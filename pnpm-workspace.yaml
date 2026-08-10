@@ -1,0 +1,10 @@
+packages:
+  - .
+
+allowBuilds:
+  '@primno/dpapi': true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@assistant-ui/core@0.3.12'
+  - '@assistant-ui/react@0.15.13'
+  - assistant-stream@0.3.37
