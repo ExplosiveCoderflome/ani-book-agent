@@ -72,3 +72,6 @@ novels/<uuid>/
 ## 许可证
 
 本项目采用 [Apache License 2.0](LICENSE)。
+## 友情链接
+
+- [LINUX DO](https://linux.do/)
