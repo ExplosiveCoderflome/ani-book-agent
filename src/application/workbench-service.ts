@@ -5,12 +5,15 @@ import { modelSettings, sanitizeProviderError } from "../infrastructure/model-se
 import { NovelRepository, novelInputHash, renderNovelBrief } from "../infrastructure/novel-repository";
 import { loadProviderCatalog } from "../infrastructure/provider-catalog";
 import { recordTokenUsage } from "../infrastructure/token-usage";
-import { artifactProposalSchema, novelBriefSchema, openingPresetProposalSchema, type ArtifactProposal, type RunView } from "../shared/contracts";
+import { artifactProposalSchema, chatChoicesSchema, novelBriefSchema, openingPresetProposalSchema, type ArtifactProposal, type RunView } from "../shared/contracts";
+import { workflowCatalog } from "../shared/workflow-catalog";
 import { effectiveNovelProductionAgent, novelProductionAgent } from "../mastra/agents/novel-production-agent";
 import { renderOpeningPresetPrompt } from "../mastra/prompts/opening-preset";
 import { ensureDefaultPromptBlocks, promptBlockDefaults, resolvePromptBlock } from "../mastra/prompts/prompt-blocks";
 import { artifactWorkflows } from "../mastra/workflows/artifact-workflows";
 import { chapterProductionWorkflow, chapterRangeWorkflow, novelExportWorkflow } from "../mastra/workflows/chapter-workflows";
+import { autoDirectorWorkflow } from "../mastra/workflows/auto-director-workflow";
+import { requireStructuredOutput, structuredOutputOptions } from "../mastra/structured-output";
 import { AppError } from "./errors";
 import { runEvents } from "./run-events";
 
@@ -28,11 +31,12 @@ const workflows: Record<WorkflowId, any> = {
   "chapter-production": chapterProductionWorkflow,
   "chapter-range": chapterRangeWorkflow,
   "novel-export": novelExportWorkflow,
+  "auto-director": autoDirectorWorkflow,
 };
 
 const activeRuns = new Map<string, { workflowId: WorkflowId; run: any }>();
 
-const definitions: Record<Exclude<WorkflowId, "chapter-production" | "chapter-range" | "novel-export">, {
+const definitions: Record<Exclude<WorkflowId, "chapter-production" | "chapter-range" | "novel-export" | "auto-director">, {
   artifactKey: (target?: string) => string; path: (target?: string) => string; title: string; promptId: string; profile: "planning" | "drafting" | "review"; dependsOn: (target?: string) => string[]; milestone: boolean;
 }> = {
   "novel-brief": { artifactKey: () => "book:novel_brief", path: () => "book/novel-brief.md", title: "小说简报", promptId: "novel.brief@v2", profile: "planning", dependsOn: () => [], milestone: true },
@@ -73,6 +77,14 @@ export function projectedRunStatus(value: string, hasLocalExecutor: boolean): Ru
   return status === "running" && !hasLocalExecutor ? "failed" : status;
 }
 
+export function releasesActiveRun(status: RunView["status"]) { return status === "committed" || status === "failed" || status === "canceled"; }
+export function shouldClearActiveRun(activeRunId: string | undefined, runId: string) { return activeRunId === runId; }
+
+async function clearActiveRun(novelId: string, runId: string) {
+  const state = await novelRepository.get(novelId);
+  if (shouldClearActiveRun(state.activeRunId, runId)) await novelRepository.setActiveRun(novelId, undefined);
+}
+
 async function locateRun(runId: string) {
   const active = activeRuns.get(runId);
   if (active) return { workflowId: active.workflowId, workflow: workflows[active.workflowId], run: active.run, state: await workflows[active.workflowId].getWorkflowRunById(runId, { fields: ["steps", "result", "error", "payload"] }) };
@@ -109,12 +121,14 @@ export async function runView(runId: string): Promise<RunView> {
   };
 }
 
-function observeRun(runId: string, operation: Promise<unknown>) {
+function observeRun(novelId: string, runId: string, operation: Promise<unknown>) {
   void operation.then(async () => {
     const view = await runView(runId);
     if (view.status === "awaiting_review") { runEvents.publish(runId, "step.completed", { step: view.currentStep }); runEvents.publish(runId, "artifact.proposed", { workflowId: view.workflowId, proposal: view.artifactProposal ?? view.proposal }); runEvents.publish(runId, "approval.required", { workflowId: view.workflowId }); }
-    if (view.status === "committed") { runEvents.publish(runId, "artifact.committed", { workflowId: view.workflowId, sha256: view.artifactSha256 }); runEvents.publish(runId, "run.completed", { status: "committed" }); activeRuns.delete(runId); await novelRepository.setActiveRun(view.novelId, undefined).catch(() => undefined); }
-  }).catch(async (error) => { runEvents.publish(runId, "run.failed", { message: sanitizeProviderError(error) }); const active = activeRuns.get(runId); activeRuns.delete(runId); if (active) { const view = await runView(runId).catch(() => undefined); if (view?.novelId) await novelRepository.setActiveRun(view.novelId, undefined).catch(() => undefined); } });
+    if (view.status === "committed") { runEvents.publish(runId, "artifact.committed", { workflowId: view.workflowId, sha256: view.artifactSha256 }); runEvents.publish(runId, "run.completed", { status: "committed" }); }
+    if (view.status === "failed") runEvents.publish(runId, "run.failed", { message: view.error?.message ?? "运行失败" });
+    if (releasesActiveRun(view.status)) { activeRuns.delete(runId); await clearActiveRun(novelId, runId).catch(() => undefined); }
+  }).catch(async (error) => { runEvents.publish(runId, "run.failed", { message: sanitizeProviderError(error) }); activeRuns.delete(runId); await clearActiveRun(novelId, runId).catch(() => undefined); });
 }
 
 async function ensureNoActiveRun(state: Awaited<ReturnType<NovelRepository["get"]>>) {
@@ -128,6 +142,7 @@ export async function startWorkflowRun(novelId: string, workflowId: WorkflowId, 
   const state = await novelRepository.get(novelId);
   await ensureNoActiveRun(state);
   let inputData: Record<string, unknown>;
+  if (workflowId === "auto-director") throw new AppError("USE_AUTO_DIRECTOR_API", "请使用自动导演接口。", 400, false);
   if (workflowId === "chapter-production") {
     const chapter = chapterNumber(target ?? String(state.currentChapter));
     if (chapter !== state.currentChapter || chapter > state.approvedChapterEnd) throw new AppError("CHAPTER_NOT_APPROVED", "该章节尚未获得生产授权。", 409, true);
@@ -147,8 +162,22 @@ export async function startWorkflowRun(novelId: string, workflowId: WorkflowId, 
   await novelRepository.setActiveRun(novelId, run.runId);
   runEvents.publish(run.runId, "run.started", { novelId, workflowId, target });
   runEvents.publish(run.runId, "step.started", { step: workflowId });
-  observeRun(run.runId, run.start({ inputData }));
+  observeRun(novelId, run.runId, run.start({ inputData }));
   return { runId: run.runId, novelId, workflowId, target, status: "running", currentStep: workflowId };
+}
+
+export async function startAutoDirector(novelId: string, input: { startChapter?: number; endChapter: number; autoApproveMilestones?: boolean }) {
+  const state = await novelRepository.get(novelId);
+  await ensureNoActiveRun(state);
+  const startChapter = input.startChapter ?? state.currentChapter;
+  if (startChapter !== state.currentChapter) throw new AppError("CHAPTER_RANGE_STALE", `当前应从第 ${state.currentChapter} 章开始。`, 409, true);
+  if (input.endChapter < startChapter || input.endChapter - startChapter > 99) throw new AppError("INVALID_CHAPTER_RANGE", "自动导演章节范围必须连续且最多 100 章。", 400, true);
+  const run = await autoDirectorWorkflow.createRun({ resourceId: novelId });
+  activeRuns.set(run.runId, { workflowId: "auto-director", run });
+  await novelRepository.setActiveRun(novelId, run.runId);
+  runEvents.publish(run.runId, "run.started", { novelId, workflowId: "auto-director", target: `${startChapter}-${input.endChapter}` });
+  observeRun(novelId, run.runId, run.start({ inputData: { novelId, startChapter, endChapter: input.endChapter, autoApproveMilestones: input.autoApproveMilestones ?? false } }));
+  return { runId: run.runId, novelId, workflowId: "auto-director" as const, target: `${startChapter}-${input.endChapter}`, status: "running" as const };
 }
 
 export async function startChapterRange(novelId: string, start: number, end: number) {
@@ -159,7 +188,7 @@ export async function startChapterRange(novelId: string, start: number, end: num
   activeRuns.set(run.runId, { workflowId: "chapter-range", run });
   await novelRepository.setActiveRun(novelId, run.runId);
   runEvents.publish(run.runId, "run.started", { novelId, workflowId: "chapter-range", target: `${start}-${end}` });
-  observeRun(run.runId, run.start({ inputData: { novelId, start, end } }));
+  observeRun(novelId, run.runId, run.start({ inputData: { novelId, start, end } }));
   return { runId: run.runId, novelId, workflowId: "chapter-range" as const, target: `${start}-${end}`, status: "running" as const };
 }
 
@@ -176,14 +205,14 @@ export async function reviewRun(runId: string, review: { action: "approve"; prop
     resumeData = { action: "approve", proposal: { ...(existing.success ? existing.data : { artifactKey: "book:novel_brief", title: "小说简报", format: "markdown", files: [], metadata: {} }), content: renderNovelBrief(review.brief), files: [{ path: "book/novel-brief.md", content: renderNovelBrief(review.brief) }], metadata: { structured: review.brief } } };
   }
   runEvents.publish(runId, "step.started", { step, action: review.action });
-  observeRun(runId, run.resume({ step, resumeData }));
+  observeRun(current.novelId, runId, run.resume({ step, resumeData }));
   return { ...current, status: "running" as const };
 }
 
 export async function startNovelBriefRun(novelId: string) { return startWorkflowRun(novelId, "novel-brief"); }
 export async function bootstrap() { await ensureDefaultPromptBlocks(); const [models, novels] = await Promise.all([modelSettings.status(), novelRepository.list()]); return { models, novels, service: { studio: "ready", workbench: "ready" } }; }
 export async function providers() { const status = await modelSettings.status(); return loadProviderCatalog(new Set(status.configuredProviders)); }
-export async function capabilities() { await ensureDefaultPromptBlocks(); return { agent: { id: "novel-production-agent", tools: ["get_novel_status", "list_novel_artifacts", "read_novel_artifact", "get_chapter_context", "inspect_continuity", "list_workflow_capabilities"], processors: ["UnicodeNormalizer", "TokenLimiterProcessor"] }, workflows: workflowIds.map((id) => ({ id, approval: ["novel-brief", "story-bible", "volume-strategy"].includes(id) ? "milestone" : "automatic" })), prompts: promptBlockDefaults.map(({ id, name }) => ({ id, name })) }; }
+export async function capabilities() { await ensureDefaultPromptBlocks(); return { agent: { id: "novel-production-agent", tools: ["get_novel_status", "list_novel_artifacts", "read_novel_artifact", "get_chapter_context", "inspect_continuity", "list_workflow_capabilities"], processors: ["UnicodeNormalizer", "TokenLimiterProcessor"] }, workflows: workflowIds.map((id) => ({ id, ...workflowCatalog[id], stages: [...workflowCatalog[id].stages] })), prompts: promptBlockDefaults.map(({ id, name, description }) => ({ id, name, description })) }; }
 
 export async function recallChatMessages(memory: NonNullable<Awaited<ReturnType<typeof novelProductionAgent.getMemory>>>, novelId: string) { const thread = await memory.getThreadById({ threadId: novelId }); return thread ? (await memory.recall({ threadId: novelId, resourceId: novelId, perPage: 100, page: 0 })).messages : []; }
 
@@ -204,8 +233,22 @@ export async function chatStream(novelId: string, message: string, abortSignal?:
     async start(controller) {
       const send = (event: string, data: unknown) => controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       try {
+        let assistantText = "";
         const reader = output.textStream.getReader();
-        while (true) { const part = await reader.read(); if (part.done) break; if (part.value) send("text-delta", { text: part.value }); }
+        while (true) { const part = await reader.read(); if (part.done) break; if (part.value) { assistantText += part.value; send("text-delta", { text: part.value }); } }
+        try {
+          const choicePrompt = await resolvePromptBlock("novel.chat_choices@v2", { novelId, taskType: "chat" });
+          const choiceContext = new RequestContext([["model", selection.model], ["novelId", novelId], ["taskType", "planning"], ["modelProfile", "chat"]]);
+          const choiceAgent = await effectiveNovelProductionAgent(choiceContext);
+          const choiceResult = await choiceAgent.generate(`${choicePrompt.content}\n\n作者本轮消息：\n${message}\n\n创作搭档本轮回复：\n${assistantText}`, { requestContext: choiceContext, ...structuredOutputOptions(chatChoicesSchema), modelSettings: { temperature: 0.2, maxOutputTokens: 1_000 } });
+          const choices = requireStructuredOutput(chatChoicesSchema, choiceResult.object, "对话快捷选择").choices;
+          if (choices.length) send("choices", { choices });
+          await recordTokenUsage(novelId, { task: "chat-choices", promptVersion: choicePrompt.version, usage: choiceResult.usage });
+        } catch (error) {
+          const message = sanitizeProviderError(error);
+          console.warn("对话快捷选择生成失败", { novelId, error: message });
+          send("choices-error", { message: `快捷选项未能生成，你仍可以直接输入选择。${message}` });
+        }
         const usage = await output.usage; await recordTokenUsage(novelId, { task: "chat", promptVersion: "novel.chat@v2", usage }); send("finish", { runId: output.runId, usage });
       } catch (error) { send("error", { message: sanitizeProviderError(error) }); }
       finally { controller.close(); }
@@ -220,13 +263,14 @@ export async function proposeOpeningPreset(novelId: string) {
   if (!messages.some((message) => message.role === "user")) throw new AppError("DISCOVERY_REQUIRED", "请先和创作搭档聊聊你的想法，再整理开书预设。", 409, true);
   const requestContext = new RequestContext([["model", selection.model], ["novelId", novelId], ["taskType", "planning"], ["modelProfile", "planning"]]);
   const agent = await effectiveNovelProductionAgent(requestContext);
-  const result = await agent.generate(`${semantic.content}\n\n${renderOpeningPresetPrompt(state.title, messages)}`, { requestContext, structuredOutput: { schema: openingPresetProposalSchema } });
-  return openingPresetProposalSchema.parse(result.object);
+  const result = await agent.generate(`${semantic.content}\n\n${renderOpeningPresetPrompt(state.title, messages)}`, { requestContext, ...structuredOutputOptions(openingPresetProposalSchema) });
+  try { return requireStructuredOutput(openingPresetProposalSchema, result.object, "开书预设"); }
+  catch (error) { throw new AppError("STRUCTURED_OUTPUT_INVALID", sanitizeProviderError(error), 502, true); }
 }
 
 export async function testModelConnection() {
   const selection = await modelSettings.runtimeSelection("chat"); const startedAt = performance.now();
-  try { const requestContext = new RequestContext([["model", selection.model], ["taskType", "chat"], ["modelProfile", "chat"]]); const schema = z.object({ ok: z.literal(true) }); const agent = await effectiveNovelProductionAgent(requestContext); const result = await agent.generate("这是一次连接测试。只返回 ok=true。", { requestContext, structuredOutput: { schema } }); schema.parse(result.object); return { ok: true, latencyMs: Math.round(performance.now() - startedAt), model: selection.model }; }
+  try { const requestContext = new RequestContext([["model", selection.model], ["taskType", "chat"], ["modelProfile", "chat"]]); const schema = z.object({ ok: z.literal(true) }); const agent = await effectiveNovelProductionAgent(requestContext); const result = await agent.generate("这是一次连接测试。只返回 ok=true。", { requestContext, ...structuredOutputOptions(schema) }); requireStructuredOutput(schema, result.object, "连接测试"); return { ok: true, latencyMs: Math.round(performance.now() - startedAt), model: selection.model }; }
   catch (error) { throw new AppError("MODEL_CONNECTION_FAILED", `连接测试失败：${sanitizeProviderError(error)}`, 502, true); }
 }
 

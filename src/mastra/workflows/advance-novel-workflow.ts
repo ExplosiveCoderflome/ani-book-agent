@@ -8,6 +8,7 @@ import { novelBriefSchema, promptVersion, type NovelBrief } from "../../shared/c
 import { effectiveNovelProductionAgent } from "../agents/novel-production-agent";
 import { renderNovelBriefPrompt } from "../prompts/novel-brief";
 import { resolvePromptBlock } from "../prompts/prompt-blocks";
+import { requireStructuredOutput, structuredOutputOptions } from "../structured-output";
 
 export const briefWorkflowInputSchema = z.object({
   novelId: z.string().uuid(),
@@ -89,6 +90,8 @@ export function createNovelBriefWorkflow(dependencies: { generateBrief: Generate
 
   return createWorkflow({
     id: "advance-novel",
+    description: "兼容性小说简报审批链：结构化生成提案，暂停等待作者批准或调整，并在重新校验输入后幂等提交。",
+    metadata: { displayName: "兼容小说简报审批链", target: "当前作品", approval: "milestone", stages: ["生成提案", "作者审阅", "幂等提交"] },
     inputSchema: briefWorkflowInputSchema,
     outputSchema: workflowOutputSchema,
   }).then(generateBriefStep).then(reviewBriefStep).then(commitBriefStep).commit();
@@ -108,9 +111,9 @@ export const generateBriefWithAgent: GenerateBrief = async (input, revision) => 
       feedback: revision?.feedback,
       priorProposal: revision?.priorProposal,
     })}`,
-    { requestContext, structuredOutput: { schema: novelBriefSchema } },
+    { requestContext, ...structuredOutputOptions(novelBriefSchema) },
   );
-  return novelBriefSchema.parse(result.object);
+  return requireStructuredOutput(novelBriefSchema, result.object, "小说简报");
 };
 
 export const advanceNovelWorkflow = createNovelBriefWorkflow({

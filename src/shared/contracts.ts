@@ -38,6 +38,16 @@ export const openingPresetProposalSchema = z.object({
 
 export type OpeningPresetProposal = z.infer<typeof openingPresetProposalSchema>;
 
+export const chatChoicesSchema = z.object({
+  choices: z.array(z.object({
+    label: z.string().trim().min(1).max(40),
+    description: z.string().trim().min(1).max(120),
+    message: z.string().trim().min(1).max(500),
+  })).max(4),
+});
+
+export type ChatChoice = z.infer<typeof chatChoicesSchema>["choices"][number];
+
 export const modelSettingsInputSchema = z.object({
   providerId: z.string().min(1),
   modelId: z.string().min(1),
@@ -107,6 +117,12 @@ export const editArtifactInputSchema = z.object({
   content: z.string(),
   expectedSha256: z.string().regex(/^[a-f0-9]{64}$/i),
 });
+
+export const autoDirectorInputSchema = z.object({
+  startChapter: z.number().int().positive().optional(),
+  endChapter: z.number().int().positive(),
+  autoApproveMilestones: z.boolean().default(false),
+}).refine((value) => value.endChapter >= (value.startChapter ?? 1) && value.endChapter - (value.startChapter ?? 1) <= 99, "自动导演章节范围必须连续且最多 100 章");
 
 export const promptVersion = "novel.brief@v2" as const;
 

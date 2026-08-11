@@ -14,6 +14,7 @@ export const workflowIds = [
   "chapter-production",
   "chapter-range",
   "novel-export",
+  "auto-director",
 ] as const;
 
 export const workflowIdSchema = z.enum(workflowIds);

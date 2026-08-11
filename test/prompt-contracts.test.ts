@@ -9,13 +9,20 @@ const prompt = (id: string) => {
 };
 
 test("all production prompts use unique v2 assets with explicit authority boundaries", () => {
-  assert.equal(promptBlockDefaults.length, 13);
+  assert.equal(promptBlockDefaults.length, 14);
   assert.equal(new Set(promptBlockDefaults.map((item) => item.id)).size, promptBlockDefaults.length);
   for (const item of promptBlockDefaults) {
     assert.match(item.id, /@v2$/);
     assert.match(item.content, /作者本轮明确要求/);
     assert.ok(item.content.length >= 500, `${item.id} is too shallow`);
   }
+});
+
+test("chat choice prompt preserves finite options as complete clickable replies", () => {
+  const content = prompt("novel.chat_choices@v2");
+  assert.match(content, /原回复有四个方向时必须输出四项/);
+  assert.match(content, /不能只写序号/);
+  assert.match(content, /否则输出空数组/);
 });
 
 test("chapter prompts share an executable reader-experience and repair contract", () => {

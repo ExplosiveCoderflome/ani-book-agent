@@ -1,7 +1,8 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { decideNextAction, workflowIds } from "../../domain";
+import { decideNextAction } from "../../domain";
 import { NovelRepository } from "../../infrastructure/novel-repository";
+import { workflowCatalog } from "../../shared/workflow-catalog";
 
 const repository = new NovelRepository();
 const novelIdInput = z.object({ novelId: z.string().uuid().optional() });
@@ -68,10 +69,10 @@ export const inspectContinuityTool = createTool({
 
 export const listWorkflowCapabilitiesTool = createTool({
   id: "list_workflow_capabilities",
-  description: "列出可推荐的小说 Workflow 及其目标要求。只读。",
+  description: "列出全部小说 Workflow 的中文名称、适用目标、审批方式、业务说明与可观察阶段，供 Agent 推荐唯一合法下一步。只读。",
   inputSchema: z.object({}),
-  outputSchema: z.object({ workflows: z.array(z.object({ id: z.string(), target: z.string() })) }),
-  execute: async () => ({ workflows: workflowIds.map((id) => ({ id, target: id.includes("chapter") || id === "quality-repair" ? "章节号或章节范围" : id === "novel-export" ? "可选导出文件名" : "当前作品" })) }),
+  outputSchema: z.object({ workflows: z.array(z.object({ id: z.string(), name: z.string(), description: z.string(), target: z.string(), approval: z.enum(["milestone", "automatic", "conditional"]), stages: z.array(z.string()) })) }),
+  execute: async () => ({ workflows: Object.entries(workflowCatalog).map(([id, descriptor]) => ({ id, ...descriptor, stages: [...descriptor.stages] })) }),
 });
 
 export const novelTools = {

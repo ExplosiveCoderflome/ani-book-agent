@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { MastraDBMessage } from "@mastra/core/agent";
+import type { ChatChoice } from "../shared/contracts";
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -13,7 +14,7 @@ import {
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import "@assistant-ui/react-markdown/styles/dot.css";
-import { Feather, Send, Square } from "lucide-react";
+import { Check, Feather, LoaderCircle, Send, Square } from "lucide-react";
 import remarkGfm from "remark-gfm";
 
 function fromDatabase(message: MastraDBMessage): ThreadMessageLike {
@@ -29,18 +30,29 @@ function convertMessage(source: ConversationMessage): ThreadMessageLike {
 function PlainTextPart() { return <MessagePartPrimitive.Text component="p" className="message-text" />; }
 function MarkdownTextPart() { return <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="message-markdown" />; }
 function WorkflowDataPart({ data }: DataMessagePartProps<{ node: ReactNode }>) { return <div className="workflow-data-part">{data.node}</div>; }
+function ThinkingDataPart() { return <div className="assistant-thinking" role="status"><LoaderCircle className="spin" size={16} /><span>正在连接模型并思考…</span></div>; }
+
+const ChoiceActionContext = createContext<{ sendMessage: (text: string) => Promise<void>; isRunning: boolean } | null>(null);
+
+function ChoicesDataPart({ data }: DataMessagePartProps<{ choices: ChatChoice[] }>) {
+  const action = useContext(ChoiceActionContext);
+  const [selected, setSelected] = useState("");
+  if (!action || !data.choices.length) return null;
+  return <div className="chat-choices" aria-label="快捷选择">{data.choices.map((choice: ChatChoice) => <button type="button" key={choice.message} disabled={action.isRunning || Boolean(selected)} onClick={() => { setSelected(choice.message); void action.sendMessage(choice.message); }}><span>{choice.label}</span><small>{choice.description}</small></button>)}</div>;
+}
 
 function ChatMessage() {
   return <MessagePrimitive.Root className="message-row">
-    <MessagePrimitive.If assistant><article className="message assistant-message"><span className="assistant-avatar"><Feather size={16} /></span><div><strong>创作搭档</strong><MessagePrimitive.Parts components={{ Text: MarkdownTextPart, data: { by_name: { workflow: WorkflowDataPart } } }} /></div></article></MessagePrimitive.If>
+    <MessagePrimitive.If assistant><article className="message assistant-message"><span className="assistant-avatar"><Feather size={16} /></span><div><strong className="assistant-name">创作搭档</strong><MessagePrimitive.Parts components={{ Text: MarkdownTextPart, data: { by_name: { workflow: WorkflowDataPart, thinking: ThinkingDataPart, choices: ChoicesDataPart } } }} /></div></article></MessagePrimitive.If>
     <MessagePrimitive.If user><article className="message user-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
     <MessagePrimitive.If system><article className="message system-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
   </MessagePrimitive.Root>;
 }
 
-export function Conversation({ novelId, initialMessages, children }: {
+export function Conversation({ novelId, initialMessages, discoveryAction, children }: {
   novelId: string;
   initialMessages: MastraDBMessage[];
+  discoveryAction?: { pending: boolean; error: unknown; onConfirm: () => void };
   children: ReactNode | ((actions: { sendMessage: (text: string) => Promise<void>; isRunning: boolean; messageCount: number }) => ReactNode);
 }) {
   const hydrated = useMemo(() => initialMessages.filter((message) => message.role !== "signal").map(fromDatabase), [initialMessages]);
@@ -57,7 +69,7 @@ export function Conversation({ novelId, initialMessages, children }: {
     const userId = crypto.randomUUID();
     const assistantId = crypto.randomUUID();
     setError(""); setRunning(true);
-    setMessages((current) => [...current, { id: userId, role: "user", content: [{ type: "text", text }], createdAt: new Date() }, { id: assistantId, role: "assistant", content: [{ type: "text", text: "" }], createdAt: new Date() }]);
+    setMessages((current) => [...current, { id: userId, role: "user", content: [{ type: "text", text }], createdAt: new Date() }, { id: assistantId, role: "assistant", content: [{ type: "data", name: "thinking", data: {} }], createdAt: new Date() }]);
     const controller = new AbortController(); abortRef.current = controller;
     let accumulated = "";
     try {
@@ -70,8 +82,10 @@ export function Conversation({ novelId, initialMessages, children }: {
         const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? "";
         for (const block of blocks) {
           const event = block.match(/^event:\s*(.+)$/m)?.[1]; const dataText = block.match(/^data:\s*(.+)$/m)?.[1]; if (!event || !dataText) continue;
-          const data = JSON.parse(dataText) as { text?: string; message?: string };
+          const data = JSON.parse(dataText) as { text?: string; message?: string; choices?: ChatChoice[] };
           if (event === "text-delta" && data.text) { accumulated += data.text; setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: [{ type: "text", text: accumulated }] } : message)); }
+          if (event === "choices" && data.choices?.length) setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: [{ type: "text", text: accumulated }, { type: "data", name: "choices", data: { choices: data.choices } }] } : message));
+          if (event === "choices-error") setError(data.message ?? "快捷选项未能生成，你仍可以直接输入选择。");
           if (event === "error") throw new Error(data.message ?? "生成失败，请重试。");
         }
       }
@@ -84,12 +98,12 @@ export function Conversation({ novelId, initialMessages, children }: {
 
   const messageCount = messages.filter((message) => message.role === "user" || message.role === "assistant").length;
   const flowNode = typeof children === "function" ? children({ sendMessage, isRunning, messageCount }) : children;
-  const externalMessages: ConversationMessage[] = [...messages.map((message) => ({ kind: "message" as const, message })), { kind: "workflow", id: `workflow-${novelId}`, node: flowNode }];
+  const externalMessages: ConversationMessage[] = [...messages.map((message) => ({ kind: "message" as const, message })), ...(isRunning || !flowNode ? [] : [{ kind: "workflow" as const, id: `workflow-${novelId}`, node: flowNode }])];
   const runtime = useExternalStoreRuntime({
     isRunning, messages: externalMessages, convertMessage,
     onNew: async (message: AppendMessage) => sendMessage(message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")),
     onCancel: async () => abortRef.current?.abort(),
   });
 
-  return <AssistantRuntimeProvider runtime={runtime}><ThreadPrimitive.Root className="conversation-thread"><ThreadPrimitive.Viewport className="conversation-viewport"><ThreadPrimitive.Messages components={{ Message: ChatMessage }} /><ThreadPrimitive.ViewportFooter className="composer-footer">{error && <div className="chat-error">{error}</div>}<ComposerPrimitive.Root className="composer"><ComposerPrimitive.Input aria-label="给创作搭档发消息" placeholder="和创作搭档聊聊这本书……" rows={1} /><ThreadPrimitive.If running><ComposerPrimitive.Cancel className="composer-button" aria-label="停止回答"><Square size={17} /></ComposerPrimitive.Cancel></ThreadPrimitive.If><ThreadPrimitive.If running={false}><ComposerPrimitive.Send className="composer-button" aria-label="发送消息"><Send size={18} /></ComposerPrimitive.Send></ThreadPrimitive.If></ComposerPrimitive.Root><small>AI 可能犯错，重要创作决定以你批准的工件为准。</small></ThreadPrimitive.ViewportFooter></ThreadPrimitive.Viewport></ThreadPrimitive.Root></AssistantRuntimeProvider>;
+  return <ChoiceActionContext.Provider value={{ sendMessage, isRunning }}><AssistantRuntimeProvider runtime={runtime}><ThreadPrimitive.Root className="conversation-thread"><ThreadPrimitive.Viewport className="conversation-viewport"><ThreadPrimitive.Messages components={{ Message: ChatMessage }} /><ThreadPrimitive.ViewportFooter className="composer-footer">{discoveryAction && messageCount > 0 && <div className="discovery-status"><div><strong>开书讨论中</strong><span>等你把想法说完整后，再整理成开书方案。</span></div><button type="button" disabled={isRunning || discoveryAction.pending} onClick={discoveryAction.onConfirm}>{discoveryAction.pending ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}{discoveryAction.pending ? "正在整理…" : "我说完了，整理方案"}</button></div>}{Boolean(discoveryAction?.error) && <div className="chat-error">{discoveryAction?.error instanceof Error ? discoveryAction.error.message : "整理失败，请重试。"}</div>}{error && <div className="chat-error">{error}</div>}<ComposerPrimitive.Root className="composer"><ComposerPrimitive.Input aria-label="给创作搭档发消息" placeholder="和创作搭档聊聊这本书……" rows={1} /><ThreadPrimitive.If running><ComposerPrimitive.Cancel className="composer-button" aria-label="停止回答"><Square size={17} /></ComposerPrimitive.Cancel></ThreadPrimitive.If><ThreadPrimitive.If running={false}><ComposerPrimitive.Send className="composer-button" aria-label="发送消息"><Send size={18} /></ComposerPrimitive.Send></ThreadPrimitive.If></ComposerPrimitive.Root><small>AI 可能犯错，重要创作决定以你批准的工件为准。</small></ThreadPrimitive.ViewportFooter></ThreadPrimitive.Viewport></ThreadPrimitive.Root></AssistantRuntimeProvider></ChoiceActionContext.Provider>;
 }

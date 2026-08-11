@@ -1,5 +1,6 @@
 import type { ArtifactProposal, NovelBrief, NovelSummary, OpeningPresetProposal, ProviderCatalogItem, RunView } from "../shared/contracts";
 import type { NovelState, NextAction, WorkflowId } from "../domain";
+import type { WorkflowApproval } from "../shared/workflow-catalog";
 import type { MastraDBMessage } from "@mastra/core/agent";
 
 export class WorkbenchApiError extends Error {
@@ -39,7 +40,7 @@ export const api = {
   testModel: () => request<{ ok: true; latencyMs: number; model: string }>("/workbench-api/model-settings/test", { method: "POST" }),
   modelProfiles: () => request<{ default?: { providerId: string; modelId: string }; profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }> }>("/workbench-api/model-profiles"),
   saveModelProfiles: (profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }>) => request("/workbench-api/model-profiles", { method: "PUT", body: JSON.stringify({ profiles }) }),
-  capabilities: () => request<{ workflows: Array<{ id: WorkflowId; approval: string }>; prompts: Array<{ id: string; name: string }>; agent: { tools: string[]; processors: string[] } }>("/workbench-api/capabilities"),
+  capabilities: () => request<{ workflows: Array<{ id: WorkflowId; name: string; description: string; target: string; approval: WorkflowApproval; stages: string[] }>; prompts: Array<{ id: string; name: string; description: string }>; agent: { tools: string[]; processors: string[] } }>("/workbench-api/capabilities"),
   createNovel: (title: string, approvalMode: "milestone_approval" | "auto" = "milestone_approval") => request<NovelState>("/workbench-api/novels", { method: "POST", body: JSON.stringify({ title, approvalMode }) }),
   novel: (id: string) => request<{ novel: NovelState; nextAction: NextAction; milestone: string }>(`/workbench-api/novels/${id}`),
   chat: (id: string) => request<{ messages: MastraDBMessage[] }>(`/workbench-api/novels/${id}/chat`),
@@ -52,6 +53,7 @@ export const api = {
   artifact: (id: string, key: string) => request<{ artifact: NovelState["artifacts"][string]; content: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`),
   editArtifact: (id: string, key: string, content: string, expectedSha256: string) => request<{ state: NovelState; sha256: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`, { method: "PUT", body: JSON.stringify({ content, expectedSha256 }) }),
   chapterRange: (id: string, start: number, end: number) => request<RunView>(`/workbench-api/novels/${id}/chapter-ranges`, { method: "POST", body: JSON.stringify({ start, end }) }),
+  autoDirector: (id: string, startChapter: number | undefined, endChapter: number, autoApproveMilestones = false) => request<RunView>(`/workbench-api/novels/${id}/auto-director`, { method: "POST", body: JSON.stringify({ startChapter, endChapter, autoApproveMilestones }) }),
   exportNovel: (id: string, fileName?: string) => request<RunView>(`/workbench-api/novels/${id}/export`, { method: "POST", body: JSON.stringify({ fileName }) }),
   exportDownloadUrl: (id: string, path: string) => `/workbench-api/novels/${id}/export?path=${encodeURIComponent(path)}`,
   run: (id: string) => request<RunView>(`/workbench-api/runs/${id}`),

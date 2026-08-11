@@ -6,8 +6,10 @@ import { modelSettings } from "../../infrastructure/model-settings";
 import { NovelRepository, renderNovelBrief } from "../../infrastructure/novel-repository";
 import { recordTokenUsage } from "../../infrastructure/token-usage";
 import { artifactProposalSchema, novelBriefSchema, type ArtifactProposal, type ModelProfileName } from "../../shared/contracts";
+import { workflowCatalog } from "../../shared/workflow-catalog";
 import { effectiveNovelProductionAgent } from "../agents/novel-production-agent";
 import { resolvePromptBlock } from "../prompts/prompt-blocks";
+import { requireStructuredOutput, structuredOutputOptions } from "../structured-output";
 
 export const artifactWorkflowInputSchema = z.object({
   novelId: z.string().uuid(),
@@ -46,18 +48,18 @@ async function generateProposal(input: WorkflowInput, revision?: { feedback: str
   const instruction = `${prompt.content}\n\n权威上下文：\n${input.context}${revisionText}`;
   const agent = await effectiveNovelProductionAgent(requestContext);
   if (input.workflowId === "novel-brief") {
-    const result = await agent.generate(instruction, { requestContext, structuredOutput: { schema: novelBriefSchema } });
+    const result = await agent.generate(instruction, { requestContext, ...structuredOutputOptions(novelBriefSchema) });
     await recordTokenUsage(input.novelId, { task: input.workflowId, promptVersion: prompt.version, usage: result.usage });
-    const brief = novelBriefSchema.parse(result.object);
+    const brief = requireStructuredOutput(novelBriefSchema, result.object, "小说简报");
     const content = renderNovelBrief(brief);
     return { proposal: { artifactKey: input.artifactKey, title: input.title, format: "markdown" as const, content, files: [{ path: input.artifactPath, content }], metadata: { structured: brief } }, resolvedPromptVersion: prompt.version };
   }
   const result = await agent.generate(`${instruction}\n\n请返回工件提案。artifactKey 必须为 ${input.artifactKey}，主文件路径必须为 ${input.artifactPath}。`, {
     requestContext,
-    structuredOutput: { schema: artifactProposalSchema },
+    ...structuredOutputOptions(artifactProposalSchema),
     modelSettings: { temperature: selection.parameters.temperature, topP: selection.parameters.topP, maxOutputTokens: selection.parameters.maxOutputTokens },
   });
-  const parsed = artifactProposalSchema.parse(result.object);
+  const parsed = requireStructuredOutput(artifactProposalSchema, result.object, input.title);
   await recordTokenUsage(input.novelId, { task: input.workflowId, promptVersion: prompt.version, usage: result.usage });
   return {
     proposal: { ...parsed, artifactKey: input.artifactKey, title: input.title, files: [{ path: input.artifactPath, content: parsed.content }, ...parsed.files.filter((file) => file.path !== input.artifactPath)] },
@@ -66,12 +68,13 @@ async function generateProposal(input: WorkflowInput, revision?: { feedback: str
 }
 
 export function createArtifactWorkflow(id: WorkflowId) {
+  const descriptor = workflowCatalog[id];
   const generate = createStep({
-    id: `${id}-generate`, description: `生成 ${id} 提案。`, inputSchema: artifactWorkflowInputSchema, outputSchema: proposalEnvelopeSchema, retries: 2,
+    id: `${id}-generate`, description: `读取已装配的权威上下文，按版本化 Prompt 生成“${descriptor.name}”结构化提案并记录模型用量。`, inputSchema: artifactWorkflowInputSchema, outputSchema: proposalEnvelopeSchema, retries: 2,
     execute: async ({ inputData }) => ({ ...inputData, ...(await generateProposal(inputData)) }),
   });
   const review = createStep({
-    id: `${id}-review`, description: `审阅 ${id} 提案。`, inputSchema: proposalEnvelopeSchema, outputSchema: approvedEnvelopeSchema, suspendSchema: proposalEnvelopeSchema, resumeSchema, retries: 2,
+    id: `${id}-review`, description: `按审批策略处理“${descriptor.name}”：自动通过，或暂停等待作者批准、编辑与要求重生成。`, inputSchema: proposalEnvelopeSchema, outputSchema: approvedEnvelopeSchema, suspendSchema: proposalEnvelopeSchema, resumeSchema, retries: 2,
     execute: async ({ inputData, resumeData, suspend }) => {
       if (!inputData.requiresReview) return { ...inputData, approvedProposal: inputData.proposal };
       if (!resumeData) return suspend(inputData);
@@ -80,13 +83,13 @@ export function createArtifactWorkflow(id: WorkflowId) {
     },
   });
   const commit = createStep({
-    id: `${id}-commit`, description: `提交 ${id} 工件。`, inputSchema: approvedEnvelopeSchema, outputSchema,
+    id: `${id}-commit`, description: `重新校验输入哈希，以幂等键原子提交“${descriptor.name}”，并登记依赖、版本与作者保护状态。`, inputSchema: approvedEnvelopeSchema, outputSchema,
     execute: async ({ inputData }) => {
       const result = await repository.commitProposal({ novelId: inputData.novelId, proposal: inputData.approvedProposal, expectedInputHash: inputData.inputHash, promptVersion: inputData.resolvedPromptVersion, idempotencyKey: `${inputData.novelId}:${inputData.artifactKey}:${inputData.inputHash}:${inputData.resolvedPromptVersion}`, dependsOn: inputData.dependsOn });
       return { status: "committed" as const, novelId: inputData.novelId, workflowId: id, sha256: result.sha256, duplicate: result.duplicate };
     },
   });
-  return createWorkflow({ id, inputSchema: artifactWorkflowInputSchema, outputSchema }).then(generate).then(review).then(commit).commit();
+  return createWorkflow({ id, description: descriptor.description, metadata: { displayName: descriptor.name, target: descriptor.target, approval: descriptor.approval, stages: [...descriptor.stages] }, inputSchema: artifactWorkflowInputSchema, outputSchema }).then(generate).then(review).then(commit).commit();
 }
 
 export const novelBriefWorkflow = createArtifactWorkflow("novel-brief");

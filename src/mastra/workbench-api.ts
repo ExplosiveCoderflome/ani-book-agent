@@ -13,6 +13,7 @@ import {
   reviewRun,
   runView,
   startChapterRange,
+  startAutoDirector,
   startNovelBriefRun,
   startWorkflowRun,
   testModelConnection,
@@ -21,6 +22,7 @@ import { runEvents } from "../application/run-events";
 import {
   createNovelInputSchema,
   chapterRangeInputSchema,
+  autoDirectorInputSchema,
   editArtifactInputSchema,
   editNovelBriefInputSchema,
   genericReviewRunInputSchema,
@@ -98,6 +100,10 @@ export const workbenchApiRoutes = [
   route("/workbench-api/novels/:id/chapter-ranges", "POST", async (c) => {
     const body = chapterRangeInputSchema.parse(await input(c, chapterRangeInputSchema));
     return c.json(await startChapterRange(c.req.param("id"), body.start, body.end), 202);
+  }),
+  route("/workbench-api/novels/:id/auto-director", "POST", async (c) => {
+    const body = autoDirectorInputSchema.parse(await input(c, autoDirectorInputSchema));
+    return c.json(await startAutoDirector(c.req.param("id"), body), 202);
   }),
   route("/workbench-api/novels/:id/artifacts/novel-brief", "PUT", async (c) => {
     const body = editNovelBriefInputSchema.parse(await input(c, editNovelBriefInputSchema));

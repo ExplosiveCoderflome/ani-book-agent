@@ -6,8 +6,10 @@ import { modelSettings } from "../../infrastructure/model-settings";
 import { NovelRepository } from "../../infrastructure/novel-repository";
 import { novelInputHash } from "../../infrastructure/novel-repository";
 import { recordTokenUsage } from "../../infrastructure/token-usage";
+import { workflowCatalog } from "../../shared/workflow-catalog";
 import { effectiveNovelProductionAgent } from "../agents/novel-production-agent";
 import { resolvePromptBlock } from "../prompts/prompt-blocks";
+import { requireStructuredOutput, structuredOutputOptions } from "../structured-output";
 import { chapterPlanningWorkflow } from "./artifact-workflows";
 
 export const chapterProductionInputSchema = z.object({
@@ -46,25 +48,25 @@ async function textGeneration(input: { novelId: string; chapter: number }, profi
 }
 
 const draftStep = createStep({
-  id: "chapter-draft", description: "依据章节合同生成整章初稿。", inputSchema: chapterProductionInputSchema, outputSchema: draftedSchema, retries: 2,
+  id: "chapter-draft", description: "读取章节合同与权威最小上下文，生成具备完整场景推进、读者回报和结尾牵引的整章初稿。", inputSchema: chapterProductionInputSchema, outputSchema: draftedSchema, retries: 2,
   execute: async ({ inputData }) => { const result = await textGeneration(inputData, "drafting", "novel.chapter_writer@v2", `章节：${inputData.chapter}\n权威最小上下文：\n${inputData.context}`); return { ...inputData, draft: result.text, promptVersions: { writer: result.version } }; },
 });
 const humanizeStep = createStep({
-  id: "chapter-humanize", description: "执行一次受约束的反模板化二稿。", inputSchema: draftedSchema, outputSchema: humanizedSchema, retries: 2,
+  id: "chapter-humanize", description: "在不改变章节义务和稳定设定的前提下，执行一次受约束的反模板化二稿，改善语言节奏与人物质感。", inputSchema: draftedSchema, outputSchema: humanizedSchema, retries: 2,
   execute: async ({ inputData }) => { const result = await textGeneration(inputData, "drafting", "novel.chapter_humanize@v2", `章节合同与上下文：\n${inputData.context}\n\n初稿：\n${inputData.draft}`); return { ...inputData, humanized: result.text, promptVersions: { ...inputData.promptVersions, humanize: result.version } }; },
 });
 const reviewStep = createStep({
-  id: "chapter-review", description: "按共享章节合同执行结构化审查。", inputSchema: humanizedSchema, outputSchema: reviewedSchema, retries: 2,
+  id: "chapter-review", description: "按同一章节合同检查目标兑现、角色行动、连续性、结尾牵引和越界风险，输出结构化接收判定与证据。", inputSchema: humanizedSchema, outputSchema: reviewedSchema, retries: 2,
   execute: async ({ inputData }) => {
     const call = await contextFor(inputData, "review", "review", "novel.chapter_review@v2");
     const agent = await effectiveNovelProductionAgent(call.requestContext);
-    const result = await agent.generate(`${call.prompt.content}\n\n章节合同与上下文：\n${inputData.context}\n\n待审正文：\n${inputData.humanized}`, { requestContext: call.requestContext, structuredOutput: { schema: chapterReviewSchema }, modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
+    const result = await agent.generate(`${call.prompt.content}\n\n章节合同与上下文：\n${inputData.context}\n\n待审正文：\n${inputData.humanized}`, { requestContext: call.requestContext, ...structuredOutputOptions(chapterReviewSchema), modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
     await recordTokenUsage(inputData.novelId, { task: "chapter-review", promptVersion: call.prompt.version, usage: result.usage });
-    return { ...inputData, review: chapterReviewSchema.parse(result.object), promptVersions: { ...inputData.promptVersions, review: call.prompt.version } };
+    return { ...inputData, review: requireStructuredOutput(chapterReviewSchema, result.object, "章节审查"), promptVersions: { ...inputData.promptVersions, review: call.prompt.version } };
   },
 });
 const repairStep = createStep({
-  id: "chapter-repair", description: "有限修复：局部一次，必要时整章一次。", inputSchema: reviewedSchema, outputSchema: repairedSchema, suspendSchema: reviewedSchema, resumeSchema: repairResumeSchema, retries: 1,
+  id: "chapter-repair", description: "根据审查判定执行有限修复；可局部解决时不重写整章，结构性冲突则暂停等待作者处理。", inputSchema: reviewedSchema, outputSchema: repairedSchema, suspendSchema: reviewedSchema, resumeSchema: repairResumeSchema, retries: 1,
   execute: async ({ inputData, resumeData, suspend }) => {
     if (inputData.review.verdict === "accepted" || inputData.review.verdict === "continue_with_warning") return { ...inputData, finalText: inputData.humanized, repairCount: 0 };
     if (inputData.review.verdict === "stop_for_replan" && !resumeData) return suspend(inputData);
@@ -74,17 +76,17 @@ const repairStep = createStep({
   },
 });
 const continuityStep = createStep({
-  id: "chapter-continuity", description: "只从稳定正文抽取连续性 delta。", inputSchema: repairedSchema, outputSchema: continuityEnvelopeSchema, retries: 2,
+  id: "chapter-continuity", description: "只从最终稳定正文抽取已发生的事实、角色状态、资源、关系、伏笔回报与世界变化，拒绝把计划和猜测写成事实。", inputSchema: repairedSchema, outputSchema: continuityEnvelopeSchema, retries: 2,
   execute: async ({ inputData }) => {
     const call = await contextFor(inputData, "continuity", "review", "novel.continuity_extract@v2");
     const agent = await effectiveNovelProductionAgent(call.requestContext);
-    const result = await agent.generate(`${call.prompt.content}\n\n最终正文：\n${inputData.finalText}`, { requestContext: call.requestContext, structuredOutput: { schema: continuitySchema }, modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
+    const result = await agent.generate(`${call.prompt.content}\n\n最终正文：\n${inputData.finalText}`, { requestContext: call.requestContext, ...structuredOutputOptions(continuitySchema), modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
     await recordTokenUsage(inputData.novelId, { task: "continuity-extract", promptVersion: call.prompt.version, usage: result.usage });
-    return { ...inputData, continuity: continuitySchema.parse(result.object), promptVersions: { ...inputData.promptVersions, continuity: call.prompt.version } };
+    return { ...inputData, continuity: requireStructuredOutput(continuitySchema, result.object, "连续性提取"), promptVersions: { ...inputData.promptVersions, continuity: call.prompt.version } };
   },
 });
 const commitStep = createStep({
-  id: "chapter-commit", description: "原子提交正文、审查和连续性资产。", inputSchema: continuityEnvelopeSchema, outputSchema,
+  id: "chapter-commit", description: "重新校验输入哈希，原子提交上下文包、初稿、稳定正文、审查、质量债与连续性资产后推进章节游标。", inputSchema: continuityEnvelopeSchema, outputSchema,
   execute: async ({ inputData }) => {
     const prefix = `chapters/chapter-${String(inputData.chapter).padStart(3, "0")}`;
     const promptVersion = Object.values(inputData.promptVersions).join("+");
@@ -101,7 +103,8 @@ const commitStep = createStep({
   },
 });
 
-export const chapterProductionWorkflow = createWorkflow({ id: "chapter-production", inputSchema: chapterProductionInputSchema, outputSchema }).then(draftStep).then(humanizeStep).then(reviewStep).then(repairStep).then(continuityStep).then(commitStep).commit();
+const chapterProductionDescriptor = workflowCatalog["chapter-production"];
+export const chapterProductionWorkflow = createWorkflow({ id: "chapter-production", description: chapterProductionDescriptor.description, metadata: { displayName: chapterProductionDescriptor.name, target: chapterProductionDescriptor.target, approval: chapterProductionDescriptor.approval, stages: [...chapterProductionDescriptor.stages] }, inputSchema: chapterProductionInputSchema, outputSchema }).then(draftStep).then(humanizeStep).then(reviewStep).then(repairStep).then(continuityStep).then(commitStep).commit();
 
 const rangeInputSchema = z.object({ novelId: z.string().uuid(), start: z.number().int().positive(), end: z.number().int().positive() });
 const rangeItemSchema = z.object({ novelId: z.string().uuid(), chapter: z.number().int().positive() });
@@ -123,11 +126,11 @@ async function assembleRangeContext(novelId: string, keys: string[]) {
 }
 
 const prepareRangeStep = createStep({
-  id: "prepare-chapter-range", inputSchema: rangeInputSchema, outputSchema: z.array(rangeItemSchema),
+  id: "prepare-chapter-range", description: "登记作者批准的章节范围，并生成严格按章节号递增的串行生产任务列表。", inputSchema: rangeInputSchema, outputSchema: z.array(rangeItemSchema),
   execute: async ({ inputData }) => { await repository.setChapterRange(inputData.novelId, inputData.start, inputData.end); return Array.from({ length: inputData.end - inputData.start + 1 }, (_, index) => ({ novelId: inputData.novelId, chapter: inputData.start + index })); },
 });
 const produceRangeItemStep = createStep({
-  id: "produce-range-chapter", inputSchema: rangeItemSchema, outputSchema: rangeItemOutputSchema, suspendSchema: rangeSuspendSchema, resumeSchema: rangeResumeSchema,
+  id: "produce-range-chapter", description: "逐章装配权威上下文，先提交章节计划，再执行正文生产；结构性冲突时暂停当前范围等待作者。", inputSchema: rangeItemSchema, outputSchema: rangeItemOutputSchema, suspendSchema: rangeSuspendSchema, resumeSchema: rangeResumeSchema,
   execute: async ({ inputData, resumeData, suspend }) => {
     if (resumeData) {
       const proposal = resumeData.proposal;
@@ -154,14 +157,16 @@ const produceRangeItemStep = createStep({
   },
 });
 const finishRangeStep = createStep({
-  id: "finish-chapter-range", inputSchema: z.array(rangeItemOutputSchema), outputSchema: rangeOutputSchema,
+  id: "finish-chapter-range", description: "汇总已经稳定提交的章节号与审查判定，确认整个批准范围按顺序完成。", inputSchema: z.array(rangeItemOutputSchema), outputSchema: rangeOutputSchema,
   execute: async ({ inputData }) => ({ status: "committed" as const, novelId: inputData[0]?.novelId ?? "", workflowId: "chapter-range" as const, completed: inputData.map((item) => item.chapter) }),
 });
-export const chapterRangeWorkflow = createWorkflow({ id: "chapter-range", inputSchema: rangeInputSchema, outputSchema: rangeOutputSchema }).then(prepareRangeStep).foreach(produceRangeItemStep, { concurrency: 1 }).then(finishRangeStep).commit();
+const chapterRangeDescriptor = workflowCatalog["chapter-range"];
+export const chapterRangeWorkflow = createWorkflow({ id: "chapter-range", description: chapterRangeDescriptor.description, metadata: { displayName: chapterRangeDescriptor.name, target: chapterRangeDescriptor.target, approval: chapterRangeDescriptor.approval, stages: [...chapterRangeDescriptor.stages] }, inputSchema: rangeInputSchema, outputSchema: rangeOutputSchema }).then(prepareRangeStep).foreach(produceRangeItemStep, { concurrency: 1 }).then(finishRangeStep).commit();
 
 const exportInputSchema = z.object({ novelId: z.string().uuid(), fileName: z.string().max(80).optional() });
 const exportOutputSchema = z.object({ status: z.literal("committed"), novelId: z.string().uuid(), workflowId: z.literal("novel-export"), path: z.string(), chapterCount: z.number(), sha256: z.string() });
-export const novelExportWorkflow = createWorkflow({ id: "novel-export", inputSchema: exportInputSchema, outputSchema: exportOutputSchema }).then(createStep({
-  id: "export-stable-chapters", inputSchema: exportInputSchema, outputSchema: exportOutputSchema,
+const novelExportDescriptor = workflowCatalog["novel-export"];
+export const novelExportWorkflow = createWorkflow({ id: "novel-export", description: novelExportDescriptor.description, metadata: { displayName: novelExportDescriptor.name, target: novelExportDescriptor.target, approval: novelExportDescriptor.approval, stages: [...novelExportDescriptor.stages] }, inputSchema: exportInputSchema, outputSchema: exportOutputSchema }).then(createStep({
+  id: "export-stable-chapters", description: "只读取已登记并稳定提交的章节正文，按章节号汇总为 TXT，并登记导出路径、章节数与内容哈希。", inputSchema: exportInputSchema, outputSchema: exportOutputSchema,
   execute: async ({ inputData }) => ({ status: "committed" as const, novelId: inputData.novelId, workflowId: "novel-export" as const, ...(await repository.exportStableChapters(inputData.novelId, inputData.fileName)) }),
 })).commit();
