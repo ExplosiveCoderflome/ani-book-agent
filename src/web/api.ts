@@ -31,6 +31,7 @@ export interface Bootstrap {
   };
   novels: NovelSummary[];
 }
+export interface PromptBlockView { id: string; name: string; description: string; defaultContent: string; draftContent?: string; publishedContent?: string; draftVersion?: string; publishedVersion?: string; activeSource: "official" | "custom"; draftSource?: "official" | "custom"; group: "对话引导" | "书级策划" | "章节生产" | "审查修复"; usage: string; order: number }
 
 export const api = {
   bootstrap: () => request<Bootstrap>("/workbench-api/bootstrap"),
@@ -40,6 +41,12 @@ export const api = {
   testModel: () => request<{ ok: true; latencyMs: number; model: string }>("/workbench-api/model-settings/test", { method: "POST" }),
   modelProfiles: () => request<{ default?: { providerId: string; modelId: string }; profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }> }>("/workbench-api/model-profiles"),
   saveModelProfiles: (profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }>) => request("/workbench-api/model-profiles", { method: "PUT", body: JSON.stringify({ profiles }) }),
+  prompts: () => request<{ prompts: PromptBlockView[] }>("/workbench-api/prompts"),
+  prompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}`),
+  savePromptDraft: (id: string, content: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/draft`, { method: "PUT", body: JSON.stringify({ content }) }),
+  previewPrompt: (id: string, content: string) => request<{ id: string; content: string }>(`/workbench-api/prompts/${encodeURIComponent(id)}/preview`, { method: "POST", body: JSON.stringify({ content }) }),
+  publishPrompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/publish`, { method: "POST" }),
+  restorePrompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/restore-default`, { method: "POST" }),
   capabilities: () => request<{ workflows: Array<{ id: WorkflowId; name: string; description: string; target: string; approval: WorkflowApproval; stages: string[] }>; prompts: Array<{ id: string; name: string; description: string }>; agent: { tools: string[]; processors: string[] } }>("/workbench-api/capabilities"),
   createNovel: (title: string, approvalMode: "milestone_approval" | "auto" = "milestone_approval") => request<NovelState>("/workbench-api/novels", { method: "POST", body: JSON.stringify({ title, approvalMode }) }),
   novel: (id: string) => request<{ novel: NovelState; nextAction: NextAction; milestone: string }>(`/workbench-api/novels/${id}`),

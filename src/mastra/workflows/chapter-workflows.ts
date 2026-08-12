@@ -3,6 +3,7 @@ import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { stringify } from "yaml";
 import { z } from "zod";
 import { modelSettings } from "../../infrastructure/model-settings";
+import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository } from "../../infrastructure/novel-repository";
 import { novelInputHash } from "../../infrastructure/novel-repository";
 import { recordTokenUsage } from "../../infrastructure/token-usage";
@@ -113,18 +114,6 @@ const rangeSuspendSchema = rangeItemSchema.extend({ childRunId: z.string(), prop
 const rangeResumeSchema = z.discriminatedUnion("action", [z.object({ action: z.literal("approve"), proposal: z.object({ artifactKey: z.string(), title: z.string(), format: z.literal("markdown"), content: z.string(), files: z.array(z.object({ path: z.string(), content: z.string() })), metadata: z.record(z.string(), z.unknown()) }).optional() }), z.object({ action: z.literal("revise"), feedback: z.string().min(1).max(2_000), proposal: z.object({ artifactKey: z.string(), title: z.string(), format: z.literal("markdown"), content: z.string(), files: z.array(z.object({ path: z.string(), content: z.string() })), metadata: z.record(z.string(), z.unknown()) }).optional() })]);
 const rangeOutputSchema = z.object({ status: z.literal("committed"), novelId: z.string().uuid(), workflowId: z.literal("chapter-range"), completed: z.array(z.number()) });
 
-async function assembleRangeContext(novelId: string, keys: string[]) {
-  const state = await repository.get(novelId);
-  const sections = [`作品：${state.title}`, `开书选择：${JSON.stringify(state.openingChoices ?? {})}`];
-  for (const key of keys) {
-    const item = state.artifacts[key];
-    if (!item || item.status !== "ready") throw new Error(`上游工件 ${key} 尚未就绪`);
-    const content = (await repository.readArtifact(novelId, key)).content;
-    sections.push(`\n## ${key}\n${key.endsWith(":humanization_revision") ? content.slice(-6_000) : content.slice(0, 18_000)}`);
-  }
-  return sections.join("\n");
-}
-
 const prepareRangeStep = createStep({
   id: "prepare-chapter-range", description: "登记作者批准的章节范围，并生成严格按章节号递增的串行生产任务列表。", inputSchema: rangeInputSchema, outputSchema: z.array(rangeItemSchema),
   execute: async ({ inputData }) => { await repository.setChapterRange(inputData.novelId, inputData.start, inputData.end); return Array.from({ length: inputData.end - inputData.start + 1 }, (_, index) => ({ novelId: inputData.novelId, chapter: inputData.start + index })); },
@@ -145,12 +134,12 @@ const produceRangeItemStep = createStep({
     if (beforePlan.currentChapter !== inputData.chapter) throw new Error(`章节串行游标应为 ${inputData.chapter}，实际为 ${beforePlan.currentChapter}`);
     const planningDependencies = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", "book:volume_outline", ...(inputData.chapter > 1 ? [`chapter:${inputData.chapter - 1}:continuity_update`, `chapter:${inputData.chapter - 1}:humanization_revision`] : [])];
     const planRun = await chapterPlanningWorkflow.createRun({ resourceId: inputData.novelId });
-    const planResult = await planRun.start({ inputData: { novelId: inputData.novelId, workflowId: "chapter-planning" as const, target: String(inputData.chapter), artifactKey: `chapter:${inputData.chapter}:chapter_plan`, artifactPath: `chapters/chapter-${String(inputData.chapter).padStart(3, "0")}/plan.md`, title: `第 ${inputData.chapter} 章计划`, context: await assembleRangeContext(inputData.novelId, planningDependencies), inputHash: novelInputHash(beforePlan, planningDependencies), promptId: "novel.chapter_plan@v2", promptVersion: "novel.chapter_plan@v2", modelProfile: "planning" as const, dependsOn: planningDependencies, requiresReview: false } });
+    const planResult = await planRun.start({ inputData: { novelId: inputData.novelId, workflowId: "chapter-planning" as const, target: String(inputData.chapter), artifactKey: `chapter:${inputData.chapter}:chapter_plan`, artifactPath: `chapters/chapter-${String(inputData.chapter).padStart(3, "0")}/plan.md`, title: `第 ${inputData.chapter} 章计划`, context: await assembleNovelContext(repository, inputData.novelId, planningDependencies), inputHash: novelInputHash(beforePlan, planningDependencies), promptId: "novel.chapter_plan@v2", promptVersion: "novel.chapter_plan@v2", modelProfile: "planning" as const, dependsOn: planningDependencies, requiresReview: false } });
     if (planResult.status !== "success") throw new Error(`第 ${inputData.chapter} 章计划未完成`);
     const beforeDraft = await repository.get(inputData.novelId);
     const productionDependencies = [...planningDependencies, `chapter:${inputData.chapter}:chapter_plan`];
     const productionRun = await chapterProductionWorkflow.createRun({ resourceId: inputData.novelId });
-    const productionResult = await productionRun.start({ inputData: { novelId: inputData.novelId, chapter: inputData.chapter, context: await assembleRangeContext(inputData.novelId, productionDependencies), inputHash: novelInputHash(beforeDraft, productionDependencies), dependsOn: productionDependencies } });
+    const productionResult = await productionRun.start({ inputData: { novelId: inputData.novelId, chapter: inputData.chapter, context: await assembleNovelContext(repository, inputData.novelId, productionDependencies), inputHash: novelInputHash(beforeDraft, productionDependencies), dependsOn: productionDependencies } });
     if (productionResult.status === "suspended") return suspend({ ...inputData, childRunId: productionRun.runId, proposal: { artifactKey: `chapter:${inputData.chapter}:structural_replan`, title: `第 ${inputData.chapter} 章需要结构性处理`, format: "markdown" as const, content: "本章审查认为现有职责与相邻计划存在结构性冲突。请批准按审查意见修复，或填写新的处理意见。", files: [], metadata: { childRunId: productionRun.runId } } });
     if (productionResult.status !== "success") throw new Error(`第 ${inputData.chapter} 章在 ${productionResult.status} 状态停止`);
     return { ...inputData, verdict: productionResult.result.verdict };

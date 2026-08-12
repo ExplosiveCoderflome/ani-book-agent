@@ -33,6 +33,7 @@ import {
 } from "../shared/contracts";
 import { modelSettings } from "../infrastructure/model-settings";
 import { mastraStorage } from "./runtime-storage";
+import { listPromptBlocks, promptBlock, previewPromptDraft, publishPromptDraft, restorePromptDefault, savePromptDraft } from "./prompts/prompt-blocks";
 
 const cors = { origin: ["http://127.0.0.1:5175"], allowMethods: ["GET", "POST", "PUT", "OPTIONS"] };
 
@@ -76,6 +77,12 @@ export const workbenchApiRoutes = [
   route("/workbench-api/model-settings/test", "POST", async (c) => c.json(await testModelConnection())),
   route("/workbench-api/model-profiles", "GET", async (c) => c.json(await modelSettings.profiles())),
   route("/workbench-api/model-profiles", "PUT", async (c) => c.json(await modelSettings.saveProfiles(modelProfilesInputSchema.parse(await input(c, modelProfilesInputSchema))))),
+  route("/workbench-api/prompts", "GET", async (c) => c.json({ prompts: await listPromptBlocks() })),
+  route("/workbench-api/prompts/:id", "GET", async (c) => c.json(await promptBlock(decodeURIComponent(c.req.param("id"))))),
+  route("/workbench-api/prompts/:id/draft", "PUT", async (c) => { const body = z.object({ content: z.string() }).parse(await input(c, z.object({ content: z.string() }))); return c.json(await savePromptDraft(decodeURIComponent(c.req.param("id")), body.content)); }),
+  route("/workbench-api/prompts/:id/preview", "POST", async (c) => { const body = z.object({ content: z.string() }).parse(await input(c, z.object({ content: z.string() }))); return c.json(await previewPromptDraft(decodeURIComponent(c.req.param("id")), body.content)); }),
+  route("/workbench-api/prompts/:id/publish", "POST", async (c) => c.json(await publishPromptDraft(decodeURIComponent(c.req.param("id"))))),
+  route("/workbench-api/prompts/:id/restore-default", "POST", async (c) => c.json(await restorePromptDefault(decodeURIComponent(c.req.param("id"))))),
   route("/workbench-api/novels", "GET", async (c) => c.json({ novels: await novelRepository.list() })),
   route("/workbench-api/novels", "POST", async (c) => {
     const body = createNovelInputSchema.parse(await input(c, createNovelInputSchema));

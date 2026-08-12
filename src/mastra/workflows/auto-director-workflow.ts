@@ -1,6 +1,7 @@
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { artifactKey, type WorkflowId } from "../../domain";
+import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository, novelInputHash } from "../../infrastructure/novel-repository";
 import { artifactProposalSchema } from "../../shared/contracts";
 import { artifactWorkflows } from "./artifact-workflows";
@@ -46,17 +47,6 @@ const bookPlan: Array<{ workflowId: Exclude<WorkflowId, "chapter-production" | "
   { workflowId: "volume-outline", key: "book:volume_outline", path: "volumes/volume-01.md", title: "当前卷骨架与节奏板", promptId: "novel.volume_outline@v2", profile: "planning", dependsOn: ["book:volume_strategy"], milestone: false },
 ];
 
-async function contextFor(novelId: string, keys: string[]) {
-  const state = await repository.get(novelId);
-  const sections = [`作品：${state.title}`, `开书选择：${JSON.stringify(state.openingChoices ?? {})}`];
-  for (const key of keys) {
-    const artifact = state.artifacts[key];
-    if (!artifact || artifact.status !== "ready") throw new Error(`上游工件 ${key} 尚未就绪`);
-    sections.push(`\n## ${key}\n${(await repository.readArtifact(novelId, key)).content.slice(0, 18_000)}`);
-  }
-  return sections.join("\n");
-}
-
 async function suspendedStep(workflow: any, runId: string) {
   const state = await workflow.getWorkflowRunById(runId, { fields: ["steps"] });
   const entry = Object.entries(state.steps ?? {}).map(([id, raw]: [string, any]) => [id, Array.isArray(raw) ? raw.at(-1) : raw] as const).find(([, step]) => step?.suspendPayload);
@@ -99,7 +89,7 @@ const runStep = createStep({
     for (const item of bookPlan) {
       const current = await repository.get(inputData.novelId);
       if (current.artifacts[item.key]?.status === "ready") continue;
-      const context = await contextFor(inputData.novelId, item.dependsOn);
+      const context = await assembleNovelContext(repository, inputData.novelId, item.dependsOn);
       const workflow = artifactWorkflowById[item.workflowId];
       const child = await workflow.createRun({ resourceId: inputData.novelId });
       const result = await child.start({ inputData: { novelId: inputData.novelId, workflowId: item.workflowId, artifactKey: item.key, artifactPath: item.path, title: item.title, context, inputHash: novelInputHash(current, item.dependsOn), promptId: item.promptId, promptVersion: item.promptId, modelProfile: item.profile, dependsOn: item.dependsOn, requiresReview: item.milestone && !autoApprove } });

@@ -15,6 +15,7 @@ import { chapterProductionWorkflow, chapterRangeWorkflow, novelExportWorkflow } 
 import { autoDirectorWorkflow } from "../mastra/workflows/auto-director-workflow";
 import { requireStructuredOutput, structuredOutputOptions } from "../mastra/structured-output";
 import { AppError } from "./errors";
+import { assembleNovelContext } from "./context-assembler";
 import { runEvents } from "./run-events";
 
 export const novelRepository = new NovelRepository();
@@ -53,19 +54,6 @@ function chapterNumber(target?: string) {
   const value = Number(target);
   if (!Number.isInteger(value) || value < 1) throw new AppError("INVALID_CHAPTER", "请提供有效章节号。", 400, true);
   return value;
-}
-
-async function assembleContext(novelId: string, keys: string[]) {
-  const state = await novelRepository.get(novelId);
-  const sections = [`作品：${state.title}`, state.openingChoices ? `开书选择：${JSON.stringify(state.openingChoices)}` : "开书选择尚未确认"];
-  for (const key of keys) {
-    const artifact = state.artifacts[key];
-    if (!artifact || artifact.status !== "ready") throw new AppError("DEPENDENCY_NOT_READY", `上游工件 ${key} 尚未就绪。`, 409, true);
-    const content = (await novelRepository.readArtifact(novelId, key)).content;
-    const bounded = key.endsWith(":humanization_revision") ? content.slice(-6_000) : content.slice(0, 18_000);
-    sections.push(`\n## ${key}\n${bounded}`);
-  }
-  return sections.join("\n");
 }
 
 export function statusOf(value: string): RunView["status"] {
@@ -147,14 +135,14 @@ export async function startWorkflowRun(novelId: string, workflowId: WorkflowId, 
     const chapter = chapterNumber(target ?? String(state.currentChapter));
     if (chapter !== state.currentChapter || chapter > state.approvedChapterEnd) throw new AppError("CHAPTER_NOT_APPROVED", "该章节尚未获得生产授权。", 409, true);
     const dependsOn = definitions["chapter-planning"].dependsOn(String(chapter)).concat(`chapter:${chapter}:chapter_plan`);
-    inputData = { novelId, chapter, context: await assembleContext(novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), dependsOn };
+    inputData = { novelId, chapter, context: await assembleNovelContext(novelRepository, novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), dependsOn };
   } else if (workflowId === "novel-export") inputData = { novelId, fileName: target };
   else if (workflowId === "chapter-range") throw new AppError("USE_CHAPTER_RANGE_API", "请使用章节范围接口。", 400, false);
   else {
     const definition = definitions[workflowId];
     const dependsOn = definition.dependsOn(target);
     const key = definition.artifactKey(target);
-    inputData = { novelId, workflowId, target, artifactKey: key, artifactPath: definition.path(target), title: definition.title, context: await assembleContext(novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), promptId: definition.promptId, promptVersion: definition.promptId, modelProfile: definition.profile, dependsOn, requiresReview: definition.milestone && (state.approvalMode ?? "milestone_approval") === "milestone_approval", ...extra };
+    inputData = { novelId, workflowId, target, artifactKey: key, artifactPath: definition.path(target), title: definition.title, context: await assembleNovelContext(novelRepository, novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), promptId: definition.promptId, promptVersion: definition.promptId, modelProfile: definition.profile, dependsOn, requiresReview: definition.milestone && (state.approvalMode ?? "milestone_approval") === "milestone_approval", ...extra };
   }
   const workflow = workflows[workflowId];
   const run = await workflow.createRun({ resourceId: novelId });

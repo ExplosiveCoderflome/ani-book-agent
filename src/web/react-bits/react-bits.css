@@ -1,0 +1,8 @@
+/* Source: React Bits (David Haz), MIT + Commons Clause License Condition v1.0. */
+.shiny-text { display: inline-block; }
+.card-spotlight { position: relative; overflow: hidden; --mouse-x: 50%; --mouse-y: 50%; --spotlight-color: rgba(166, 103, 34, .22); }
+.card-spotlight::before { content: ""; position: absolute; z-index: 2; inset: 0; pointer-events: none; opacity: 0; background: radial-gradient(circle at var(--mouse-x) var(--mouse-y), var(--spotlight-color), transparent 76%); transition: opacity .5s ease; }
+.card-spotlight:hover::before { opacity: .75; }
+.click-spark { position: relative; width: 100%; height: 100%; }
+.click-spark > canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .card-spotlight::before { transition: none; } }

@@ -1,6 +1,17 @@
 import { MastraEditor } from "@mastra/editor";
+import { AppError } from "../../application/errors";
 
 export interface PromptBlockDefault { id: string; name: string; description: string; content: string }
+export type PromptGroup = "对话引导" | "书级策划" | "章节生产" | "审查修复";
+export function promptPresentation(id: string): { group: PromptGroup; usage: string; order: number } {
+  const entries: Record<string, { group: PromptGroup; usage: string; order: number }> = {
+    "novel.chat@v2": { group: "对话引导", usage: "作者对话", order: 1 }, "novel.chat_choices@v2": { group: "对话引导", usage: "快捷选择", order: 2 },
+    "novel.brief@v2": { group: "书级策划", usage: "小说简报", order: 10 }, "novel.story_bible@v2": { group: "书级策划", usage: "故事圣经", order: 11 }, "novel.world_bible@v2": { group: "书级策划", usage: "世界圣经", order: 12 }, "novel.character_cast@v2": { group: "书级策划", usage: "角色阵容", order: 13 }, "novel.volume_strategy@v2": { group: "书级策划", usage: "卷战略", order: 14 }, "novel.volume_outline@v2": { group: "书级策划", usage: "卷骨架", order: 15 },
+    "novel.chapter_plan@v2": { group: "章节生产", usage: "章节计划", order: 20 }, "novel.chapter_writer@v2": { group: "章节生产", usage: "正文写作", order: 21 }, "novel.chapter_humanize@v2": { group: "章节生产", usage: "正文润色", order: 22 },
+    "novel.chapter_review@v2": { group: "审查修复", usage: "章节审查", order: 30 }, "novel.chapter_repair@v2": { group: "审查修复", usage: "章节修复", order: 31 }, "novel.continuity_extract@v2": { group: "审查修复", usage: "连续性抽取", order: 32 },
+  };
+  return entries[id] ?? { group: "书级策划", usage: "创作任务", order: 99 };
+}
 
 const sharedBoundary = `
 
@@ -244,6 +255,17 @@ export const promptBlockDefaults: PromptBlockDefault[] = [
 export const novelEditor = new MastraEditor();
 let seedPromise: Promise<void> | undefined;
 
+export type PromptBlockView = { id: string; name: string; description: string; defaultContent: string; draftContent?: string; publishedContent?: string; draftVersion?: string; publishedVersion?: string; activeSource: "official" | "custom"; draftSource?: "official" | "custom"; group: PromptGroup; usage: string; order: number };
+const promptContent = (value: unknown) => {
+  if (typeof value !== "string" || value.trim().length < 80 || value.length > 12_000) throw new AppError("PROMPT_CONTENT_INVALID", "提示词内容需为 80 至 12,000 个字符。", 400, true);
+  return value.trim();
+};
+function promptDefault(id: string) {
+  const item = promptBlockDefaults.find((candidate) => candidate.id === id);
+  if (!item) throw new AppError("PROMPT_NOT_FOUND", "未找到该提示词模板。", 404, false);
+  return item;
+}
+
 export function ensureDefaultPromptBlocks() {
   seedPromise ??= (async () => {
     for (const item of promptBlockDefaults) {
@@ -263,4 +285,34 @@ export async function resolvePromptBlock(id: string, context: Record<string, unk
   const content = stored?.content ?? fallback?.content;
   if (!content) throw new Error(`Unknown prompt block: ${id}`);
   return { content: await novelEditor.prompt.preview([{ type: "text", content }], context).catch(() => content), version: stored?.resolvedVersionId ?? id };
+}
+
+export async function listPromptBlocks(): Promise<PromptBlockView[]> {
+  await ensureDefaultPromptBlocks();
+  return Promise.all(promptBlockDefaults.map(async (item) => {
+    const [draft, published] = await Promise.all([novelEditor.prompt.getById(item.id, { status: "draft" }), novelEditor.prompt.getById(item.id, { status: "published" })]);
+    return { id: item.id, name: item.name, description: item.description, defaultContent: item.content, draftContent: draft?.content, publishedContent: published?.content, activeSource: (published?.content ?? item.content) === item.content ? "official" : "custom", ...promptPresentation(item.id), draftVersion: draft?.resolvedVersionId, publishedVersion: published?.resolvedVersionId, ...(draft?.content ? { draftSource: draft.content === item.content ? "official" as const : "custom" as const } : {}) };
+  }));
+}
+
+export async function promptBlock(id: string) { return (await listPromptBlocks()).find((item) => item.id === promptDefault(id).id)!; }
+export async function savePromptDraft(id: string, content: unknown) {
+  promptDefault(id); await ensureDefaultPromptBlocks();
+  await novelEditor.prompt.update({ id, content: promptContent(content), status: "draft" });
+  return promptBlock(id);
+}
+export async function previewPromptDraft(id: string, content: unknown) {
+  const item = promptDefault(id); const rendered = await novelEditor.prompt.preview([{ type: "text", content: promptContent(content) }], { taskType: "planning", promptId: item.id }).catch(() => String(content));
+  return { id, content: rendered };
+}
+export async function publishPromptDraft(id: string) {
+  promptDefault(id); await ensureDefaultPromptBlocks();
+  const draft = await novelEditor.prompt.getById(id, { status: "draft" });
+  if (!draft?.resolvedVersionId) throw new AppError("PROMPT_DRAFT_REQUIRED", "请先保存有效草稿后再发布。", 409, true);
+  await novelEditor.prompt.update({ id, activeVersionId: draft.resolvedVersionId, status: "published" });
+  return promptBlock(id);
+}
+export async function restorePromptDefault(id: string) {
+  await savePromptDraft(id, promptDefault(id).content);
+  return publishPromptDraft(id);
 }

@@ -16,6 +16,10 @@ import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import "@assistant-ui/react-markdown/styles/dot.css";
 import { Check, Feather, LoaderCircle, Send, Square } from "lucide-react";
 import remarkGfm from "remark-gfm";
+import { ThinkingOrb } from "thinking-orbs";
+import AnimatedContent from "./react-bits/AnimatedContent";
+import ClickSpark from "./react-bits/ClickSpark";
+import SpotlightCard from "./react-bits/SpotlightCard";
 
 function fromDatabase(message: MastraDBMessage): ThreadMessageLike {
   const text = message.content.parts.filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
@@ -29,8 +33,8 @@ function convertMessage(source: ConversationMessage): ThreadMessageLike {
 
 function PlainTextPart() { return <MessagePartPrimitive.Text component="p" className="message-text" />; }
 function MarkdownTextPart() { return <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="message-markdown" />; }
-function WorkflowDataPart({ data }: DataMessagePartProps<{ node: ReactNode }>) { return <div className="workflow-data-part">{data.node}</div>; }
-function ThinkingDataPart() { return <div className="assistant-thinking" role="status"><LoaderCircle className="spin" size={16} /><span>正在连接模型并思考…</span></div>; }
+function WorkflowDataPart({ data }: DataMessagePartProps<{ node: ReactNode }>) { return <AnimatedContent className="workflow-data-part" distance={18}>{data.node}</AnimatedContent>; }
+function ThinkingDataPart() { return <div className="assistant-thinking" role="status"><ThinkingOrb state="working" size={20} theme="light" aria-label="创作搭档正在思考" /><span>创作搭档正在思考…</span></div>; }
 
 const ChoiceActionContext = createContext<{ sendMessage: (text: string) => Promise<void>; isRunning: boolean } | null>(null);
 
@@ -38,11 +42,11 @@ function ChoicesDataPart({ data }: DataMessagePartProps<{ choices: ChatChoice[] 
   const action = useContext(ChoiceActionContext);
   const [selected, setSelected] = useState("");
   if (!action || !data.choices.length) return null;
-  return <div className="chat-choices" aria-label="快捷选择">{data.choices.map((choice: ChatChoice) => <button type="button" key={choice.message} disabled={action.isRunning || Boolean(selected)} onClick={() => { setSelected(choice.message); void action.sendMessage(choice.message); }}><span>{choice.label}</span><small>{choice.description}</small></button>)}</div>;
+  return <div className="chat-choices" aria-label="快捷选择">{data.choices.map((choice: ChatChoice, index: number) => <AnimatedContent key={choice.message} distance={14} delay={index * .055}><SpotlightCard className="choice-spotlight"><ClickSpark sparkColor="#bd7a2d" sparkRadius={18} sparkCount={7}><button type="button" disabled={action.isRunning || Boolean(selected)} onClick={() => { setSelected(choice.message); void action.sendMessage(choice.message); }}><span>{choice.label}</span><small>{choice.description}</small></button></ClickSpark></SpotlightCard></AnimatedContent>)}</div>;
 }
 
 function ChatMessage() {
-  return <MessagePrimitive.Root className="message-row">
+  return <MessagePrimitive.Root className="message-row message-reveal">
     <MessagePrimitive.If assistant><article className="message assistant-message"><span className="assistant-avatar"><Feather size={16} /></span><div><strong className="assistant-name">创作搭档</strong><MessagePrimitive.Parts components={{ Text: MarkdownTextPart, data: { by_name: { workflow: WorkflowDataPart, thinking: ThinkingDataPart, choices: ChoicesDataPart } } }} /></div></article></MessagePrimitive.If>
     <MessagePrimitive.If user><article className="message user-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
     <MessagePrimitive.If system><article className="message system-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
