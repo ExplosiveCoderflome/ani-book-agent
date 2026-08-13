@@ -1,6 +1,6 @@
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
-import { artifactKey, type WorkflowId } from "../../domain";
+import { artifactKey, volumeHandoffKey, type WorkflowId } from "../../domain";
 import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository, novelInputHash } from "../../infrastructure/novel-repository";
 import { artifactProposalSchema } from "../../shared/contracts";
@@ -35,6 +35,8 @@ const artifactWorkflowById = {
   "character-cast": artifactWorkflows.characterCastWorkflow,
   "volume-strategy": artifactWorkflows.volumeStrategyWorkflow,
   "volume-outline": artifactWorkflows.volumeOutlineWorkflow,
+  "volume-handoff": artifactWorkflows.volumeHandoffWorkflow,
+  "completion-audit": artifactWorkflows.completionAuditWorkflow,
   "chapter-planning": artifactWorkflows.chapterPlanningWorkflow,
   "quality-repair": artifactWorkflows.qualityRepairWorkflow,
 };
@@ -44,7 +46,6 @@ const bookPlan: Array<{ workflowId: Exclude<WorkflowId, "chapter-production" | "
   { workflowId: "world-bible", key: "book:world_bible", path: "world-bible.md", title: "世界圣经", promptId: "novel.world_bible@v2", profile: "planning", dependsOn: ["book:novel_brief", "book:story_bible"], milestone: false },
   { workflowId: "character-cast", key: "book:character_cast", path: "characters/character-roster.md", title: "角色阵容", promptId: "novel.character_cast@v2", profile: "planning", dependsOn: ["book:novel_brief", "book:story_bible", "book:world_bible"], milestone: false },
   { workflowId: "volume-strategy", key: "book:volume_strategy", path: "volumes/volume-strategy.md", title: "卷战略", promptId: "novel.volume_strategy@v2", profile: "planning", dependsOn: ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast"], milestone: true },
-  { workflowId: "volume-outline", key: "book:volume_outline", path: "volumes/volume-01.md", title: "当前卷骨架与节奏板", promptId: "novel.volume_outline@v2", profile: "planning", dependsOn: ["book:volume_strategy"], milestone: false },
 ];
 
 async function suspendedStep(workflow: any, runId: string) {
@@ -87,6 +88,8 @@ const runStep = createStep({
     }
 
     for (const item of bookPlan) {
+      if (item.workflowId === "volume-outline") continue;
+      if (item.workflowId === "volume-handoff" || item.workflowId === "completion-audit") continue;
       const current = await repository.get(inputData.novelId);
       if (current.artifacts[item.key]?.status === "ready") continue;
       const context = await assembleNovelContext(repository, inputData.novelId, item.dependsOn);
@@ -102,7 +105,21 @@ const runStep = createStep({
       if (result.status !== "success") throw new Error(`${item.workflowId} 子运行未完成：${result.status}`);
     }
 
-    const current = await repository.get(inputData.novelId);
+    let current = await repository.get(inputData.novelId);
+    if (current.schemaVersion === 2) {
+      const volume = current.volumes[String(current.currentVolume)];
+      if (!volume || volume.status !== "active") throw new Error(`第 ${current.currentVolume} 卷尚未配置章节范围`);
+      const outlineKey = `volume:${current.currentVolume}:outline`;
+      if (current.artifacts[outlineKey]?.status !== "ready") {
+        const outlineDependencies = current.currentVolume > 1 ? ["book:volume_strategy", volumeHandoffKey(current.currentVolume - 1)] : ["book:volume_strategy"];
+        const context = await assembleNovelContext(repository, inputData.novelId, outlineDependencies);
+        const workflow = artifactWorkflowById["volume-outline"];
+        const child = await workflow.createRun({ resourceId: inputData.novelId });
+        const result = await child.start({ inputData: { novelId: inputData.novelId, workflowId: "volume-outline", target: String(current.currentVolume), artifactKey: outlineKey, artifactPath: `volumes/volume-${String(current.currentVolume).padStart(2, "0")}.md`, title: `第 ${current.currentVolume} 卷骨架与节奏板`, context, inputHash: novelInputHash(current, outlineDependencies), promptId: "novel.volume_outline@v2", promptVersion: "novel.volume_outline@v2", modelProfile: "planning", dependsOn: outlineDependencies, requiresReview: false } });
+        if (result.status !== "success") throw new Error(`第 ${current.currentVolume} 卷骨架未完成`);
+        current = await repository.get(inputData.novelId);
+      }
+    }
     const startChapter = inputData.startChapter ?? current.currentChapter;
     if (startChapter !== current.currentChapter) throw new Error(`自动导演应从第 ${current.currentChapter} 章开始`);
     const child = await chapterRangeWorkflow.createRun({ resourceId: inputData.novelId });

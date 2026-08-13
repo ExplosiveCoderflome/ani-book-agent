@@ -4,7 +4,7 @@ import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "nod
 import path from "node:path";
 import { parse, stringify } from "yaml";
 import { DatabaseSync } from "node:sqlite";
-import { artifactKey, decideNextAction, novelStateSchema, untitledNovelTitle, type ArtifactState, type NovelState, type ProductionStage } from "../domain";
+import { artifactKey, completionAuditBlockers, completionAuditResultSchema, decideNextAction, novelStateSchema, untitledNovelTitle, volumeHandoffKey, volumeOutlineKey, volumePlanSchema, type ArtifactState, type NovelState, type ProductionStage, type VolumePlan } from "../domain";
 import { AppError } from "../application/errors";
 import { artifactProposalSchema, novelBriefSchema, openingChoicesInputSchema, promptVersion, type ArtifactProposal, type NovelBrief, type NovelSummary } from "../shared/contracts";
 
@@ -22,7 +22,7 @@ function stableJson(value: unknown): string {
 
 export function novelInputHash(state: NovelState, dependencies: string[] = []): string {
   const selected = dependencies.map((key) => ({ key, sha256: state.artifacts[key]?.sha256 ?? null }));
-  return sha256(stableJson({ title: state.title, openingChoices: state.openingChoices, dependencies: selected }));
+  return sha256(stableJson({ title: state.title, openingChoices: state.openingChoices, currentVolume: state.currentVolume, volumes: state.volumes, productionStatus: state.productionStatus, completionAudit: state.completionAudit, dependencies: selected }));
 }
 
 export function renderNovelBrief(brief: NovelBrief): string {
@@ -70,7 +70,7 @@ export class NovelRepository {
 
   async create(title: string, approvalMode: "milestone_approval" | "auto" = "milestone_approval"): Promise<NovelState> {
     const now = new Date().toISOString();
-    const state: NovelState = { schemaVersion: 2, novelId: randomUUID(), title, approvalMode, currentChapter: 1, approvedChapterEnd: 0, artifacts: {}, continuity: { lastCommittedChapter: 0, revision: 0 }, createdAt: now, updatedAt: now };
+    const state: NovelState = { schemaVersion: 2, novelId: randomUUID(), title, approvalMode, currentChapter: 1, approvedChapterEnd: 0, currentVolume: 1, volumes: {}, productionStatus: "in_progress", artifacts: {}, continuity: { lastCommittedChapter: 0, revision: 0 }, createdAt: now, updatedAt: now };
     await this.writeState(state);
     return state;
   }
@@ -103,7 +103,23 @@ export class NovelRepository {
   async setChapterRange(novelId: string, start: number, end: number): Promise<NovelState> {
     const state = await this.prepareForWrite(await this.get(novelId));
     if (start !== state.currentChapter) throw new AppError("CHAPTER_RANGE_STALE", `当前应从第 ${state.currentChapter} 章开始。`, 409, true);
+    const volume = state.schemaVersion === 2 ? state.volumes[String(state.currentVolume)] : undefined;
+    if (state.schemaVersion === 2 && !volume) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
+    if (volume && (volume.status !== "active" || end > volume.endChapter)) throw new AppError("VOLUME_RANGE_EXCEEDED", `章节范围不能超过第 ${state.currentVolume} 卷的结束章节 ${volume.endChapter}。`, 409, true);
     state.approvedChapterEnd = end;
+    await this.touchAndWrite(state);
+    return state;
+  }
+
+  async setVolumePlan(novelId: string, plan: unknown): Promise<NovelState> {
+    const state = await this.prepareForWrite(await this.get(novelId));
+    if (state.productionStatus === "completed") throw new AppError("NOVEL_COMPLETED", "这部小说已经完本，不能重新配置卷范围。", 409, false);
+    if (state.productionStatus === "awaiting_completion_review") throw new AppError("COMPLETION_REVIEW_REQUIRED", "最终卷已完成，请先完成完本验收。", 409, true);
+    const parsed = volumePlanSchema.parse(plan);
+    if (parsed.number !== state.currentVolume || parsed.startChapter !== state.currentChapter) throw new AppError("VOLUME_PLAN_STALE", `当前应配置第 ${state.currentVolume} 卷，从第 ${state.currentChapter} 章开始。`, 409, true);
+    if (parsed.number > 1 && state.volumes[String(parsed.number - 1)]?.status === "completed" && state.volumes[String(parsed.number - 1)]?.final === false && state.artifacts[volumeHandoffKey(parsed.number - 1)]?.status !== "ready") throw new AppError("VOLUME_HANDOFF_REQUIRED", `请先完成第 ${parsed.number - 1} 卷的卷间承接包。`, 409, true);
+    state.volumes[String(parsed.number)] = parsed;
+    state.approvedChapterEnd = parsed.endChapter;
     await this.touchAndWrite(state);
     return state;
   }
@@ -137,12 +153,27 @@ export class NovelRepository {
     if (existing?.protected) throw new AppError("ARTIFACT_PROTECTED", "该工件已被作者保护，需要明确解除保护后才能替换。", 409, false);
     if (existing?.status === "ready" && existing.inputHash === args.expectedInputHash && existing.promptVersion === args.promptVersion) return { state, sha256: existing.sha256 ?? "", duplicate: true };
 
+    const completionAudit = proposal.artifactKey === "book:completion_audit" ? completionAuditResultSchema.parse(proposal.metadata.completionAudit ?? proposal.metadata.structured) : undefined;
+    if (proposal.artifactKey === "book:completion_audit") {
+      const volume = state.volumes[String(state.currentVolume)];
+      if (state.productionStatus !== "awaiting_completion_review" || !volume?.final || volume.status !== "completed") throw new AppError("COMPLETION_AUDIT_NOT_DUE", "当前还没有进入最终卷完本验收阶段。", 409, true);
+    }
+    if (/^volume:\d+:handoff$/.test(proposal.artifactKey)) {
+      const volumeNumber = Number(proposal.artifactKey.split(":")[1]);
+      const volume = state.volumes[String(volumeNumber)];
+      if (!volume || volume.status !== "completed" || volume.final || state.currentVolume !== volumeNumber + 1) throw new AppError("VOLUME_HANDOFF_NOT_DUE", "当前还没有进入该卷的卷间承接阶段。", 409, true);
+    }
+    if (completionAudit?.verdict === "pass" && completionAuditBlockers(state).length) throw new AppError("COMPLETION_AUDIT_INVALID", "完本验收报告标记通过，但权威工件仍存在阻断项。", 409, true);
     const files = proposal.files.length ? proposal.files : [{ path: this.defaultPath(proposal.artifactKey), content: proposal.content }];
     for (const file of files) await atomicWrite(this.artifactPath(args.novelId, file.path), file.content);
     const [main] = files;
     if (!main) throw new AppError("EMPTY_PROPOSAL", "工件提案没有可写内容。", 400, true);
     const contentHash = sha256(main.content);
     state.artifacts[proposal.artifactKey] = { key: proposal.artifactKey, stage: this.stageForKey(proposal.artifactKey), status: "ready", path: normalizeArtifactPath(main.path), source: "ai_generated", protected: false, userEdited: false, sha256: contentHash, inputHash: args.expectedInputHash, promptVersion: args.promptVersion, dependsOn: dependencies, committedAt: new Date().toISOString() };
+    if (completionAudit) {
+      state.completionAudit = completionAudit;
+      state.productionStatus = completionAudit.verdict === "pass" ? "completed" : "awaiting_completion_review";
+    }
     this.invalidateDependents(state, [proposal.artifactKey]);
     await this.touchAndWrite(state);
     return { state, sha256: contentHash, duplicate: false };
@@ -151,6 +182,13 @@ export class NovelRepository {
   async commitBundle(args: { novelId: string; expectedInputHash: string; promptVersion: string; dependsOn: string[]; artifacts: Array<{ key: string; path: string; content: string; source?: "ai_generated" | "user_edited" | "imported" }>; continuityDelta?: { chapter: number; facts: string[]; characterStates: string[]; resources: string[]; relationships: string[]; payoffs: string[]; worldChanges: string[] } }) {
     const state = await this.prepareForWrite(await this.get(args.novelId));
     if (novelInputHash(state, args.dependsOn) !== args.expectedInputHash) throw new AppError("CONTEXT_STALE", "上游内容已经改变，请重新生成。", 409, true);
+    if (args.continuityDelta) {
+      const chapter = args.continuityDelta.chapter;
+      if (chapter !== state.currentChapter) throw new AppError("CHAPTER_NOT_CURRENT", `只能提交当前第 ${state.currentChapter} 章。`, 409, true);
+    const volume = state.schemaVersion === 2 ? state.volumes[String(state.currentVolume)] : undefined;
+      if (state.schemaVersion === 2 && (!volume || volume.status !== "active")) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
+      if (volume && chapter > volume.endChapter) throw new AppError("VOLUME_RANGE_EXCEEDED", `第 ${chapter} 章超出第 ${state.currentVolume} 卷的结束章节 ${volume.endChapter}。`, 409, true);
+    }
     const artifacts: Array<{ key: string; path: string; content: string; source?: "ai_generated" | "user_edited" | "imported" }> = [...args.artifacts, ...(args.continuityDelta ? await this.continuityArtifacts(args.novelId, args.continuityDelta) : [])];
     for (const item of artifacts) if (state.artifacts[item.key]?.protected) throw new AppError("ARTIFACT_PROTECTED", `工件 ${item.key} 已被作者保护。`, 409, false);
     for (const item of artifacts) await atomicWrite(this.artifactPath(args.novelId, item.path), item.content);
@@ -161,6 +199,13 @@ export class NovelRepository {
       const chapter = Number(continuity.key.split(":")[1]);
       state.continuity = { lastCommittedChapter: chapter, revision: (state.continuity?.revision ?? 0) + 1 };
       state.currentChapter = chapter + 1;
+      const volume = state.volumes[String(state.currentVolume)];
+      if (volume && chapter >= volume.endChapter) {
+        state.volumes[String(state.currentVolume)] = { ...volume, status: "completed" };
+        state.approvedChapterEnd = chapter;
+        if (volume.final) state.productionStatus = "awaiting_completion_review";
+        else state.currentVolume += 1;
+      }
     }
     await this.touchAndWrite(state);
     if (args.continuityDelta) this.rebuildContinuityIndex(args.novelId, args.continuityDelta.chapter);
@@ -231,6 +276,11 @@ export class NovelRepository {
     if (key === "book:character_cast") return "characters/character-roster.md";
     if (key === "book:volume_strategy") return "volumes/volume-strategy.md";
     if (key === "book:volume_outline") return "volumes/volume-01.md";
+    const volumeMatch = /^volume:(\d+):outline$/.exec(key);
+    if (volumeMatch) return `volumes/volume-${String(Number(volumeMatch[1])).padStart(2, "0")}.md`;
+    const handoffMatch = /^volume:(\d+):handoff$/.exec(key);
+    if (handoffMatch) return `volumes/volume-${String(Number(handoffMatch[1])).padStart(2, "0")}-handoff.md`;
+    if (key === "book:completion_audit") return "production/completion-audit.md";
     const match = /^chapter:(\d+):(.+)$/.exec(key);
     if (match) { const chapterNumber = match[1]; const stage = match[2]; if (!chapterNumber || !stage) throw new AppError("INVALID_ARTIFACT_KEY", "章节工件键无效。", 400, false); const chapter = chapterNumber.padStart(3, "0"); const names: Record<string, string> = { chapter_plan: "plan.md", context_package: "context-package.md", chapter_draft: "draft.md", humanization_revision: "draft-humanized.md", chapter_review: "review.md", continuity_update: "continuity-delta.yaml" }; return `chapters/chapter-${chapter}/${names[stage] ?? `${stage}.md`}`; }
     if (key.startsWith("export:")) return `exports/${key.slice(7)}.txt`;
@@ -238,8 +288,10 @@ export class NovelRepository {
   }
 
   private stageForKey(key: string): ProductionStage | undefined {
+    if (/^volume:\d+:outline$/.test(key)) return "volume_outline";
+    if (/^volume:\d+:handoff$/.test(key)) return "volume_handoff";
     const name = key.split(":").at(-1) as ProductionStage;
-    return ["novel_brief", "story_bible", "world_bible", "character_cast", "volume_strategy", "volume_outline", "chapter_plan", "context_package", "chapter_draft", "humanization_revision", "chapter_review", "continuity_update", "quality_repair"].includes(name) ? name : undefined;
+    return ["novel_brief", "story_bible", "world_bible", "character_cast", "volume_strategy", "volume_outline", "volume_handoff", "completion_audit", "chapter_plan", "context_package", "chapter_draft", "humanization_revision", "chapter_review", "continuity_update", "quality_repair"].includes(name) ? name : undefined;
   }
 
   private invalidateDependents(state: NovelState, changed: string[]) {
@@ -285,6 +337,9 @@ export class NovelRepository {
     state.schemaVersion = 2;
     state.approvalMode ??= "milestone_approval";
     state.continuity ??= { lastCommittedChapter: Math.max(0, state.currentChapter - 1), revision: 0 };
+    state.currentVolume ??= 1;
+    state.volumes ??= {};
+    state.productionStatus ??= "in_progress";
     for (const [key, artifact] of Object.entries(state.artifacts)) { artifact.key ??= key; artifact.source ??= artifact.userEdited ? "user_edited" : "ai_generated"; artifact.dependsOn ??= []; }
     return state;
   }

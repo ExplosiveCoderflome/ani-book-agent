@@ -1,7 +1,7 @@
 import { RequestContext } from "@mastra/core/request-context";
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
-import { workflowIdSchema, type WorkflowId } from "../../domain";
+import { completionAuditResultSchema, workflowIdSchema, type WorkflowId } from "../../domain";
 import { modelSettings } from "../../infrastructure/model-settings";
 import { NovelRepository, renderNovelBrief } from "../../infrastructure/novel-repository";
 import { recordTokenUsage } from "../../infrastructure/token-usage";
@@ -54,6 +54,13 @@ async function generateProposal(input: WorkflowInput, revision?: { feedback: str
     const content = renderNovelBrief(brief);
     return { proposal: { artifactKey: input.artifactKey, title: input.title, format: "markdown" as const, content, files: [{ path: input.artifactPath, content }], metadata: { structured: brief } }, resolvedPromptVersion: prompt.version };
   }
+  if (input.workflowId === "completion-audit") {
+    const result = await agent.generate(instruction, { requestContext, ...structuredOutputOptions(completionAuditResultSchema), modelSettings: { temperature: selection.parameters.temperature, topP: selection.parameters.topP, maxOutputTokens: selection.parameters.maxOutputTokens } });
+    await recordTokenUsage(input.novelId, { task: input.workflowId, promptVersion: prompt.version, usage: result.usage });
+    const audit = requireStructuredOutput(completionAuditResultSchema, result.object, "完本验收");
+    const content = [`# 完本验收报告`, ``, `- 判定：${audit.verdict}`, `- 摘要：${audit.summary}`, ``, `## 质量债`, ...audit.qualityDebt.map((item) => `- 第 ${item.chapter} 章：${item.issue}`), ``, `## 缺失章节`, ...audit.missingChapters.map((chapter) => `- 第 ${chapter} 章`), ``, `## 未兑现承诺`, ...audit.unresolvedPromises.map((item) => `- ${item}`), ``, `## 连续性异常`, ...audit.continuityAnomalies.map((item) => `- ${item}`), ``].join("\n");
+    return { proposal: { artifactKey: input.artifactKey, title: input.title, format: "markdown" as const, content, files: [{ path: input.artifactPath, content }], metadata: { completionAudit: audit } }, resolvedPromptVersion: prompt.version };
+  }
   const result = await agent.generate(`${instruction}\n\n请返回工件提案。artifactKey 必须为 ${input.artifactKey}，主文件路径必须为 ${input.artifactPath}。`, {
     requestContext,
     ...structuredOutputOptions(artifactProposalSchema),
@@ -98,7 +105,9 @@ export const worldBibleWorkflow = createArtifactWorkflow("world-bible");
 export const characterCastWorkflow = createArtifactWorkflow("character-cast");
 export const volumeStrategyWorkflow = createArtifactWorkflow("volume-strategy");
 export const volumeOutlineWorkflow = createArtifactWorkflow("volume-outline");
+export const volumeHandoffWorkflow = createArtifactWorkflow("volume-handoff");
+export const completionAuditWorkflow = createArtifactWorkflow("completion-audit");
 export const chapterPlanningWorkflow = createArtifactWorkflow("chapter-planning");
 export const qualityRepairWorkflow = createArtifactWorkflow("quality-repair");
 
-export const artifactWorkflows = { novelBriefWorkflow, storyBibleWorkflow, worldBibleWorkflow, characterCastWorkflow, volumeStrategyWorkflow, volumeOutlineWorkflow, chapterPlanningWorkflow, qualityRepairWorkflow };
+export const artifactWorkflows = { novelBriefWorkflow, storyBibleWorkflow, worldBibleWorkflow, characterCastWorkflow, volumeStrategyWorkflow, volumeOutlineWorkflow, volumeHandoffWorkflow, completionAuditWorkflow, chapterPlanningWorkflow, qualityRepairWorkflow };

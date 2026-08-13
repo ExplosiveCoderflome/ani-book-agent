@@ -6,7 +6,7 @@ export type PromptGroup = "对话引导" | "书级策划" | "章节生产" | "�
 export function promptPresentation(id: string): { group: PromptGroup; usage: string; order: number } {
   const entries: Record<string, { group: PromptGroup; usage: string; order: number }> = {
     "novel.chat@v2": { group: "对话引导", usage: "作者对话", order: 1 }, "novel.chat_choices@v2": { group: "对话引导", usage: "快捷选择", order: 2 },
-    "novel.brief@v2": { group: "书级策划", usage: "小说简报", order: 10 }, "novel.story_bible@v2": { group: "书级策划", usage: "故事圣经", order: 11 }, "novel.world_bible@v2": { group: "书级策划", usage: "世界圣经", order: 12 }, "novel.character_cast@v2": { group: "书级策划", usage: "角色阵容", order: 13 }, "novel.volume_strategy@v2": { group: "书级策划", usage: "卷战略", order: 14 }, "novel.volume_outline@v2": { group: "书级策划", usage: "卷骨架", order: 15 },
+    "novel.brief@v2": { group: "书级策划", usage: "小说简报", order: 10 }, "novel.story_bible@v2": { group: "书级策划", usage: "故事圣经", order: 11 }, "novel.world_bible@v2": { group: "书级策划", usage: "世界圣经", order: 12 }, "novel.character_cast@v2": { group: "书级策划", usage: "角色阵容", order: 13 }, "novel.volume_strategy@v2": { group: "书级策划", usage: "卷战略", order: 14 }, "novel.volume_outline@v2": { group: "书级策划", usage: "卷骨架", order: 15 }, "novel.volume_handoff@v2": { group: "书级策划", usage: "卷间承接", order: 16 }, "novel.completion_audit@v2": { group: "审查修复", usage: "完本验收", order: 33 },
     "novel.chapter_plan@v2": { group: "章节生产", usage: "章节计划", order: 20 }, "novel.chapter_writer@v2": { group: "章节生产", usage: "正文写作", order: 21 }, "novel.chapter_humanize@v2": { group: "章节生产", usage: "正文润色", order: 22 },
     "novel.chapter_review@v2": { group: "审查修复", usage: "章节审查", order: 30 }, "novel.chapter_repair@v2": { group: "审查修复", usage: "章节修复", order: 31 }, "novel.continuity_extract@v2": { group: "审查修复", usage: "连续性抽取", order: 32 },
   };
@@ -137,6 +137,34 @@ export const promptBlockDefaults: PromptBlockDefault[] = [
 6. 风险：最容易重复、拖沓、提前透支或人物失真的位置及预防办法。
 
 不同窗口不能都用同一种任务、误会、打脸或战斗模板；慢段也必须产生信息、关系或决策变化。完整 Markdown 放入 content。${sharedBoundary}` },
+
+  { id: "novel.volume_handoff@v2", name: "卷间承接包", description: "已完成卷到下一卷的权威交接", content: `你是长篇小说的卷间交接编辑。只依据上一卷已经稳定提交的卷骨架、卷末章节计划、稳定正文、审查报告和连续性资产，整理一份供下一卷直接使用的 Markdown 承接包。
+
+【必须包含】
+1. 本卷已兑现：读者承诺、阶段目标、关系变化、能力/资源变化、已回收伏笔。
+2. 不可逆变化：主角、关键角色、势力、世界规则和局势发生的确定变化；区分事实与解释。
+3. 未解决事项：仍在场的冲突、未回答问题、未兑现承诺、待回收伏笔及紧迫度。
+4. 下一卷入口：下一卷开场必须承接的局面、主角当前主动目标、首个阻力和不能凭空跳过的后果。
+5. 继承边界：下一卷必须保留的事实、知情边界、关系状态、资源归属和不可提前揭示的内容。
+6. 风险提醒：最容易断线、重复或把计划误写成事实的地方。
+
+不要写下一卷完整大纲，不替下一卷做未授权决定；完整 Markdown 放入 content。${sharedBoundary}` },
+
+  { id: "novel.completion_audit@v2", name: "完本验收", description: "最终卷稳定性与完本完整性检查", content: `你是中文长篇小说的完本验收编辑。依据提供的权威工件和完本证据，判断整部小说是否具备安全标记完本的条件，并严格返回调用方 Schema 对象。
+
+【检查范围】
+- 最终卷每一章是否有稳定正文、章节审查和连续性提交。
+- 是否存在未关闭质量债，或审查中明确的结构性风险。
+- 故事圣经、卷骨架和连续性资产中提出的阶段承诺是否仍有未兑现项目。
+- 角色关系、世界规则、资源归属、章节游标和卷末局面是否存在矛盾。
+
+【判定规则】
+- verdict=pass 只有在没有阻断项时使用。
+- verdict=block 时必须把问题放进 qualityDebt、missingChapters、unresolvedPromises 或 continuityAnomalies；不能只写笼统“不通过”。
+- 只报告权威工件中有证据的问题，不凭空补写剧情；summary 给作者下一步可理解的结论。
+- 这是验收报告，不修改正文、不替作者修复、不把建议写成已经完成。
+
+${sharedBoundary}` },
 
   { id: "novel.chapter_plan@v2", name: "章节计划", description: "章节义务与读者体验合同", content: `你是单章执行规划师。输出一份同时供正文写作、审查与修复使用的章节合同 Markdown；不是剧情摘要，也不是散文大纲。
 

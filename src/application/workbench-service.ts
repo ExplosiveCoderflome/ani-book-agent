@@ -1,6 +1,6 @@
 import { RequestContext } from "@mastra/core/request-context";
 import { z } from "zod";
-import { artifactKey, decideNextAction, workflowIds, type WorkflowId } from "../domain";
+import { artifactKey, completionAuditKey, decideNextAction, volumeHandoffKey, volumeOutlineKey, workflowIds, type WorkflowId } from "../domain";
 import { modelSettings, sanitizeProviderError } from "../infrastructure/model-settings";
 import { NovelRepository, novelInputHash, renderNovelBrief } from "../infrastructure/novel-repository";
 import { loadProviderCatalog } from "../infrastructure/provider-catalog";
@@ -15,7 +15,7 @@ import { chapterProductionWorkflow, chapterRangeWorkflow, novelExportWorkflow } 
 import { autoDirectorWorkflow } from "../mastra/workflows/auto-director-workflow";
 import { requireStructuredOutput, structuredOutputOptions } from "../mastra/structured-output";
 import { AppError } from "./errors";
-import { assembleNovelContext } from "./context-assembler";
+import { assembleAvailableNovelContext, assembleNovelContext } from "./context-assembler";
 import { runEvents } from "./run-events";
 
 export const novelRepository = new NovelRepository();
@@ -27,6 +27,8 @@ const workflows: Record<WorkflowId, any> = {
   "character-cast": artifactWorkflows.characterCastWorkflow,
   "volume-strategy": artifactWorkflows.volumeStrategyWorkflow,
   "volume-outline": artifactWorkflows.volumeOutlineWorkflow,
+  "volume-handoff": artifactWorkflows.volumeHandoffWorkflow,
+  "completion-audit": artifactWorkflows.completionAuditWorkflow,
   "chapter-planning": artifactWorkflows.chapterPlanningWorkflow,
   "quality-repair": artifactWorkflows.qualityRepairWorkflow,
   "chapter-production": chapterProductionWorkflow,
@@ -45,7 +47,9 @@ const definitions: Record<Exclude<WorkflowId, "chapter-production" | "chapter-ra
   "world-bible": { artifactKey: () => "book:world_bible", path: () => "world-bible.md", title: "世界圣经", promptId: "novel.world_bible@v2", profile: "planning", dependsOn: () => ["book:novel_brief", "book:story_bible"], milestone: false },
   "character-cast": { artifactKey: () => "book:character_cast", path: () => "characters/character-roster.md", title: "角色阵容", promptId: "novel.character_cast@v2", profile: "planning", dependsOn: () => ["book:novel_brief", "book:story_bible", "book:world_bible"], milestone: false },
   "volume-strategy": { artifactKey: () => "book:volume_strategy", path: () => "volumes/volume-strategy.md", title: "卷战略", promptId: "novel.volume_strategy@v2", profile: "planning", dependsOn: () => ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast"], milestone: true },
-  "volume-outline": { artifactKey: () => "book:volume_outline", path: () => "volumes/volume-01.md", title: "当前卷骨架与节奏板", promptId: "novel.volume_outline@v2", profile: "planning", dependsOn: () => ["book:volume_strategy"], milestone: false },
+  "volume-outline": { artifactKey: (target) => volumeOutlineKey(Number(target ?? "1")), path: (target) => `volumes/volume-${String(Number(target ?? "1")).padStart(2, "0")}.md`, title: "当前卷骨架与节奏板", promptId: "novel.volume_outline@v2", profile: "planning", dependsOn: () => ["book:volume_strategy"], milestone: false },
+  "volume-handoff": { artifactKey: (target) => volumeHandoffKey(Number(target ?? "1")), path: (target) => `volumes/volume-${String(Number(target ?? "1")).padStart(2, "0")}-handoff.md`, title: "卷间承接包", promptId: "novel.volume_handoff@v2", profile: "planning", dependsOn: () => [], milestone: false },
+  "completion-audit": { artifactKey: () => completionAuditKey(), path: () => "production/completion-audit.md", title: "完本验收报告", promptId: "novel.completion_audit@v2", profile: "review", dependsOn: () => [], milestone: false },
   "chapter-planning": { artifactKey: (target) => `chapter:${chapterNumber(target)}:chapter_plan`, path: (target) => `chapters/chapter-${String(chapterNumber(target)).padStart(3, "0")}/plan.md`, title: "章节计划", promptId: "novel.chapter_plan@v2", profile: "planning", dependsOn: (target) => ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", "book:volume_outline", ...(chapterNumber(target) > 1 ? [`chapter:${chapterNumber(target) - 1}:continuity_update`, `chapter:${chapterNumber(target) - 1}:humanization_revision`] : [])], milestone: false },
   "quality-repair": { artifactKey: (target) => `chapter:${chapterNumber(target)}:quality_repair`, path: (target) => `chapters/chapter-${String(chapterNumber(target)).padStart(3, "0")}/repair-proposal.md`, title: "质量修复提案", promptId: "novel.chapter_repair@v2", profile: "review", dependsOn: (target) => [`chapter:${chapterNumber(target)}:chapter_plan`, `chapter:${chapterNumber(target)}:humanization_revision`, `chapter:${chapterNumber(target)}:chapter_review`, `chapter:${chapterNumber(target)}:quality_debt`], milestone: false },
 };
@@ -54,6 +58,23 @@ function chapterNumber(target?: string) {
   const value = Number(target);
   if (!Number.isInteger(value) || value < 1) throw new AppError("INVALID_CHAPTER", "请提供有效章节号。", 400, true);
   return value;
+}
+
+function volumeOutlineDependency(state: Awaited<ReturnType<NovelRepository["get"]>>) {
+  return state.schemaVersion === 1 ? "book:volume_outline" : volumeOutlineKey(state.currentVolume);
+}
+
+function volumeHandoffDependencies(volume: number, state: Awaited<ReturnType<NovelRepository["get"]>>) {
+  const end = state.volumes[String(volume)]?.endChapter ?? state.currentChapter - 1;
+  return [volumeOutlineKey(volume), `chapter:${end}:chapter_plan`, `chapter:${end}:humanization_revision`, `chapter:${end}:chapter_review`, `chapter:${end}:continuity_update`];
+}
+
+function completionAuditDependencies(volume: number, state: Awaited<ReturnType<NovelRepository["get"]>>) {
+  const end = state.volumes[String(volume)]?.endChapter ?? state.continuity?.lastCommittedChapter ?? 0;
+  const keys = ["book:novel_brief", "book:story_bible", "book:volume_strategy", volumeOutlineKey(volume)];
+  const start = state.volumes[String(volume)]?.startChapter ?? 1;
+  for (let chapter = start; chapter <= end; chapter += 1) keys.push(`chapter:${chapter}:humanization_revision`, `chapter:${chapter}:chapter_review`, `chapter:${chapter}:continuity_update`, `chapter:${chapter}:quality_debt`, `chapter:${chapter}:quality_repair`);
+  return keys;
 }
 
 export function statusOf(value: string): RunView["status"] {
@@ -134,15 +155,40 @@ export async function startWorkflowRun(novelId: string, workflowId: WorkflowId, 
   if (workflowId === "chapter-production") {
     const chapter = chapterNumber(target ?? String(state.currentChapter));
     if (chapter !== state.currentChapter || chapter > state.approvedChapterEnd) throw new AppError("CHAPTER_NOT_APPROVED", "该章节尚未获得生产授权。", 409, true);
-    const dependsOn = definitions["chapter-planning"].dependsOn(String(chapter)).concat(`chapter:${chapter}:chapter_plan`);
+    const handoff = state.schemaVersion === 2 && state.volumes[String(state.currentVolume)]?.startChapter === chapter && state.currentVolume > 1 ? volumeHandoffKey(state.currentVolume - 1) : undefined;
+    const dependsOn = definitions["chapter-planning"].dependsOn(String(chapter)).map((key) => key === "book:volume_outline" ? volumeOutlineDependency(state) : key).concat(handoff ? [handoff] : [], `chapter:${chapter}:chapter_plan`);
     inputData = { novelId, chapter, context: await assembleNovelContext(novelRepository, novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), dependsOn };
   } else if (workflowId === "novel-export") inputData = { novelId, fileName: target };
   else if (workflowId === "chapter-range") throw new AppError("USE_CHAPTER_RANGE_API", "请使用章节范围接口。", 400, false);
   else {
     const definition = definitions[workflowId];
-    const dependsOn = definition.dependsOn(target);
-    const key = definition.artifactKey(target);
-    inputData = { novelId, workflowId, target, artifactKey: key, artifactPath: definition.path(target), title: definition.title, context: await assembleNovelContext(novelRepository, novelId, dependsOn), inputHash: novelInputHash(state, dependsOn), promptId: definition.promptId, promptVersion: definition.promptId, modelProfile: definition.profile, dependsOn, requiresReview: definition.milestone && (state.approvalMode ?? "milestone_approval") === "milestone_approval", ...extra };
+    const resolvedTarget = workflowId === "volume-outline" ? String(state.currentVolume)
+      : workflowId === "volume-handoff" ? String(state.currentVolume - 1)
+        : workflowId === "completion-audit" ? String(state.currentVolume)
+          : target;
+    if (workflowId === "volume-handoff") {
+      const volume = state.volumes[String(Number(resolvedTarget))];
+      if (!volume || volume.status !== "completed" || volume.final || state.currentVolume !== Number(resolvedTarget) + 1) throw new AppError("VOLUME_HANDOFF_NOT_DUE", "当前还没有进入该卷的卷间承接阶段。", 409, true);
+    }
+    if (workflowId === "completion-audit") {
+      const volume = state.volumes[String(state.currentVolume)];
+      if (state.productionStatus !== "awaiting_completion_review" || !volume?.final || volume.status !== "completed") throw new AppError("COMPLETION_AUDIT_NOT_DUE", "当前还没有进入最终卷完本验收阶段。", 409, true);
+    }
+    if (workflowId === "volume-outline" && state.schemaVersion === 2) {
+      const volume = state.volumes[String(state.currentVolume)];
+      if (!volume || volume.status !== "active") throw new AppError("VOLUME_NOT_CONFIGURED", "请先确定当前卷的章节范围。", 409, true);
+      if (state.currentVolume > 1 && state.artifacts[volumeHandoffKey(state.currentVolume - 1)]?.status !== "ready") throw new AppError("VOLUME_HANDOFF_REQUIRED", "请先完成上一卷的卷间承接包。", 409, true);
+    }
+    const rawDependencies = workflowId === "volume-handoff" ? volumeHandoffDependencies(Number(resolvedTarget), state)
+      : workflowId === "completion-audit" ? completionAuditDependencies(Number(resolvedTarget), state)
+        : workflowId === "volume-outline" && state.schemaVersion === 2 && state.currentVolume > 1 ? [...definition.dependsOn(resolvedTarget), volumeHandoffKey(state.currentVolume - 1)]
+          : definition.dependsOn(resolvedTarget);
+    const dependsOn = rawDependencies.map((key) => key === "book:volume_outline" ? volumeOutlineDependency(state) : key);
+    const key = definition.artifactKey(resolvedTarget);
+    const context = workflowId === "volume-handoff" || workflowId === "completion-audit"
+      ? await assembleAvailableNovelContext(novelRepository, novelId, dependsOn)
+      : await assembleNovelContext(novelRepository, novelId, dependsOn);
+    inputData = { novelId, workflowId, target: resolvedTarget, artifactKey: key, artifactPath: definition.path(resolvedTarget), title: definition.title, context, inputHash: novelInputHash(state, dependsOn), promptId: definition.promptId, promptVersion: definition.promptId, modelProfile: definition.profile, dependsOn, requiresReview: definition.milestone && (state.approvalMode ?? "milestone_approval") === "milestone_approval", ...extra };
   }
   const workflow = workflows[workflowId];
   const run = await workflow.createRun({ resourceId: novelId });
@@ -160,6 +206,10 @@ export async function startAutoDirector(novelId: string, input: { startChapter?:
   const startChapter = input.startChapter ?? state.currentChapter;
   if (startChapter !== state.currentChapter) throw new AppError("CHAPTER_RANGE_STALE", `当前应从第 ${state.currentChapter} 章开始。`, 409, true);
   if (input.endChapter < startChapter || input.endChapter - startChapter > 99) throw new AppError("INVALID_CHAPTER_RANGE", "自动导演章节范围必须连续且最多 100 章。", 400, true);
+  const volume = state.schemaVersion === 2 ? state.volumes[String(state.currentVolume)] : undefined;
+  if (state.schemaVersion === 2 && (!volume || volume.status !== "active")) throw new AppError("VOLUME_NOT_CONFIGURED", "请先确定当前卷的章节范围。", 409, true);
+  if (state.schemaVersion === 2 && state.currentVolume > 1 && state.artifacts[volumeHandoffKey(state.currentVolume - 1)]?.status !== "ready") throw new AppError("VOLUME_HANDOFF_REQUIRED", "请先完成上一卷的卷间承接包。", 409, true);
+  if (volume && input.endChapter > volume.endChapter) throw new AppError("VOLUME_RANGE_EXCEEDED", `自动导演不能超过第 ${state.currentVolume} 卷的结束章节 ${volume.endChapter}。`, 409, true);
   const run = await autoDirectorWorkflow.createRun({ resourceId: novelId });
   activeRuns.set(run.runId, { workflowId: "auto-director", run });
   await novelRepository.setActiveRun(novelId, run.runId);
@@ -198,6 +248,10 @@ export async function reviewRun(runId: string, review: { action: "approve"; prop
 }
 
 export async function startNovelBriefRun(novelId: string) { return startWorkflowRun(novelId, "novel-brief"); }
+export async function configureVolume(novelId: string, plan: { number: number; startChapter: number; endChapter: number; final: boolean }) {
+  const state = await novelRepository.setVolumePlan(novelId, plan);
+  return { novel: state, nextAction: decideNextAction(state) };
+}
 export async function bootstrap() { await ensureDefaultPromptBlocks(); const [models, novels] = await Promise.all([modelSettings.status(), novelRepository.list()]); return { models, novels, service: { studio: "ready", workbench: "ready" } }; }
 export async function providers() { const status = await modelSettings.status(); return loadProviderCatalog(new Set(status.configuredProviders)); }
 export async function capabilities() { await ensureDefaultPromptBlocks(); return { agent: { id: "novel-production-agent", tools: ["get_novel_status", "list_novel_artifacts", "read_novel_artifact", "get_chapter_context", "inspect_continuity", "list_workflow_capabilities"], processors: ["UnicodeNormalizer", "TokenLimiterProcessor"] }, workflows: workflowIds.map((id) => ({ id, ...workflowCatalog[id], stages: [...workflowCatalog[id].stages] })), prompts: promptBlockDefaults.map(({ id, name, description }) => ({ id, name, description })) }; }

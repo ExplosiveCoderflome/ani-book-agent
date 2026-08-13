@@ -2,6 +2,7 @@ import { RequestContext } from "@mastra/core/request-context";
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { stringify } from "yaml";
 import { z } from "zod";
+import { volumeHandoffKey } from "../../domain";
 import { modelSettings } from "../../infrastructure/model-settings";
 import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository } from "../../infrastructure/novel-repository";
@@ -132,7 +133,11 @@ const produceRangeItemStep = createStep({
     }
     const beforePlan = await repository.get(inputData.novelId);
     if (beforePlan.currentChapter !== inputData.chapter) throw new Error(`章节串行游标应为 ${inputData.chapter}，实际为 ${beforePlan.currentChapter}`);
-    const planningDependencies = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", "book:volume_outline", ...(inputData.chapter > 1 ? [`chapter:${inputData.chapter - 1}:continuity_update`, `chapter:${inputData.chapter - 1}:humanization_revision`] : [])];
+    const beforePlanState = await repository.get(inputData.novelId);
+    const volumeOutline = beforePlanState.schemaVersion === 1 ? "book:volume_outline" : `volume:${beforePlanState.currentVolume}:outline`;
+    const currentVolume = beforePlanState.volumes[String(beforePlanState.currentVolume)];
+    const handoff = beforePlanState.schemaVersion === 2 && currentVolume?.startChapter === inputData.chapter && beforePlanState.currentVolume > 1 ? volumeHandoffKey(beforePlanState.currentVolume - 1) : undefined;
+    const planningDependencies = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", volumeOutline, ...(handoff ? [handoff] : []), ...(inputData.chapter > 1 ? [`chapter:${inputData.chapter - 1}:continuity_update`, `chapter:${inputData.chapter - 1}:humanization_revision`] : [])];
     const planRun = await chapterPlanningWorkflow.createRun({ resourceId: inputData.novelId });
     const planResult = await planRun.start({ inputData: { novelId: inputData.novelId, workflowId: "chapter-planning" as const, target: String(inputData.chapter), artifactKey: `chapter:${inputData.chapter}:chapter_plan`, artifactPath: `chapters/chapter-${String(inputData.chapter).padStart(3, "0")}/plan.md`, title: `第 ${inputData.chapter} 章计划`, context: await assembleNovelContext(repository, inputData.novelId, planningDependencies), inputHash: novelInputHash(beforePlan, planningDependencies), promptId: "novel.chapter_plan@v2", promptVersion: "novel.chapter_plan@v2", modelProfile: "planning" as const, dependsOn: planningDependencies, requiresReview: false } });
     if (planResult.status !== "success") throw new Error(`第 ${inputData.chapter} 章计划未完成`);

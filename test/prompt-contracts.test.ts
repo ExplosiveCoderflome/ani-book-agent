@@ -9,7 +9,7 @@ const prompt = (id: string) => {
 };
 
 test("all production prompts use unique v2 assets with explicit authority boundaries", () => {
-  assert.equal(promptBlockDefaults.length, 14);
+  assert.equal(promptBlockDefaults.length, 16);
   assert.equal(new Set(promptBlockDefaults.map((item) => item.id)).size, promptBlockDefaults.length);
   for (const item of promptBlockDefaults) {
     assert.match(item.id, /@v2$/);
@@ -48,4 +48,11 @@ test("continuity extraction separates authoritative fact categories", () => {
   const content = prompt("novel.continuity_extract@v2");
   for (const field of ["facts", "characterStates", "resources", "relationships", "payoffs", "worldChanges"]) assert.match(content, new RegExp(field));
   assert.match(content, /计划、愿望、威胁、传闻、假设、梦境、谎言、未证实推断和审查建议都不是事实/);
+});
+
+test("completion and volume handoff prompts define bounded end-to-end checks", () => {
+  assert.match(prompt("novel.volume_handoff@v2"), /不可逆变化/);
+  assert.match(prompt("novel.volume_handoff@v2"), /下一卷入口/);
+  assert.match(prompt("novel.completion_audit@v2"), /verdict=pass/);
+  assert.match(prompt("novel.completion_audit@v2"), /missingChapters/);
 });

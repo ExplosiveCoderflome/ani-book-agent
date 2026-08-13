@@ -47,7 +47,8 @@ export const getChapterContextTool = createTool({
   execute: async (input, context) => {
     const novelId = requireNovelId(input, context);
     const state = await repository.get(novelId);
-    const keys = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", "book:volume_outline", `chapter:${input.chapter}:chapter_plan`, ...(input.chapter > 1 ? [`chapter:${input.chapter - 1}:humanization_revision`, `chapter:${input.chapter - 1}:continuity_update`] : [])];
+    const volumeOutline = state.schemaVersion === 1 ? "book:volume_outline" : `volume:${state.currentVolume}:outline`;
+    const keys = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", volumeOutline, `chapter:${input.chapter}:chapter_plan`, ...(input.chapter > 1 ? [`chapter:${input.chapter - 1}:humanization_revision`, `chapter:${input.chapter - 1}:continuity_update`] : [])];
     const sources = [];
     for (const key of keys) if (state.artifacts[key]?.status === "ready") sources.push({ key, content: (await repository.readArtifact(novelId, key)).content });
     return { chapter: input.chapter, sources };

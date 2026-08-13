@@ -53,6 +53,20 @@ export const workflowCatalog = {
     approval: "automatic",
     stages: ["生成卷骨架与节奏板", "自动校验", "提交权威工件"],
   },
+  "volume-handoff": {
+    name: "卷间承接包",
+    description: "把已完成卷的稳定变化、未解决冲突、角色状态和下一卷必须承接的事项整理成权威交接资产，避免换卷后丢失主线。",
+    target: "已完成卷号",
+    approval: "automatic",
+    stages: ["读取卷末稳定资产", "生成承接清单", "提交权威工件"],
+  },
+  "completion-audit": {
+    name: "完本验收",
+    description: "在最终卷完成后检查稳定章节、质量债、未兑现承诺与连续性异常，只有验收通过才能标记整部小说完本。",
+    target: "最终卷",
+    approval: "automatic",
+    stages: ["汇总完本证据", "结构化验收", "提交验收报告"],
+  },
   "chapter-planning": {
     name: "章节计划",
     description: "结合书级工件、当前卷与上一章连续性，生成单章义务、读者回报、关键转折、净变化和结尾钩子合同。",

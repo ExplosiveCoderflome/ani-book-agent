@@ -107,6 +107,13 @@ export const chapterRangeInputSchema = z.object({
   end: z.number().int().positive(),
 }).refine((value) => value.end >= value.start && value.end - value.start <= 99, "章节范围必须连续且最多 100 章");
 
+export const volumePlanInputSchema = z.object({
+  number: z.number().int().positive(),
+  startChapter: z.number().int().positive(),
+  endChapter: z.number().int().positive(),
+  final: z.boolean().default(false),
+}).refine((value) => value.endChapter >= value.startChapter, "卷结束章节不能早于开始章节");
+
 export const genericReviewRunInputSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("approve"), proposal: artifactProposalSchema.optional(), brief: novelBriefSchema.optional() }),
   z.object({ action: z.literal("revise"), feedback: z.string().trim().min(1).max(2_000) }),

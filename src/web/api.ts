@@ -60,6 +60,7 @@ export const api = {
   artifact: (id: string, key: string) => request<{ artifact: NovelState["artifacts"][string]; content: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`),
   editArtifact: (id: string, key: string, content: string, expectedSha256: string) => request<{ state: NovelState; sha256: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`, { method: "PUT", body: JSON.stringify({ content, expectedSha256 }) }),
   chapterRange: (id: string, start: number, end: number) => request<RunView>(`/workbench-api/novels/${id}/chapter-ranges`, { method: "POST", body: JSON.stringify({ start, end }) }),
+  configureVolume: (id: string, plan: { number: number; startChapter: number; endChapter: number; final: boolean }) => request<{ novel: NovelState; nextAction: NextAction }>(`/workbench-api/novels/${id}/volumes`, { method: "PUT", body: JSON.stringify(plan) }),
   autoDirector: (id: string, startChapter: number | undefined, endChapter: number, autoApproveMilestones = false) => request<RunView>(`/workbench-api/novels/${id}/auto-director`, { method: "POST", body: JSON.stringify({ startChapter, endChapter, autoApproveMilestones }) }),
   exportNovel: (id: string, fileName?: string) => request<RunView>(`/workbench-api/novels/${id}/export`, { method: "POST", body: JSON.stringify({ fileName }) }),
   exportDownloadUrl: (id: string, path: string) => `/workbench-api/novels/${id}/export?path=${encodeURIComponent(path)}`,
