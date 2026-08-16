@@ -1,6 +1,6 @@
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
-import { artifactKey, volumeHandoffKey, type WorkflowId } from "../../domain";
+import { artifactKey, isMultiVolumeProduction, volumeHandoffKey, type WorkflowId } from "../../domain";
 import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository, novelInputHash } from "../../infrastructure/novel-repository";
 import { artifactProposalSchema } from "../../shared/contracts";
@@ -106,7 +106,7 @@ const runStep = createStep({
     }
 
     let current = await repository.get(inputData.novelId);
-    if (current.schemaVersion === 2) {
+    if (isMultiVolumeProduction(current)) {
       const volume = current.volumes[String(current.currentVolume)];
       if (!volume || volume.status !== "active") throw new Error(`第 ${current.currentVolume} 卷尚未配置章节范围`);
       const outlineKey = `volume:${current.currentVolume}:outline`;

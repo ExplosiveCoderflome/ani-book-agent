@@ -8,10 +8,15 @@ function visibleText(message: MastraDBMessage): string {
     .trim();
 }
 
+function authorMessage(message: MastraDBMessage) {
+  const signal = message.content.metadata?.signal;
+  return message.role === "user" || (message.role === "signal" && signal && typeof signal === "object" && !Array.isArray(signal) && (signal as Record<string, unknown>).type === "user");
+}
+
 export function renderOpeningPresetPrompt(title: string, messages: MastraDBMessage[]): string {
   const transcript = messages
-    .filter((message) => message.role === "user" || message.role === "assistant")
-    .map((message) => `${message.role === "user" ? "作者" : "创作搭档"}：${visibleText(message)}`)
+    .filter((message) => authorMessage(message) || message.role === "assistant")
+    .map((message) => `${authorMessage(message) ? "作者" : "创作助手"}：${visibleText(message)}`)
     .filter((line) => !line.endsWith("："))
     .join("\n\n");
   return `任务：根据作者与创作搭档的真实讨论，整理一份可编辑、能直接驱动小说简报的开书预设提案。\n` +

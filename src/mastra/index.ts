@@ -3,6 +3,7 @@ import { DefaultExporter, Observability, SensitiveDataFilter } from "@mastra/obs
 import { novelProductionAgent } from "./agents/novel-production-agent";
 import { artifactWorkflows } from "./workflows/artifact-workflows";
 import { chapterProductionWorkflow, chapterRangeWorkflow, novelExportWorkflow } from "./workflows/chapter-workflows";
+import { autoDirectorWorkflow } from "./workflows/auto-director-workflow";
 import { novelEditor, ensureDefaultPromptBlocks } from "./prompts/prompt-blocks";
 import { mastraStorage } from "./runtime-storage";
 import { workbenchApiRoutes } from "./workbench-api";
@@ -11,7 +12,7 @@ export const mastra = new Mastra({
   storage: mastraStorage,
   editor: novelEditor,
   observability: new Observability({
-    configs: { default: { serviceName: "ani-novel-agent", logging: { enabled: true, level: "info" }, exporters: [new DefaultExporter()], spanOutputProcessors: [new SensitiveDataFilter()] } },
+    configs: { default: { serviceName: "ani-novel-agent", requestContextKeys: ["novelId", "taskType", "workflowId", "modelProfile"], logging: { enabled: true, level: "info" }, exporters: [new DefaultExporter()], spanOutputProcessors: [new SensitiveDataFilter()] } },
   }),
   agents: { novelProductionAgent },
   workflows: {
@@ -19,6 +20,7 @@ export const mastra = new Mastra({
     chapterProductionWorkflow,
     chapterRangeWorkflow,
     novelExportWorkflow,
+    autoDirectorWorkflow,
   },
   server: {
     port: Number(process.env.MASTRA_PORT ?? 4111),

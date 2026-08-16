@@ -27,8 +27,8 @@ test("structured output validation returns valid data", () => {
   assert.deepEqual(requireStructuredOutput(schema, { title: "有效提案" }, "测试提案"), { title: "有效提案" });
 });
 
-test("chat choices accept four complete replies and reject a fifth option", () => {
-  const choices = Array.from({ length: 4 }, (_, index) => ({ label: `方向${index + 1}`, description: `阅读体验${index + 1}`, message: `我选择方向${index + 1}，请沿着这个核心体验继续。` }));
-  assert.equal(chatChoicesSchema.parse({ choices }).choices.length, 4);
+test("chat choices accept five complete replies and reject a sixth option", () => {
+  const choices = Array.from({ length: 5 }, (_, index) => ({ label: `方向${index + 1}`, description: `阅读体验${index + 1}`, message: `我选择方向${index + 1}，请沿着这个核心体验继续。` }));
+  assert.equal(chatChoicesSchema.parse({ choices }).choices.length, 5);
   assert.equal(chatChoicesSchema.safeParse({ choices: [...choices, choices[0]] }).success, false);
 });

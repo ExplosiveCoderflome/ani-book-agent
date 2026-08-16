@@ -1,5 +1,7 @@
 # 实施路线
 
+> 本文保留项目初始阶段路线作为历史基线。当前长期能力规划见 [development-plan.md](./development-plan.md)。
+
 ## 阶段 0：架构基线（当前）
 
 - Mastra 注册、libSQL 运行存储和单一小说 Agent；

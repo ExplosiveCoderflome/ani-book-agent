@@ -152,27 +152,19 @@ Context Broker 只从权威工件选择必要片段。Mastra Memory 只服务对
 
 ## 6. API 与事件边界
 
-后端最终采用 Fastify + Mastra Server Adapter，不再建设第二个独立 Agent 服务。
+Mastra Server 是 Agent 和 Workflow 的唯一运行时。作者前端通过官方客户端直接消费 Agent Part 流和 Workflow Run 流，应用 API 只负责小说领域状态、工件和作者保护。
 
-最小应用 API：
+Agent 对话使用 Mastra 原生 Thread/Memory/Signal API；消息中的 `text`、`reasoning`、`tool-invocation`、`tool-result` 和 `data-*` Part 由前端 `MessageFactory` 渲染。工具审批、暂停、恢复、取消和断线重连均调用 Mastra 原生接口，不再经过项目自建事件总线。
 
-- `POST /novels`：创建小说工作区；
-- `GET /novels/:id/status`：领域状态与唯一下一步；
-- `POST /novels/:id/advance`：启动 Mastra Workflow；
-- `POST /runs/:runId/resume`：提交审批并恢复；
-- `POST /artifacts/:key/commit-edit`：提交作者修改；
-- `GET /runs/:runId/events`：流式运行事件；
-- `GET /artifacts/:key`：读取工件。
+小说领域 API 保留：
 
-UI 只消费项目级事件：
+- `GET /workbench-api/novels/:id/workspace`：统一工作台投影；
+- `GET/PUT /workbench-api/novels/:id/artifacts/:key`：读取和作者保护编辑；
+- `POST /workbench-api/novels/:id/runs`：按领域规则创建 Workflow Run；
+- `POST /workbench-api/runs/:runId/review`：审批、修改或取消；
+- `GET /workbench-api/runs/:runId`：Mastra Run 的只读领域投影。
 
-- `run.started`、`run.suspended`、`run.completed`、`run.failed`；
-- `step.started`、`step.completed`；
-- `artifact.proposed`、`artifact.committed`、`artifact.stale`；
-- `approval.required`；
-- `generation.delta`。
-
-Mastra 原始流事件先经过适配器，避免前端被框架内部协议锁定。
+页面刷新通过投影中的 `activeRunId` 和 Mastra Storage 恢复，不保存第二份运行状态。
 
 ## 7. 数据与目录
 

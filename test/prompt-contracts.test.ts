@@ -8,14 +8,25 @@ const prompt = (id: string) => {
   return item.content;
 };
 
-test("all production prompts use unique v2 assets with explicit authority boundaries", () => {
+test("all production prompts use unique versioned assets with explicit authority boundaries", () => {
   assert.equal(promptBlockDefaults.length, 16);
   assert.equal(new Set(promptBlockDefaults.map((item) => item.id)).size, promptBlockDefaults.length);
   for (const item of promptBlockDefaults) {
-    assert.match(item.id, /@v2$/);
+    assert.match(item.id, /@v\d+$/);
     assert.match(item.content, /作者本轮明确要求/);
     assert.ok(item.content.length >= 500, `${item.id} is too shallow`);
   }
+});
+
+test("chat prompt records discovery facts and does not preemptively sanitize a genre", () => {
+  const content = prompt("novel.chat@v5");
+  assert.match(content, /path 传 ideas\.md/);
+  assert.match(content, /不主动输出能力声明、内容免责声明、价值评判或说教/);
+  assert.match(content, /不得擅自把题材改写/);
+  assert.match(content, /当前只要求作者回答一个关键问题/);
+  assert.match(content, /关系结构、知情差、主动权、代价和推进方式/);
+  assert.match(content, /已确认.*只能原样记录/s);
+  assert.match(content, /不得自行补出知情关系、主导者、叙事视角/);
 });
 
 test("chat choice prompt preserves finite options as complete clickable replies", () => {

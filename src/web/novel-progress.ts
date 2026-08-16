@@ -1,4 +1,4 @@
-import { volumeHandoffKey, type NovelState } from "../domain";
+import { isMultiVolumeProduction, volumeHandoffKey, type NovelState } from "../domain";
 
 export type VolumeProgressPhase = "active" | "handoff_pending" | "handoff_ready" | "audit_pending" | "audit_blocked" | "completed" | "planning";
 
@@ -33,7 +33,7 @@ function phaseOf(state: NovelState, number: number, final: boolean, status: "act
 
 export function buildNovelProgress(state: NovelState): NovelProgress {
   const stableChapters = completedChapterCount(state);
-  if (state.schemaVersion === 1) {
+  if (!isMultiVolumeProduction(state)) {
     const focusVolume: VolumeProgressItem = { number: 1, startChapter: 1, completedChapters: stableChapters, percent: 0, final: true, phase: state.productionStatus === "completed" ? "completed" : "active" };
     return { mode: "legacy", stableChapters, focusVolume, volumes: [focusVolume] };
   }

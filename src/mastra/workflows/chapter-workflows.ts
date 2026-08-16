@@ -2,14 +2,15 @@ import { RequestContext } from "@mastra/core/request-context";
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { stringify } from "yaml";
 import { z } from "zod";
-import { volumeHandoffKey } from "../../domain";
+import { isMultiVolumeProduction, volumeHandoffKey } from "../../domain";
 import { modelSettings } from "../../infrastructure/model-settings";
 import { assembleNovelContext } from "../../application/context-assembler";
 import { NovelRepository } from "../../infrastructure/novel-repository";
 import { novelInputHash } from "../../infrastructure/novel-repository";
 import { recordTokenUsage } from "../../infrastructure/token-usage";
 import { workflowCatalog } from "../../shared/workflow-catalog";
-import { effectiveNovelProductionAgent } from "../agents/novel-production-agent";
+import { effectiveNovelWorkflowAgent } from "../agents/novel-production-agent";
+import { generateWithGuard } from "../generation-guard";
 import { resolvePromptBlock } from "../prompts/prompt-blocks";
 import { requireStructuredOutput, structuredOutputOptions } from "../structured-output";
 import { chapterPlanningWorkflow } from "./artifact-workflows";
@@ -33,6 +34,15 @@ const continuityEnvelopeSchema = repairedSchema.extend({ continuity: continuityS
 const outputSchema = z.object({ status: z.literal("committed"), novelId: z.string().uuid(), workflowId: z.literal("chapter-production"), chapter: z.number(), sha256: z.string(), verdict: chapterReviewSchema.shape.verdict });
 
 const repository = new NovelRepository();
+const CHAPTER_OUTPUT_TOKEN_CAP = 4_000;
+
+function chapterModelSettings(selection: Awaited<ReturnType<typeof modelSettings.runtimeSelection>>, fallbackOutputTokens: number) {
+  return {
+    temperature: selection.parameters.temperature,
+    topP: selection.parameters.topP,
+    maxOutputTokens: Math.min(selection.parameters.maxOutputTokens ?? fallbackOutputTokens, CHAPTER_OUTPUT_TOKEN_CAP),
+  };
+}
 
 async function contextFor(input: { novelId: string; chapter: number }, taskType: "drafting" | "review" | "continuity", profile: "drafting" | "review", promptId: string) {
   const selection = await modelSettings.runtimeSelection(profile);
@@ -42,8 +52,8 @@ async function contextFor(input: { novelId: string; chapter: number }, taskType:
 
 async function textGeneration(input: { novelId: string; chapter: number }, profile: "drafting" | "review", promptId: string, body: string) {
   const call = await contextFor(input, profile === "review" ? "review" : "drafting", profile, promptId);
-  const agent = await effectiveNovelProductionAgent(call.requestContext);
-  const result = await agent.generate(`${call.prompt.content}\n\n${body}`, { requestContext: call.requestContext, modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
+  const agent = await effectiveNovelWorkflowAgent(call.requestContext);
+  const result = await generateWithGuard(`第 ${input.chapter} 章生成`, (abortSignal) => agent.generate(`${call.prompt.content}\n\n${body}`, { requestContext: call.requestContext, abortSignal, toolChoice: "none", modelSettings: chapterModelSettings(call.selection, CHAPTER_OUTPUT_TOKEN_CAP) }));
   await recordTokenUsage(input.novelId, { task: promptId, promptVersion: call.prompt.version, usage: result.usage });
   if (!result.text?.trim()) throw new Error("模型没有返回可用正文");
   return { text: result.text.trim(), version: call.prompt.version };
@@ -61,8 +71,8 @@ const reviewStep = createStep({
   id: "chapter-review", description: "按同一章节合同检查目标兑现、角色行动、连续性、结尾牵引和越界风险，输出结构化接收判定与证据。", inputSchema: humanizedSchema, outputSchema: reviewedSchema, retries: 2,
   execute: async ({ inputData }) => {
     const call = await contextFor(inputData, "review", "review", "novel.chapter_review@v2");
-    const agent = await effectiveNovelProductionAgent(call.requestContext);
-    const result = await agent.generate(`${call.prompt.content}\n\n章节合同与上下文：\n${inputData.context}\n\n待审正文：\n${inputData.humanized}`, { requestContext: call.requestContext, ...structuredOutputOptions(chapterReviewSchema), modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
+    const agent = await effectiveNovelWorkflowAgent(call.requestContext);
+    const result = await generateWithGuard(`第 ${inputData.chapter} 章审查`, (abortSignal) => agent.generate(`${call.prompt.content}\n\n章节合同与上下文：\n${inputData.context}\n\n待审正文：\n${inputData.humanized}`, { requestContext: call.requestContext, abortSignal, ...structuredOutputOptions(chapterReviewSchema), modelSettings: chapterModelSettings(call.selection, 1_500) }));
     await recordTokenUsage(inputData.novelId, { task: "chapter-review", promptVersion: call.prompt.version, usage: result.usage });
     return { ...inputData, review: requireStructuredOutput(chapterReviewSchema, result.object, "章节审查"), promptVersions: { ...inputData.promptVersions, review: call.prompt.version } };
   },
@@ -81,8 +91,8 @@ const continuityStep = createStep({
   id: "chapter-continuity", description: "只从最终稳定正文抽取已发生的事实、角色状态、资源、关系、伏笔回报与世界变化，拒绝把计划和猜测写成事实。", inputSchema: repairedSchema, outputSchema: continuityEnvelopeSchema, retries: 2,
   execute: async ({ inputData }) => {
     const call = await contextFor(inputData, "continuity", "review", "novel.continuity_extract@v2");
-    const agent = await effectiveNovelProductionAgent(call.requestContext);
-    const result = await agent.generate(`${call.prompt.content}\n\n最终正文：\n${inputData.finalText}`, { requestContext: call.requestContext, ...structuredOutputOptions(continuitySchema), modelSettings: { temperature: call.selection.parameters.temperature, topP: call.selection.parameters.topP, maxOutputTokens: call.selection.parameters.maxOutputTokens } });
+    const agent = await effectiveNovelWorkflowAgent(call.requestContext);
+    const result = await generateWithGuard(`第 ${inputData.chapter} 章连续性提取`, (abortSignal) => agent.generate(`${call.prompt.content}\n\n最终正文：\n${inputData.finalText}`, { requestContext: call.requestContext, abortSignal, ...structuredOutputOptions(continuitySchema), modelSettings: chapterModelSettings(call.selection, 1_500) }));
     await recordTokenUsage(inputData.novelId, { task: "continuity-extract", promptVersion: call.prompt.version, usage: result.usage });
     return { ...inputData, continuity: requireStructuredOutput(continuitySchema, result.object, "连续性提取"), promptVersions: { ...inputData.promptVersions, continuity: call.prompt.version } };
   },
@@ -134,9 +144,9 @@ const produceRangeItemStep = createStep({
     const beforePlan = await repository.get(inputData.novelId);
     if (beforePlan.currentChapter !== inputData.chapter) throw new Error(`章节串行游标应为 ${inputData.chapter}，实际为 ${beforePlan.currentChapter}`);
     const beforePlanState = await repository.get(inputData.novelId);
-    const volumeOutline = beforePlanState.schemaVersion === 1 ? "book:volume_outline" : `volume:${beforePlanState.currentVolume}:outline`;
+    const volumeOutline = isMultiVolumeProduction(beforePlanState) ? `volume:${beforePlanState.currentVolume}:outline` : "book:volume_outline";
     const currentVolume = beforePlanState.volumes[String(beforePlanState.currentVolume)];
-    const handoff = beforePlanState.schemaVersion === 2 && currentVolume?.startChapter === inputData.chapter && beforePlanState.currentVolume > 1 ? volumeHandoffKey(beforePlanState.currentVolume - 1) : undefined;
+    const handoff = isMultiVolumeProduction(beforePlanState) && currentVolume?.startChapter === inputData.chapter && beforePlanState.currentVolume > 1 ? volumeHandoffKey(beforePlanState.currentVolume - 1) : undefined;
     const planningDependencies = ["book:novel_brief", "book:story_bible", "book:world_bible", "book:character_cast", "book:volume_strategy", volumeOutline, ...(handoff ? [handoff] : []), ...(inputData.chapter > 1 ? [`chapter:${inputData.chapter - 1}:continuity_update`, `chapter:${inputData.chapter - 1}:humanization_revision`] : [])];
     const planRun = await chapterPlanningWorkflow.createRun({ resourceId: inputData.novelId });
     const planResult = await planRun.start({ inputData: { novelId: inputData.novelId, workflowId: "chapter-planning" as const, target: String(inputData.chapter), artifactKey: `chapter:${inputData.chapter}:chapter_plan`, artifactPath: `chapters/chapter-${String(inputData.chapter).padStart(3, "0")}/plan.md`, title: `第 ${inputData.chapter} 章计划`, context: await assembleNovelContext(repository, inputData.novelId, planningDependencies), inputHash: novelInputHash(beforePlan, planningDependencies), promptId: "novel.chapter_plan@v2", promptVersion: "novel.chapter_plan@v2", modelProfile: "planning" as const, dependsOn: planningDependencies, requiresReview: false } });

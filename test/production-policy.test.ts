@@ -17,6 +17,7 @@ const baseState = (): NovelState => ({
   title: "测试小说",
   currentChapter: 1,
   approvedChapterEnd: 0,
+  productionMode: "legacy",
   currentVolume: 1,
   volumes: {},
   productionStatus: "in_progress",
@@ -30,6 +31,7 @@ test("domain policy requests opening choices before any model work", () => {
 test("schema v2 asks for a volume plan before generating chapter work", () => {
   const state = baseState();
   state.schemaVersion = 2;
+  state.productionMode = "multi_volume";
   state.openingChoices = { channel: "泛读者", format: "免费连载", primaryReward: "成长与反转" };
   for (const stage of bookStages.filter((item) => item !== "volume_outline")) state.artifacts[artifactKey(stage)] = { stage, status: "ready", path: `${stage}.md`, protected: false };
   assert.deepEqual(decideNextAction(state), { type: "configure_volume", volume: 1, startChapter: 1, suggestedEndChapter: 10, reason: "先确定第 1 卷写到哪一章，Agent 才能按卷目标安排节奏。" });
@@ -38,6 +40,7 @@ test("schema v2 asks for a volume plan before generating chapter work", () => {
 test("completed final volume requires a completion audit", () => {
   const state = baseState();
   state.schemaVersion = 2;
+  state.productionMode = "multi_volume";
   state.currentVolume = 1;
   state.continuity = { lastCommittedChapter: 3, revision: 1 };
   state.productionStatus = "awaiting_completion_review";
@@ -47,6 +50,7 @@ test("completed final volume requires a completion audit", () => {
 test("final completion audit blocks until its evidence is complete", () => {
   const state = baseState();
   state.schemaVersion = 2;
+  state.productionMode = "multi_volume";
   state.currentVolume = 1;
   state.productionStatus = "awaiting_completion_review";
   state.continuity = { lastCommittedChapter: 1, revision: 1 };
@@ -65,6 +69,7 @@ test("final completion audit blocks until its evidence is complete", () => {
 test("completed non-final volume requires its handoff before next volume configuration", () => {
   const state = baseState();
   state.schemaVersion = 2;
+  state.productionMode = "multi_volume";
   state.openingChoices = { channel: "泛读者", format: "免费连载", primaryReward: "成长与反转" };
   state.currentVolume = 2;
   state.currentChapter = 2;
@@ -101,6 +106,7 @@ test("domain policy closes chapter quality debt before approving more chapters",
   const state = baseState();
   state.openingChoices = { channel: "男频", format: "免费连载", primaryReward: "成长与反转" };
   state.schemaVersion = 2;
+  state.productionMode = "multi_volume";
   state.currentChapter = 2;
   state.approvedChapterEnd = 10;
   state.continuity = { lastCommittedChapter: 1, revision: 1 };

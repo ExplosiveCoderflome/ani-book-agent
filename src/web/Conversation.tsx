@@ -1,113 +1,127 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { RequestContext } from "@mastra/core/request-context";
+import type { CoreUserMessage } from "@mastra/core/llm";
 import type { MastraDBMessage } from "@mastra/core/agent";
-import type { ChatChoice } from "../shared/contracts";
-import {
-  AssistantRuntimeProvider,
-  ComposerPrimitive,
-  MessagePartPrimitive,
-  MessagePrimitive,
-  ThreadPrimitive,
-  useExternalStoreRuntime,
-  type AppendMessage,
-  type DataMessagePartProps,
-  type ThreadMessageLike,
-} from "@assistant-ui/react";
-import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import "@assistant-ui/react-markdown/styles/dot.css";
-import { Check, Feather, LoaderCircle, Send, Square } from "lucide-react";
-import remarkGfm from "remark-gfm";
-import { ThinkingOrb } from "thinking-orbs";
-import AnimatedContent from "./react-bits/AnimatedContent";
-import ClickSpark from "./react-bits/ClickSpark";
-import SpotlightCard from "./react-bits/SpotlightCard";
+import { useChat } from "@mastra/react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Check, CircleAlert, FileText, LoaderCircle, Paperclip, Send, Square, X } from "lucide-react";
+import { StudioMessage, hasRenderableMessage, messageForDisplay, messageText, openingPresetFromMessage, type ToolActions } from "./studio/MessageParts";
+import type { OpeningPresetProposal } from "../shared/contracts";
 
-function fromDatabase(message: MastraDBMessage): ThreadMessageLike {
-  const text = message.content.parts.filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
-  return { id: message.id, role: message.role === "signal" ? "assistant" : message.role, content: [{ type: "text", text: text || "正在整理方案…" }], createdAt: new Date(message.createdAt) };
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+type Attachment = { name: string; mimeType: string; data: string; size: number };
+
+async function readAttachment(file: File): Promise<Attachment> {
+  if (file.size > MAX_ATTACHMENT_BYTES) throw new Error(`${file.name} 超过 5 MB，暂时无法发送。`);
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error(`无法读取 ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+  return { name: file.name, mimeType: file.type || "application/octet-stream", data: dataUrl.slice(dataUrl.indexOf(",") + 1), size: file.size };
 }
 
-type ConversationMessage = { kind: "message"; message: ThreadMessageLike } | { kind: "workflow"; id: string; node: ReactNode };
-function convertMessage(source: ConversationMessage): ThreadMessageLike {
-  return source.kind === "message" ? source.message : { id: source.id, role: "assistant", content: [{ type: "data", name: "workflow", data: { node: source.node } }], createdAt: new Date(0) };
-}
+export type ConversationRevisionMode = { label: string; onSubmit: (text: string) => Promise<void>; onExit: () => void };
 
-function PlainTextPart() { return <MessagePartPrimitive.Text component="p" className="message-text" />; }
-function MarkdownTextPart() { return <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="message-markdown" />; }
-function WorkflowDataPart({ data }: DataMessagePartProps<{ node: ReactNode }>) { return <AnimatedContent className="workflow-data-part" distance={18}>{data.node}</AnimatedContent>; }
-function ThinkingDataPart() { return <div className="assistant-thinking" role="status"><ThinkingOrb state="working" size={20} theme="light" aria-label="创作搭档正在思考" /><span>创作搭档正在思考…</span></div>; }
-
-const ChoiceActionContext = createContext<{ sendMessage: (text: string) => Promise<void>; isRunning: boolean } | null>(null);
-
-function ChoicesDataPart({ data }: DataMessagePartProps<{ choices: ChatChoice[] }>) {
-  const action = useContext(ChoiceActionContext);
-  const [selected, setSelected] = useState("");
-  if (!action || !data.choices.length) return null;
-  return <div className="chat-choices" aria-label="快捷选择">{data.choices.map((choice: ChatChoice, index: number) => <AnimatedContent key={choice.message} distance={14} delay={index * .055}><SpotlightCard className="choice-spotlight"><ClickSpark sparkColor="#bd7a2d" sparkRadius={18} sparkCount={7}><button type="button" disabled={action.isRunning || Boolean(selected)} onClick={() => { setSelected(choice.message); void action.sendMessage(choice.message); }}><span>{choice.label}</span><small>{choice.description}</small></button></ClickSpark></SpotlightCard></AnimatedContent>)}</div>;
-}
-
-function ChatMessage() {
-  return <MessagePrimitive.Root className="message-row message-reveal">
-    <MessagePrimitive.If assistant><article className="message assistant-message"><span className="assistant-avatar"><Feather size={16} /></span><div><strong className="assistant-name">创作搭档</strong><MessagePrimitive.Parts components={{ Text: MarkdownTextPart, data: { by_name: { workflow: WorkflowDataPart, thinking: ThinkingDataPart, choices: ChoicesDataPart } } }} /></div></article></MessagePrimitive.If>
-    <MessagePrimitive.If user><article className="message user-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
-    <MessagePrimitive.If system><article className="message system-message"><MessagePrimitive.Parts components={{ Text: PlainTextPart }} /></article></MessagePrimitive.If>
-  </MessagePrimitive.Root>;
-}
-
-export function Conversation({ novelId, initialMessages, discoveryAction, children }: {
+export function Conversation({ novelId, initialMessages, discoveryAction, emptyState, revisionMode, contextLabel, currentArtifactKey, currentFilePath, onConversationChange, onOpeningPresetReady }: {
   novelId: string;
   initialMessages: MastraDBMessage[];
   discoveryAction?: { pending: boolean; error: unknown; onConfirm: () => void };
-  children: ReactNode | ((actions: { sendMessage: (text: string) => Promise<void>; isRunning: boolean; messageCount: number }) => ReactNode);
+  emptyState?: (actions: { sendMessage: (text: string) => Promise<void>; isRunning: boolean }) => ReactNode;
+  revisionMode?: ConversationRevisionMode;
+  contextLabel?: string;
+  currentArtifactKey?: string;
+  currentFilePath?: string;
+  onConversationChange?: () => void | Promise<void>;
+  onOpeningPresetReady?: (proposal: OpeningPresetProposal) => void;
 }) {
-  const hydrated = useMemo(() => initialMessages.filter((message) => message.role !== "signal").map(fromDatabase), [initialMessages]);
-  const [messages, setMessages] = useState<ThreadMessageLike[]>(hydrated);
-  const [isRunning, setRunning] = useState(false);
-  const [error, setError] = useState("");
-  const abortRef = useRef<AbortController | undefined>(undefined);
-
-  useEffect(() => { setMessages(hydrated); setError(""); abortRef.current?.abort(); setRunning(false); }, [hydrated, novelId]);
-
-  const sendMessage = async (raw: string) => {
-    const text = raw.trim();
-    if (!text || isRunning) return;
-    const userId = crypto.randomUUID();
-    const assistantId = crypto.randomUUID();
-    setError(""); setRunning(true);
-    setMessages((current) => [...current, { id: userId, role: "user", content: [{ type: "text", text }], createdAt: new Date() }, { id: assistantId, role: "assistant", content: [{ type: "data", name: "thinking", data: {} }], createdAt: new Date() }]);
-    const controller = new AbortController(); abortRef.current = controller;
-    let accumulated = "";
-    try {
-      const response = await fetch(`/workbench-api/novels/${novelId}/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }), signal: controller.signal });
-      if (!response.ok || !response.body) { const body = await response.json().catch(() => ({})); throw new Error(body?.error?.message ?? "消息发送失败，请重试。"); }
-      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
-      while (true) {
-        const chunk = await reader.read(); if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, { stream: true });
-        const blocks = buffer.split("\n\n"); buffer = blocks.pop() ?? "";
-        for (const block of blocks) {
-          const event = block.match(/^event:\s*(.+)$/m)?.[1]; const dataText = block.match(/^data:\s*(.+)$/m)?.[1]; if (!event || !dataText) continue;
-          const data = JSON.parse(dataText) as { text?: string; message?: string; choices?: ChatChoice[] };
-          if (event === "text-delta" && data.text) { accumulated += data.text; setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: [{ type: "text", text: accumulated }] } : message)); }
-          if (event === "choices" && data.choices?.length) setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: [{ type: "text", text: accumulated }, { type: "data", name: "choices", data: { choices: data.choices } }] } : message));
-          if (event === "choices-error") setError(data.message ?? "快捷选项未能生成，你仍可以直接输入选择。");
-          if (event === "error") throw new Error(data.message ?? "生成失败，请重试。");
-        }
-      }
-      if (!accumulated) throw new Error("模型没有返回可展示的文本。");
-    } catch (cause) {
-      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "消息发送失败，请重试。");
-      setMessages((current) => current.filter((message) => message.id !== assistantId || accumulated.length > 0));
-    } finally { if (abortRef.current === controller) abortRef.current = undefined; setRunning(false); }
-  };
-
-  const messageCount = messages.filter((message) => message.role === "user" || message.role === "assistant").length;
-  const flowNode = typeof children === "function" ? children({ sendMessage, isRunning, messageCount }) : children;
-  const externalMessages: ConversationMessage[] = [...messages.map((message) => ({ kind: "message" as const, message })), ...(isRunning || !flowNode ? [] : [{ kind: "workflow" as const, id: `workflow-${novelId}`, node: flowNode }])];
-  const runtime = useExternalStoreRuntime({
-    isRunning, messages: externalMessages, convertMessage,
-    onNew: async (message: AppendMessage) => sendMessage(message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")),
-    onCancel: async () => abortRef.current?.abort(),
+  const [revisionNotice, setRevisionNotice] = useState("");
+  const [chatError, setChatError] = useState("");
+  const [compatibilityStream, setCompatibilityStream] = useState(false);
+  const [showPending, setShowPending] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
+  const followOutputRef = useRef(true);
+  const openingPresetMessageRef = useRef("");
+  const requestContext = useMemo(() => new RequestContext<any>([
+    ["novelId", novelId], ["taskType", revisionMode ? "review" : "chat"], ["modelProfile", revisionMode ? "review" : "chat"],
+    ["currentArtifactKey", currentArtifactKey ?? ""], ["currentFilePath", currentFilePath ?? ""], ["novelContext", contextLabel ?? ""],
+  ]), [currentArtifactKey, currentFilePath, contextLabel, novelId, revisionMode]);
+  const { messages, tasks, isRunning, isAwaitingToolApproval, sendMessage, cancelRun, approveToolCall, declineToolCall, toolCallApprovals } = useChat({
+    agentId: "novel-production-agent", resourceId: novelId, threadId: novelId, initialMessages, requestContext,
+    enableThreadSignals: true, onThreadSignalsUnsupported: () => setCompatibilityStream(true),
   });
+  const running = isRunning || isAwaitingToolApproval;
+  const renderableMessages = useMemo(() => messages.filter(hasRenderableMessage).map(messageForDisplay), [messages]);
+  const lastHasOutput = renderableMessages.at(-1)?.role === "assistant";
 
-  return <ChoiceActionContext.Provider value={{ sendMessage, isRunning }}><AssistantRuntimeProvider runtime={runtime}><ThreadPrimitive.Root className="conversation-thread"><ThreadPrimitive.Viewport className="conversation-viewport"><ThreadPrimitive.Messages components={{ Message: ChatMessage }} /><ThreadPrimitive.ViewportFooter className="composer-footer">{discoveryAction && messageCount > 0 && <div className="discovery-status"><div><strong>开书讨论中</strong><span>等你把想法说完整后，再整理成开书方案。</span></div><button type="button" disabled={isRunning || discoveryAction.pending} onClick={discoveryAction.onConfirm}>{discoveryAction.pending ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}{discoveryAction.pending ? "正在整理…" : "我说完了，整理方案"}</button></div>}{Boolean(discoveryAction?.error) && <div className="chat-error">{discoveryAction?.error instanceof Error ? discoveryAction.error.message : "整理失败，请重试。"}</div>}{error && <div className="chat-error">{error}</div>}<ComposerPrimitive.Root className="composer"><ComposerPrimitive.Input aria-label="给创作搭档发消息" placeholder="和创作搭档聊聊这本书……" rows={1} /><ThreadPrimitive.If running><ComposerPrimitive.Cancel className="composer-button" aria-label="停止回答"><Square size={17} /></ComposerPrimitive.Cancel></ThreadPrimitive.If><ThreadPrimitive.If running={false}><ComposerPrimitive.Send className="composer-button" aria-label="发送消息"><Send size={18} /></ComposerPrimitive.Send></ThreadPrimitive.If></ComposerPrimitive.Root><small>AI 可能犯错，重要创作决定以你批准的工件为准。</small></ThreadPrimitive.ViewportFooter></ThreadPrimitive.Viewport></ThreadPrimitive.Root></AssistantRuntimeProvider></ChoiceActionContext.Provider>;
+  const sendText = useCallback(async (raw: string, attachments: Attachment[] = []) => {
+    const text = raw.trim();
+    if ((!text && !attachments.length) || running) return;
+    setChatError(""); followOutputRef.current = true;
+    try {
+      if (revisionMode) { setRevisionNotice(""); await revisionMode.onSubmit(text); setRevisionNotice("修改要求已提交，正在重新生成。"); return; }
+      const coreUserMessages: CoreUserMessage[] = attachments.length ? [{ role: "user", content: attachments.map((file) => ({ type: "file" as const, data: file.data, filename: file.name, mimeType: file.mimeType })) }] : [];
+      await sendMessage({ message: text, coreUserMessages, threadId: novelId, requestContext });
+      await onConversationChange?.();
+    } catch (error) { setChatError(error instanceof Error ? error.message : "消息发送失败，请重试。"); }
+  }, [novelId, onConversationChange, requestContext, revisionMode, running, sendMessage]);
+
+  useEffect(() => { setRevisionNotice(""); setChatError(""); setCompatibilityStream(false); }, [novelId, revisionMode]);
+  useEffect(() => {
+    const message = [...messages].reverse().find((item) => openingPresetFromMessage(item));
+    const proposal = message && openingPresetFromMessage(message);
+    if (!proposal || message.id === openingPresetMessageRef.current) return;
+    openingPresetMessageRef.current = message.id;
+    onOpeningPresetReady?.(proposal);
+  }, [messages, onOpeningPresetReady]);
+  useEffect(() => {
+    if (!running || lastHasOutput) { setShowPending(false); return; }
+    const timer = window.setTimeout(() => setShowPending(true), 280);
+    return () => window.clearTimeout(timer);
+  }, [lastHasOutput, running]);
+  useEffect(() => { if (followOutputRef.current && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages, showPending, tasks]);
+
+  const actions = useMemo<ToolActions>(() => ({
+    approve: async (id, resumeData) => { await approveToolCall(id, resumeData); await onConversationChange?.(); },
+    decline: async (id) => { await declineToolCall(id); await onConversationChange?.(); },
+    approvals: toolCallApprovals,
+  }), [approveToolCall, declineToolCall, onConversationChange, toolCallApprovals]);
+
+  return <div className="studio-conversation">
+    <div className="studio-conversation-head"><div><span className="eyebrow">{contextLabel ? `当前上下文 · ${contextLabel}` : "创作线程"}</span><strong>Agent</strong></div>{running && <span className="studio-running"><LoaderCircle className="spin" size={14} />{isAwaitingToolApproval ? "等待确认" : "正在运行"}</span>}</div>
+    <div className="studio-message-list" ref={listRef} onScroll={(event) => { const element = event.currentTarget; followOutputRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; }}>
+      {renderableMessages.map((message) => <article className={`studio-message ${message.role}`} key={message.id} data-message-id={message.id}><StudioMessage message={message} actions={actions} onChoice={(choice) => void sendText(choice)} streamActive={running && message.id === renderableMessages.at(-1)?.id} />{message.role === "assistant" && messageText(message).trim() && <div className="studio-message-actions"><button type="button" onClick={() => void navigator.clipboard?.writeText(messageText(message))}>复制</button></div>}</article>)}
+      {!renderableMessages.length && emptyState?.({ sendMessage: (text) => sendText(text), isRunning: running })}
+      {tasks.length > 0 && <section className="studio-task-list" aria-label="Agent 任务"><header>任务进度</header>{tasks.map((task) => <div className={task.status} key={task.id}><span /><strong>{task.status === "in_progress" ? task.activeForm : task.content}</strong><small>{task.status === "completed" ? "完成" : task.status === "in_progress" ? "进行中" : "等待"}</small></div>)}</section>}
+      {showPending && <div className="studio-pending"><LoaderCircle className="spin" size={16} />正在连接创作服务…</div>}
+    </div>
+    <div className="studio-composer-wrap">
+      {discoveryAction && renderableMessages.some((message) => message.role === "user") && <div className="studio-discovery-action"><div><strong>开书讨论中</strong><span>等你把想法说完整后，再整理成开书方案。</span></div><button type="button" disabled={running || discoveryAction.pending} onClick={discoveryAction.onConfirm}>{discoveryAction.pending ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}{discoveryAction.pending ? "正在整理…" : "我说完了，整理方案"}</button></div>}
+      {Boolean(discoveryAction?.error) && <div className="studio-error"><CircleAlert size={16} />{discoveryAction?.error instanceof Error ? discoveryAction.error.message : "整理失败，请重试。"}</div>}
+      {compatibilityStream && <div className="studio-stream-notice">当前服务使用兼容流模式，消息内容不受影响。</div>}
+      {chatError && <div className="studio-error"><CircleAlert size={16} />{chatError}</div>}
+      {revisionNotice && <div className="studio-notice">{revisionNotice}</div>}
+      <Composer onSend={sendText} onCancel={cancelRun} running={running} revisionMode={revisionMode} onError={setChatError} />
+      <small className="studio-disclaimer">AI 可能犯错，重要创作决定以你批准的工件为准。</small>
+    </div>
+  </div>;
+}
+
+function Composer({ onSend, onCancel, onError, running, revisionMode }: { onSend: (text: string, attachments?: Attachment[]) => Promise<void>; onCancel: () => void; onError: (message: string) => void; running: boolean; revisionMode?: ConversationRevisionMode }) {
+  const [value, setValue] = useState("");
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [readingFiles, setReadingFiles] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const submit = () => { const text = value.trim(); if ((!text && !attachments.length) || running || readingFiles) return; const pendingAttachments = attachments; setValue(""); setAttachments([]); void onSend(text, pendingAttachments); };
+  const chooseFiles = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setReadingFiles(true); onError("");
+    try { const added = await Promise.all(Array.from(files).map(readAttachment)); setAttachments((current) => [...current, ...added]); }
+    catch (error) { onError(error instanceof Error ? error.message : "附件读取失败。"); }
+    finally { setReadingFiles(false); if (inputRef.current) inputRef.current.value = ""; }
+  };
+  return <div className="studio-composer-shell">
+    {attachments.length > 0 && <div className="studio-attachment-list">{attachments.map((file, index) => <span key={`${file.name}-${index}`}><FileText size={14} /><span><strong>{file.name}</strong><small>{Math.ceil(file.size / 1024)} KB</small></span><button type="button" aria-label={`移除 ${file.name}`} onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={13} /></button></span>)}</div>}
+    <div className="studio-composer"><input ref={inputRef} type="file" hidden multiple disabled={running || Boolean(revisionMode)} onChange={(event) => void chooseFiles(event.target.files)} /><button type="button" className="studio-attach-button" aria-label="添加附件" title={revisionMode ? "修改模式暂不支持附件" : "添加附件（单个不超过 5 MB）"} disabled={running || readingFiles || Boolean(revisionMode)} onClick={() => inputRef.current?.click()}>{readingFiles ? <LoaderCircle className="spin" size={17} /> : <Paperclip size={17} />}</button><textarea value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); } }} placeholder={revisionMode ? `说明希望如何调整${revisionMode.label}……` : "聊聊这本书……"} aria-label={revisionMode ? "说明修改要求" : "发送对话消息"} rows={1} /><button type="button" className="studio-composer-button" aria-label={running ? "停止回答" : "发送消息"} onClick={running ? onCancel : submit}>{running ? <Square size={17} /> : <Send size={17} />}</button></div>
+  </div>;
 }

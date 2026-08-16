@@ -64,6 +64,9 @@ export const completionAuditResultSchema = z.object({
 });
 export type CompletionAuditResult = z.infer<typeof completionAuditResultSchema>;
 
+export const productionModeSchema = z.enum(["legacy", "multi_volume"]);
+export type ProductionMode = z.infer<typeof productionModeSchema>;
+
 export const productionStageSchema = z.enum([...bookStages, ...volumeStages, ...chapterStages, ...optionalChapterStages]);
 export type ProductionStage = z.infer<typeof productionStageSchema>;
 export const artifactStatusSchema = z.enum(["missing", "in_progress", "ready", "stale", "blocked"]);
@@ -95,7 +98,7 @@ export const openingChoicesSchema = z.object({
   tone: z.string().min(1).max(120).optional(),
 });
 
-export const novelStateSchema = z.object({
+const novelStateObjectSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(2)]),
   novelId: z.string().min(1),
   title: z.string().min(1).max(80),
@@ -104,6 +107,7 @@ export const novelStateSchema = z.object({
   updatedAt: z.string().optional(),
   currentChapter: z.number().int().positive(),
   approvedChapterEnd: z.number().int().nonnegative(),
+  productionMode: productionModeSchema,
   currentVolume: z.number().int().positive().default(1),
   volumes: z.record(z.string(), volumePlanSchema).default({}),
   productionStatus: z.enum(["in_progress", "awaiting_completion_review", "completed"]).default("in_progress"),
@@ -117,7 +121,19 @@ export const novelStateSchema = z.object({
   }).optional(),
 });
 
+export const novelStateSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const raw = value as Record<string, unknown>;
+  if (raw.productionMode !== undefined) return value;
+  const hasVolumeState = ["currentVolume", "volumes", "productionStatus"].every((key) => Object.prototype.hasOwnProperty.call(raw, key));
+  return { ...raw, productionMode: hasVolumeState ? "multi_volume" : "legacy" };
+}, novelStateObjectSchema);
+
 export type NovelState = z.infer<typeof novelStateSchema>;
+
+export function isMultiVolumeProduction(state: Pick<NovelState, "productionMode">): boolean {
+  return state.productionMode === "multi_volume";
+}
 
 export const nextActionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("collect_opening_choices"), reason: z.string() }),
@@ -147,7 +163,7 @@ export function volumeHandoffKey(volume: number): string { return `volume:${volu
 export function completionAuditKey(): string { return "book:completion_audit"; }
 
 export function completionAuditBlockers(state: NovelState): string[] {
-  if (state.schemaVersion === 1) return [];
+  if (!isMultiVolumeProduction(state)) return [];
   const volume = state.volumes[String(state.currentVolume)];
   if (!volume || !volume.final || volume.status !== "completed") return [`第 ${state.currentVolume} 卷尚未完成最终卷验收范围。`];
   const blockers: string[] = [];

@@ -10,6 +10,7 @@ function state(): NovelState {
     title: "进度测试",
     currentChapter: 13,
     approvedChapterEnd: 20,
+    productionMode: "multi_volume",
     currentVolume: 2,
     volumes: {
       "1": { number: 1, startChapter: 1, endChapter: 10, final: false, status: "completed" },

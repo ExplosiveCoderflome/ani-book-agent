@@ -4,11 +4,21 @@ import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "nod
 import path from "node:path";
 import { parse, stringify } from "yaml";
 import { DatabaseSync } from "node:sqlite";
-import { artifactKey, completionAuditBlockers, completionAuditResultSchema, decideNextAction, novelStateSchema, untitledNovelTitle, volumeHandoffKey, volumeOutlineKey, volumePlanSchema, type ArtifactState, type NovelState, type ProductionStage, type VolumePlan } from "../domain";
+import { artifactKey, completionAuditBlockers, completionAuditResultSchema, decideNextAction, isMultiVolumeProduction, novelStateSchema, untitledNovelTitle, volumeHandoffKey, volumeOutlineKey, volumePlanSchema, type ArtifactState, type NovelState, type ProductionStage, type VolumePlan } from "../domain";
 import { AppError } from "../application/errors";
-import { artifactProposalSchema, novelBriefSchema, openingChoicesInputSchema, promptVersion, type ArtifactProposal, type NovelBrief, type NovelSummary } from "../shared/contracts";
+import { artifactProposalSchema, novelBriefSchema, openingChoicesInputSchema, promptVersion, type ArtifactProposal, type AssetRecord, type NovelBrief, type NovelFileRecord, type NovelSummary } from "../shared/contracts";
 
 const BRIEF_PATH = "book/novel-brief.md";
+const READABLE_FILE_LIMIT = 1_000_000;
+
+function fileKind(relativePath: string): NovelFileRecord["kind"] {
+  const extension = path.extname(relativePath).toLocaleLowerCase();
+  if (extension === ".md") return "markdown";
+  if (extension === ".yaml" || extension === ".yml") return "yaml";
+  if (extension === ".json") return "json";
+  if ([".sqlite", ".sqlite3", ".db", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip"].includes(extension)) return "binary";
+  return "text";
+}
 
 export function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -70,7 +80,7 @@ export class NovelRepository {
 
   async create(title: string, approvalMode: "milestone_approval" | "auto" = "milestone_approval"): Promise<NovelState> {
     const now = new Date().toISOString();
-    const state: NovelState = { schemaVersion: 2, novelId: randomUUID(), title, approvalMode, currentChapter: 1, approvedChapterEnd: 0, currentVolume: 1, volumes: {}, productionStatus: "in_progress", artifacts: {}, continuity: { lastCommittedChapter: 0, revision: 0 }, createdAt: now, updatedAt: now };
+    const state: NovelState = { schemaVersion: 2, novelId: randomUUID(), title, approvalMode, currentChapter: 1, approvedChapterEnd: 0, productionMode: "multi_volume", currentVolume: 1, volumes: {}, productionStatus: "in_progress", artifacts: {}, continuity: { lastCommittedChapter: 0, revision: 0 }, createdAt: now, updatedAt: now };
     await this.writeState(state);
     return state;
   }
@@ -103,8 +113,8 @@ export class NovelRepository {
   async setChapterRange(novelId: string, start: number, end: number): Promise<NovelState> {
     const state = await this.prepareForWrite(await this.get(novelId));
     if (start !== state.currentChapter) throw new AppError("CHAPTER_RANGE_STALE", `当前应从第 ${state.currentChapter} 章开始。`, 409, true);
-    const volume = state.schemaVersion === 2 ? state.volumes[String(state.currentVolume)] : undefined;
-    if (state.schemaVersion === 2 && !volume) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
+    const volume = isMultiVolumeProduction(state) ? state.volumes[String(state.currentVolume)] : undefined;
+    if (isMultiVolumeProduction(state) && !volume) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
     if (volume && (volume.status !== "active" || end > volume.endChapter)) throw new AppError("VOLUME_RANGE_EXCEEDED", `章节范围不能超过第 ${state.currentVolume} 卷的结束章节 ${volume.endChapter}。`, 409, true);
     state.approvedChapterEnd = end;
     await this.touchAndWrite(state);
@@ -135,11 +145,84 @@ export class NovelRepository {
     return Object.entries(state.artifacts).map(([key, item]) => ({ ...item, key: item.key ?? key, source: item.source ?? (item.userEdited ? "user_edited" : "ai_generated"), dependsOn: item.dependsOn ?? [] }));
   }
 
+  async listAssets(novelId: string): Promise<AssetRecord[]> {
+    const state = await this.get(novelId);
+    const artifacts = await this.listArtifacts(novelId);
+    const assets: AssetRecord[] = artifacts.map((artifact) => {
+      const id = artifact.key ?? artifact.path;
+      const type: AssetRecord["type"] = id.startsWith("chapter:") ? "chapter" : id.startsWith("continuity:") ? "continuity" : id.startsWith("volume:") || id.includes("volume") ? "volume" : id.includes("character") ? "character" : id.includes("world") ? "world" : id.includes("story") ? "story" : id.includes("brief") ? "brief" : id.startsWith("export:") ? "reference" : "workspace";
+      return { id, type, title: id, path: artifact.path, status: artifact.status, version: 1, ...(artifact.sha256 ? { sha256: artifact.sha256 } : {}), source: artifact.source === "user_edited" ? "user_edited" : artifact.source === "imported" ? "imported" : "ai_generated", protected: Boolean(artifact.protected), dependsOn: artifact.dependsOn ?? [], referencedBy: Object.entries(state.artifacts).filter(([, candidate]) => candidate.dependsOn?.includes(id)).map(([key]) => key), tags: [artifact.stage ?? type], updatedAt: artifact.committedAt };
+    });
+    const workspaceRoot = this.artifactPath(novelId, "workspace");
+    const walk = async (directory: string, prefix: string): Promise<AssetRecord[]> => {
+      const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+      const result: AssetRecord[] = [];
+      for (const entry of entries) {
+        const relative = `${prefix}${entry.name}`;
+        if (entry.isDirectory()) result.push(...await walk(path.join(directory, entry.name), `${relative}/`));
+        else result.push({ id: `workspace:${relative}`, type: "workspace", title: entry.name, path: `workspace/${relative}`, status: "ready", version: 1, source: "imported", protected: false, dependsOn: [], referencedBy: [], tags: [path.extname(entry.name).slice(1) || "file"] });
+      }
+      return result;
+    };
+    return [...assets, ...await walk(workspaceRoot, "")];
+  }
+
+  async listNovelFiles(novelId: string): Promise<NovelFileRecord[]> {
+    const state = await this.get(novelId);
+    const artifactByPath = new Map(Object.entries(state.artifacts).map(([key, artifact]) => [artifact.path, key]));
+    const root = this.novelDirectory(novelId);
+    const files: NovelFileRecord[] = [];
+    const walk = async (directory: string, prefix = ""): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries.sort((left, right) => Number(right.isDirectory()) - Number(left.isDirectory()) || left.name.localeCompare(right.name))) {
+        const relative = `${prefix}${entry.name}`;
+        if (entry.isDirectory()) await walk(path.join(directory, entry.name), `${relative}/`);
+        else if (entry.isFile()) {
+          const metadata = await stat(path.join(directory, entry.name));
+          files.push({ path: relative, kind: fileKind(relative), size: metadata.size, modifiedAt: metadata.mtime.toISOString(), ...(artifactByPath.get(relative) ? { artifactKey: artifactByPath.get(relative) } : {}) });
+        }
+      }
+    };
+    await walk(root);
+    return files;
+  }
+
+  async readNovelFile(novelId: string, relativePath: string) {
+    await this.get(novelId);
+    const clean = normalizeArtifactPath(relativePath);
+    const target = this.artifactPath(novelId, clean);
+    const metadata = await stat(target).catch(() => { throw new AppError("NOVEL_FILE_NOT_FOUND", "没有找到这个作品文件。", 404, false); });
+    if (!metadata.isFile()) throw new AppError("NOVEL_FILE_NOT_FOUND", "没有找到这个作品文件。", 404, false);
+    const kind = fileKind(clean);
+    if (kind === "binary") throw new AppError("NOVEL_FILE_NOT_READABLE", "这个文件不是可直接阅读的文本文件。", 409, true);
+    if (metadata.size > READABLE_FILE_LIMIT) throw new AppError("NOVEL_FILE_TOO_LARGE", "这个文件过大，请通过资产或 Agent 分段读取。", 413, true);
+    const content = await readFile(target, "utf8");
+    return { path: clean, kind, size: metadata.size, modifiedAt: metadata.mtime.toISOString(), sha256: sha256(content), content };
+  }
+
   async readArtifact(novelId: string, key: string): Promise<{ artifact: ArtifactState; content: string }> {
     const state = await this.get(novelId);
     const artifact = state.artifacts[key];
     if (!artifact) throw new AppError("ARTIFACT_NOT_FOUND", "没有找到这个工件。", 404, false);
     return { artifact: { ...artifact, key }, content: await readFile(this.artifactPath(novelId, artifact.path), "utf8") };
+  }
+
+  async readWorkspaceFile(novelId: string, relativePath: string) {
+    await this.get(novelId);
+    const clean = normalizeArtifactPath(relativePath);
+    const content = await readFile(this.artifactPath(novelId, `workspace/${clean}`), "utf8").catch(() => { throw new AppError("WORKSPACE_FILE_NOT_FOUND", "没有找到这个工作区文件。", 404, false); });
+    return { path: clean, content, sha256: sha256(content) };
+  }
+
+  async writeWorkspaceFile(novelId: string, relativePath: string, content: string, expectedSha256?: string) {
+    await this.get(novelId);
+    const clean = normalizeArtifactPath(relativePath);
+    if (!/\.(md|ya?ml|txt|json)$/i.test(clean)) throw new AppError("INVALID_WORKSPACE_FILE", "工作区文件只支持 Markdown、YAML、TXT 或 JSON。", 400, true);
+    const target = this.artifactPath(novelId, `workspace/${clean}`);
+    const existing = await readFile(target, "utf8").catch(() => undefined);
+    if (existing !== undefined && (!expectedSha256 || sha256(existing) !== expectedSha256)) throw new AppError("WORKSPACE_FILE_CONFLICT", "工作区文件已存在或内容已变化，请先读取后再写入。", 409, true);
+    await atomicWrite(target, content);
+    return { path: clean, sha256: sha256(content), created: existing === undefined };
   }
 
   async commitProposal(args: { novelId: string; proposal: ArtifactProposal; expectedInputHash: string; promptVersion: string; idempotencyKey: string; dependsOn?: string[] }): Promise<{ state: NovelState; sha256: string; duplicate: boolean }> {
@@ -185,8 +268,8 @@ export class NovelRepository {
     if (args.continuityDelta) {
       const chapter = args.continuityDelta.chapter;
       if (chapter !== state.currentChapter) throw new AppError("CHAPTER_NOT_CURRENT", `只能提交当前第 ${state.currentChapter} 章。`, 409, true);
-    const volume = state.schemaVersion === 2 ? state.volumes[String(state.currentVolume)] : undefined;
-      if (state.schemaVersion === 2 && (!volume || volume.status !== "active")) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
+    const volume = isMultiVolumeProduction(state) ? state.volumes[String(state.currentVolume)] : undefined;
+      if (isMultiVolumeProduction(state) && (!volume || volume.status !== "active")) throw new AppError("VOLUME_NOT_CONFIGURED", `请先确定第 ${state.currentVolume} 卷的章节范围。`, 409, true);
       if (volume && chapter > volume.endChapter) throw new AppError("VOLUME_RANGE_EXCEEDED", `第 ${chapter} 章超出第 ${state.currentVolume} 卷的结束章节 ${volume.endChapter}。`, 409, true);
     }
     const artifacts: Array<{ key: string; path: string; content: string; source?: "ai_generated" | "user_edited" | "imported" }> = [...args.artifacts, ...(args.continuityDelta ? await this.continuityArtifacts(args.novelId, args.continuityDelta) : [])];

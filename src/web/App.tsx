@@ -1,19 +1,19 @@
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Controller, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronDown, ChevronRight, CircleAlert, Columns3, Download, Eye, Feather, FileText, Flag, Lightbulb, LoaderCircle, Menu, Palette, PanelRightClose, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, X } from "lucide-react";
+import { useStreamWorkflow } from "@mastra/react";
+import { BookOpen, Check, ChevronRight, CircleAlert, Columns3, Download, Eye, Feather, FileText, Lightbulb, LoaderCircle, MessageCircle, Palette, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, X } from "lucide-react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { z } from "zod";
-import { untitledNovelTitle, type NextAction, type NovelState, type WorkflowId } from "../domain";
-import { novelBriefSchema, openingPresetProposalSchema, type ArtifactProposal, type NovelBrief, type OpeningPresetProposal, type RunView } from "../shared/contracts";
+import { untitledNovelTitle, type NextAction, type WorkflowId } from "../domain";
+import { novelBriefSchema, openingPresetProposalSchema, type ArtifactProposal, type NovelBrief, type OpeningPresetProposal, type RunView, type WorkspaceProjection } from "../shared/contracts";
 import { workflowLabels } from "../shared/workflow-catalog";
 import { api } from "./api";
-import { Conversation } from "./Conversation";
+import { Conversation, type ConversationRevisionMode } from "./Conversation";
 import { persistTheme, readStoredTheme, THEMES, type ThemeId } from "./themes";
-import { buildNovelProgress, type VolumeProgressPhase } from "./novel-progress";
 import { ThinkingOrb } from "thinking-orbs";
 import AnimatedContent from "./react-bits/AnimatedContent";
 import ClickSpark from "./react-bits/ClickSpark";
@@ -21,6 +21,7 @@ import Magnet from "./react-bits/Magnet";
 import ShinyText from "./react-bits/ShinyText";
 import SpotlightCard from "./react-bits/SpotlightCard";
 import WarpText from "./react-bits/WarpText";
+import { AgentSidebar, ArtifactReviewWorkspace, AssetCenter, CapabilityCenter, NovelFileManager, NovelFileWorkspace, NovelWorkbench, ObservabilityCenter, PlatformNavigator, RunDock, WorkspaceMain, type ConversationContextTarget, type WorkspaceSection } from "./workbench/NovelWorkbench";
 
 function ThemeSwitcher({ value, onChange, compact = false }: { value: ThemeId; onChange: (theme: ThemeId) => void; compact?: boolean }) {
   const selected = THEMES.find((theme) => theme.id === value);
@@ -116,7 +117,7 @@ function HomePage({ onSettings, onPrompts, theme, onThemeChange }: { onSettings:
   const create = useMutation({ mutationFn: ({ title, approvalMode }: { title: string; approvalMode: "milestone_approval" | "auto" }) => api.createNovel(title.trim() || untitledNovelTitle, approvalMode), onSuccess: async (novel) => { reset(); await queryClient.invalidateQueries({ queryKey: ["bootstrap"] }); navigate(`/novels/${novel.novelId}`); } });
   return <div className="home-shell"><header className="home-topbar"><div className="brand"><span className="brand-mark"><Feather size={20} /></span><span>ANI 小说 Agent</span></div><div className="topbar-actions"><ThemeSwitcher value={theme} onChange={onThemeChange} /><button className="quiet-button" onClick={onPrompts}><Pencil size={18} />提示词管理</button><button className="quiet-button" onClick={onSettings}><Settings2 size={18} />模型设置</button></div></header><main className="home-page">
     <div className="home-intro">
-      <AnimatedContent className="hero" delay={.04}><span className="eyebrow">你的长篇创作搭档</span><WarpText className="hero-warp-title" text="说出你的故事" color="#1f1915" fontFamily="Georgia, 'Noto Serif SC', serif" fontSize="clamp(3.3rem, 5.6vw, 5.4rem)" fontWeight={650} letterSpacing="-0.035em" warpStrength={0.18} warpScale={1.7} speed={0.55} pointerInfluence={0.85} pointerStrength={1.25} refraction={0.04} /><p>从故事方向、人物与世界，到逐章创作和完稿审阅，Agent 陪你一步步完成。</p><div className="hero-path" aria-label="创作流程"><span>聊出灵感</span><i /><span>搭好故事</span><i /><span>逐章写完</span></div></AnimatedContent>
+      <AnimatedContent className="hero" delay={.04}><span className="eyebrow">从灵感到完稿</span><WarpText className="hero-warp-title" text="说出你的故事" color="#1f1915" fontFamily="Georgia, 'Noto Serif SC', serif" fontSize="clamp(3.3rem, 5.6vw, 5.4rem)" fontWeight={650} letterSpacing="-0.035em" warpStrength={0.18} warpScale={1.7} speed={0.55} pointerInfluence={0.85} pointerStrength={1.25} refraction={0.04} /><p>从故事方向、人物与世界，到逐章创作和完稿审阅，Agent 陪你一步步完成。</p><div className="hero-path" aria-label="创作流程"><span>聊出灵感</span><i /><span>搭好故事</span><i /><span>逐章写完</span></div></AnimatedContent>
       <AnimatedContent className="create-card" delay={.16}><div className="create-card-heading"><span className="create-step">从这里开始</span><h2>创建新作品</h2><p>标题可以稍后再定，先给故事留一个位置。</p></div><form onSubmit={handleSubmit((value) => create.mutate(value))}><label><span>作品名 <small>选填</small></span><input {...register("title", { maxLength: 80 })} placeholder="例如：雾海尽头" autoFocus /></label><label><span>创作推进方式</span><Magnet padding={26} magnetStrength={30} wrapperClassName="magnet-select"><SpotlightCard className="select-spotlight"><select {...register("approvalMode")}><option value="milestone_approval">关键节点由我确认（推荐）</option><option value="auto">普通节点自动推进</option></select></SpotlightCard></Magnet></label><ClickSpark sparkColor="#f5c46a" sparkRadius={22} sparkCount={10}><Magnet padding={36} magnetStrength={16} wrapperClassName="magnet-cta"><button className="primary-button create-button" disabled={create.isPending}>{create.isPending ? <LoaderCircle className="spin" /> : <Plus />}{create.isPending ? "正在创建…" : "开始这部小说"}<ChevronRight size={18} /></button></Magnet></ClickSpark></form><p className="create-assurance"><Sparkles size={15} />没有想法也没关系，创建后 Agent 会给你具体选项。</p><ErrorNotice error={create.error} /></AnimatedContent>
     </div>
     <AnimatedContent className="recent-section" delay={0.26}><div className="section-heading"><div><span className="eyebrow">你的书架</span><h2>继续创作</h2></div><span>{bootstrap.data?.novels.length ?? 0} 部作品</span></div>
@@ -126,7 +127,7 @@ function HomePage({ onSettings, onPrompts, theme, onThemeChange }: { onSettings:
 }
 
 const starterMessages = [
-  ["我完全没有想法", "我想写一本长篇小说，但现在完全没有想法。请先给我三个差异明显、容易产生继续创作欲望的故事方向，然后一次只问我一个问题。"],
+  ["我完全没有想法", "我想写一本长篇小说，但现在完全没有想法。请先用可点击选项给我恰好五条差异明显、容易产生继续创作欲望的一句话开书种子，然后再一次只问我一个问题。"],
   ["我有一个模糊点子", "我有一点模糊想法，但还没整理好。请用一次一个问题的方式帮我说清楚，并且每次给我几个具体备选。"],
   ["我只知道想要的感觉", "我还不知道写什么，只知道想从阅读感觉开始。请先给我几个明显不同的感觉方向让我选。"],
 ] as const;
@@ -141,12 +142,10 @@ function DiscoveryCard({ isRunning, onSend }: { isRunning: boolean; onSend: (tex
   return <section className="flow-card discovery-card"><div className="card-speaker"><Lightbulb size={16} />聊天式开书</div><h2>我们先聊，不用先填任何设置</h2><p>选择最接近你现在状态的一句话，或者直接在下面输入。之后我每次只问一个问题，并给你几个备选方案。</p><div className="starter-options">{starterMessages.map(([label, message]) => <button className="secondary-button" key={label} disabled={isRunning} onClick={() => onSend(message)}>{label}<ChevronRight size={17} /></button>)}</div></section>;
 }
 
-function ReadyBrief({ onStart, pending }: { onStart: () => void; pending: boolean }) {
-  return <section className="flow-card action-card"><div className="card-speaker"><Sparkles size={16} />创作搭档</div><h2>我已经可以整理第一版小说简报</h2><p>它会覆盖读者定位、主角、核心冲突、故事引擎和开篇钩子。生成后先交给你编辑与批准，不会直接写入作品。</p><ClickSpark sparkColor="#f5c46a"><Magnet padding={28} magnetStrength={18} wrapperClassName="magnet-action"><button className="primary-button" disabled={pending} onClick={onStart}>{pending ? <LoaderCircle className="spin" /> : <Sparkles />}生成小说简报</button></Magnet></ClickSpark></section>;
-}
-
-function GenerationProgress({ onCancel, label = "当前工件" }: { onCancel: () => void; label?: string }) {
-  return <SpotlightCard className="flow-card progress-card"><div className="generation-orb"><ThinkingOrb state="composing" size={64} theme="light" aria-label="正在生成创作内容" /></div><div><div className="card-speaker"><Sparkles size={16} />正在生成</div><h2><ShinyText text={`正在推进${label}`} color="var(--ink)" shineColor="var(--amber)" speed={2} /></h2><div className="progress-steps"><span className="done"><Check />装配权威上下文</span><span className="active"><ThinkingOrb state="working" size={20} theme="light" />执行 Workflow</span><span>校验并提交结果</span></div><button className="text-button danger" onClick={onCancel}>取消本次运行</button></div></SpotlightCard>;
+function GenerationProgress({ onCancel, run, label = "当前工件" }: { onCancel: () => void; run: NonNullable<WorkspaceProjection["run"]>; label?: string }) {
+  const heading = run.recovered ? `正在恢复并继续${label}` : `正在推进${label}`;
+  const stage = run.currentStep ?? (run.recovered ? `恢复执行，第 ${run.attempt ?? 1} 次尝试` : "执行 Workflow");
+  return <SpotlightCard className="flow-card progress-card"><div className="generation-orb"><ThinkingOrb state="composing" size={64} theme="light" aria-label="正在生成创作内容" /></div><div><div className="card-speaker"><Sparkles size={16} />{run.recovered ? "恢复运行" : "正在生成"}</div><h2><ShinyText text={heading} color="var(--ink)" shineColor="var(--amber)" speed={2} /></h2><div className="progress-steps"><span className="done"><Check />装配权威上下文</span><span className="active"><ThinkingOrb state="working" size={20} theme="light" />{stage}</span><span>校验并提交结果</span></div><button className="text-button danger" onClick={onCancel}>取消本次运行</button></div></SpotlightCard>;
 }
 
 type BriefForm = Omit<NovelBrief, "risks"> & { risksText: string };
@@ -158,13 +157,12 @@ function EditableBriefField({ control, name, label, rows = 3 }: { control: Contr
   return <Controller name={name} control={control} render={({ field }) => <div className="editable-field" data-field={name}><span className="editable-field-label">{label}</span>{editing ? <textarea {...field} className="editable-input" autoFocus rows={rows} onKeyDown={(event) => { if (event.key === "Escape") event.currentTarget.blur(); }} onBlur={() => { field.onBlur(); setEditing(false); }} /> : <button type="button" className="editable-display" aria-label={`编辑${label}`} onClick={() => setEditing(true)}><span className="editable-copy">{field.value || "点击添加内容"}</span><span className="editable-hint" aria-hidden="true"><Pencil size={13} />编辑</span></button>}</div>} />;
 }
 
-function BriefProposal({ run, onUpdated, onCanceled }: { run: RunView; onUpdated: () => void; onCanceled: () => void }) {
+function BriefProposal({ run, onUpdated, onCanceled, onRequestRevision }: { run: RunView; onUpdated: () => void; onCanceled: () => void; onRequestRevision: () => void }) {
   const proposal = run.proposal!;
   const { control, handleSubmit } = useForm<BriefForm>({ resolver: zodResolver(briefFormSchema), defaultValues: { ...proposal, risksText: proposal.risks.join("\n") } });
-  const [feedback, setFeedback] = useState("");
   const review = useMutation({ mutationFn: (body: Parameters<typeof api.review>[1]) => api.review(run.runId, body), onSuccess: (_value, body) => body.action === "cancel" ? onCanceled() : onUpdated() });
   const toBrief = (value: BriefForm): NovelBrief => ({ ...value, risks: value.risksText.split("\n").map((item) => item.trim()).filter(Boolean) });
-  return <section className="flow-card brief-card"><div className="card-speaker"><Sparkles size={16} />创作搭档 · 等待你的决定</div><h2>小说简报提案</h2><p>这是提案，不是定稿。点击任意内容即可编辑，批准后才会保存。</p><form className="brief-form" onSubmit={handleSubmit((value) => review.mutate({ action: "approve", brief: toBrief(value) }))}>{briefFields.map(([name, label]) => <EditableBriefField key={name} control={control} name={name} label={label} rows={name === "workingTitle" ? 1 : 3} />)}<EditableBriefField control={control} name="risksText" label="风险与提醒" rows={4} /><div className="approval-box"><strong>批准后会发生什么？</strong><p>当前内容会写入小说简报 Markdown，并成为后续“故事圣经”的上游依据。</p></div><div className="review-actions"><button className="primary-button" type="submit" disabled={review.isPending}><Check />批准并保存</button><button className="secondary-button" type="button" disabled={!feedback.trim() || review.isPending} onClick={() => review.mutate({ action: "revise", feedback })}><RefreshCw />要求调整</button></div><label>给 AI 的调整意见<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="例如：主角目标还不够迫切，希望开篇三章内出现第一次明确胜利。" rows={3} /></label><button type="button" className="text-button danger" onClick={() => review.mutate({ action: "cancel" })}>取消本次生成</button><ErrorNotice error={review.error} /></form></section>;
+  return <section className="flow-card brief-card"><div className="card-speaker"><Sparkles size={16} />待确认提案</div><h2>小说简报提案</h2><p>这是提案，不是定稿。点击任意内容即可编辑，批准后才会保存。</p><form className="brief-form" onSubmit={handleSubmit((value) => review.mutate({ action: "approve", brief: toBrief(value) }))}>{briefFields.map(([name, label]) => <EditableBriefField key={name} control={control} name={name} label={label} rows={name === "workingTitle" ? 1 : 3} />)}<EditableBriefField control={control} name="risksText" label="风险与提醒" rows={4} /><div className="approval-box"><strong>批准后会发生什么？</strong><p>当前内容会写入小说简报 Markdown，并成为后续“故事圣经”的上游依据。</p></div><div className="review-actions"><button className="primary-button" type="submit" disabled={review.isPending}><Check />批准并保存</button><button className="secondary-button" type="button" disabled={review.isPending} onClick={onRequestRevision}><RefreshCw />要求调整</button></div><button type="button" className="text-button danger" onClick={() => review.mutate({ action: "cancel" })}>取消本次生成</button><ErrorNotice error={review.error} /></form></section>;
 }
 
 function EditableMarkdown({ value, onChange }: { value: string; onChange: (value: string) => void }) {
@@ -175,13 +173,12 @@ function EditableMarkdown({ value, onChange }: { value: string; onChange: (value
   </section>;
 }
 
-function ArtifactProposalCard({ run, onUpdated, onCanceled }: { run: RunView; onUpdated: () => void; onCanceled: () => void }) {
+function ArtifactProposalCard({ run, onUpdated, onCanceled, onRequestRevision }: { run: RunView; onUpdated: () => void; onCanceled: () => void; onRequestRevision: (proposal: ArtifactProposal) => void }) {
   const proposal = run.artifactProposal!;
   const [content, setContent] = useState(proposal.content);
-  const [feedback, setFeedback] = useState("");
   const review = useMutation({ mutationFn: (body: Parameters<typeof api.review>[1]) => api.review(run.runId, body), onSuccess: (_value, body) => body.action === "cancel" ? onCanceled() : onUpdated() });
   const edited: ArtifactProposal = { ...proposal, content, files: proposal.files.map((file, index) => index === 0 ? { ...file, content } : file) };
-  return <section className="flow-card brief-card"><div className="card-speaker"><Sparkles size={16} />创作搭档 · 等待你的决定</div><h2>{proposal.title}</h2><p>这是可编辑提案。默认显示排版效果，点击“编辑源码”后再修改；批准后才会写入权威工件。</p><EditableMarkdown value={content} onChange={setContent} /><div className="review-actions"><button className="primary-button" disabled={review.isPending} onClick={() => review.mutate({ action: "approve", proposal: edited })}><Check />批准并保存</button><button className="secondary-button" disabled={!feedback.trim() || review.isPending} onClick={() => review.mutate({ action: "revise", feedback, proposal: edited })}><RefreshCw />要求调整</button></div><label>调整意见<textarea rows={3} value={feedback} onChange={(event) => setFeedback(event.target.value)} /></label><button className="text-button danger" onClick={() => review.mutate({ action: "cancel" })}>取消本次生成</button><ErrorNotice error={review.error} /></section>;
+  return <section className="flow-card brief-card"><div className="card-speaker"><Sparkles size={16} />待确认提案</div><h2>{proposal.title}</h2><p>这是可编辑提案。默认显示排版效果，点击“编辑源码”后再修改；批准后才会写入权威工件。</p><EditableMarkdown value={content} onChange={setContent} /><div className="review-actions"><button className="primary-button" disabled={review.isPending} onClick={() => review.mutate({ action: "approve", proposal: edited })}><Check />批准并保存</button><button className="secondary-button" disabled={review.isPending} onClick={() => onRequestRevision(edited)}><RefreshCw />要求调整</button></div><button className="text-button danger" onClick={() => review.mutate({ action: "cancel" })}>取消本次生成</button><ErrorNotice error={review.error} /></section>;
 }
 
 function NextStepCard({ next, pending, onStart, onRange, onVolume }: { next: NextAction; pending: boolean; onStart: (workflowId: WorkflowId, target?: string) => void; onRange: (start: number, end: number, autoApproveMilestones: boolean) => void; onVolume: (plan: { number: number; startChapter: number; endChapter: number; final: boolean }) => void }) {
@@ -192,155 +189,139 @@ function NextStepCard({ next, pending, onStart, onRange, onVolume }: { next: Nex
   if (next.type === "configure_volume") return <section className="flow-card action-card"><div className="card-speaker"><BookOpen size={16} />卷规划</div><h2>确定第 {next.volume} 卷的范围</h2><p>{next.reason} 先给这一卷一个明确的收束点，后续章节会围绕卷目标逐章推进。</p><label>本卷写到第几章<input type="number" min={next.startChapter} max={next.startChapter + 99} value={volumeEnd} onChange={(event) => setVolumeEnd(Number(event.target.value))} /></label><label className="volume-final-toggle"><input type="checkbox" checked={isFinalVolume} onChange={(event) => setIsFinalVolume(event.target.checked)} />这是最终卷，完成后标记整部小说完本</label><button className="primary-button" disabled={pending || volumeEnd < next.startChapter} onClick={() => onVolume({ number: next.volume, startChapter: next.startChapter, endChapter: volumeEnd, final: isFinalVolume })}><Check />确认第 {next.volume} 卷范围</button></section>;
   if (next.type === "complete_novel") return <section className="flow-card complete-card"><div className="complete-mark"><Check /></div><h2>这部小说已经写完</h2><p>{next.reason}</p><button className="primary-button" onClick={() => onStart("novel-export")}><Download size={17} />导出稳定章节 TXT</button></section>;
   if (next.type === "completion_blocked") return <section className="flow-card action-card"><div className="card-speaker"><CircleAlert size={16} />完本验收未通过</div><h2>还有 {next.blockers.length} 项需要处理</h2><p>{next.reason}</p><ul className="blocker-list">{next.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul><button className="secondary-button" disabled={pending} onClick={() => onStart(next.workflowId)}><RefreshCw />修复后重新验收</button></section>;
-  if (next.type === "approve_chapter_range") return <section className="flow-card action-card"><div className="card-speaker"><BookOpen size={16} />章节生产授权</div><h2>批准下一段章节范围</h2><p>{next.reason} 章节会严格串行：当前章定稿并回灌连续性后才进入下一章。</p><label>生产到第几章<input type="number" min={next.chapter} max={next.chapter + 99} value={rangeEnd} onChange={(event) => setRangeEnd(Number(event.target.value))} /></label><fieldset className="production-mode"><legend>创作方式</legend><label><input type="radio" name="production-mode" checked={!autoApproveMilestones} onChange={() => setAutoApproveMilestones(false)} />逐项确认（推荐）<small>关键规划完成后由你确认，再继续创作。</small></label><label><input type="radio" name="production-mode" checked={autoApproveMilestones} onChange={() => setAutoApproveMilestones(true)} />全自动推进<small>自动完成准备工件并连续生产至目标章节；你可随时停止。</small></label></fieldset><ClickSpark sparkColor="#f5c46a"><Magnet padding={28} magnetStrength={18} wrapperClassName="magnet-action"><button className="primary-button" disabled={pending || rangeEnd < next.chapter} onClick={() => onRange(next.chapter, rangeEnd, autoApproveMilestones)}><Check />{autoApproveMilestones ? `自动创作至第 ${rangeEnd} 章` : `批准第 ${next.chapter}–${rangeEnd} 章`}</button></Magnet></ClickSpark></section>;
+  if (next.type === "approve_chapter_range") return <section className="flow-card action-card"><div className="card-speaker"><BookOpen size={16} />章节生产授权</div><h2>批准下一段章节范围</h2><p>{next.reason} 章节会严格串行：当前章定稿并回灌连续性后才进入下一章。</p><label>生产到第几章<input type="number" min={next.chapter} max={next.chapter + 99} value={rangeEnd} onChange={(event) => setRangeEnd(Number(event.target.value))} /></label><fieldset className="production-mode"><legend>创作方式</legend><label><input type="radio" name="production-mode" checked={!autoApproveMilestones} onChange={() => setAutoApproveMilestones(false)} />逐项确认（推荐）<small>关键规划完成后由你确认，再继续创作。</small></label><label><input type="radio" name="production-mode" checked={autoApproveMilestones} onChange={() => setAutoApproveMilestones(true)} />全自动推进<small>自动完成准备工件并连续生产至目标章节；你可随时停止。</small></label></fieldset><button className="primary-button" disabled={pending || rangeEnd < next.chapter} onClick={() => onRange(next.chapter, rangeEnd, autoApproveMilestones)}><Check />{autoApproveMilestones ? `自动创作至第 ${rangeEnd} 章` : `批准第 ${next.chapter}–${rangeEnd} 章`}</button></section>;
   if (next.type === "collect_opening_choices") return null;
   const workflowId = next.workflowId;
   if (!workflowId) return <RecoveryCard error="当前步骤缺少 Workflow 映射。" pending={false} onRetry={() => undefined} />;
   const chapterTarget = next.artifactKey.startsWith("chapter:") ? next.artifactKey.split(":")[1] : undefined;
   const label = workflowLabels[workflowId];
   const refreshing = next.type === "refresh_artifact";
-  return <section className="flow-card next-step-card"><header className="next-step-heading"><span className="next-step-icon"><Sparkles size={19} /></span><div><span>推荐下一步</span><h2>{label}</h2></div></header><p className="next-step-reason">{refreshing ? `${label}的上游内容已有变化，需要重新整理。` : `创作链已经准备好进入“${label}”。`}</p><div className="next-step-note"><Check size={17} /><div><strong>安全生成</strong><p>读取已确认的上游内容，完成校验后按需交给你批准；受保护内容不会被覆盖。</p></div></div><ClickSpark sparkColor="#f5c46a" sparkRadius={24} sparkCount={10}><Magnet padding={32} magnetStrength={16} wrapperClassName="magnet-cta"><button className="primary-button next-step-action" disabled={pending} onClick={() => onStart(workflowId, chapterTarget)}>{pending ? <><LoaderCircle className="spin" />正在启动…</> : <><Sparkles />{refreshing ? "重新生成" : "生成"}{label}</>}</button></Magnet></ClickSpark></section>;
+  return <section className="flow-card next-step-card"><header className="next-step-heading"><span className="next-step-icon"><Sparkles size={19} /></span><div><span>推荐下一步</span><h2>{label}</h2></div></header><p className="next-step-reason">{refreshing ? `${label}的上游内容已有变化，需要重新整理。` : `创作链已经准备好进入“${label}”。`}</p><div className="next-step-note"><Check size={17} /><div><strong>安全生成</strong><p>读取已确认的上游内容，完成校验后按需交给你批准；受保护内容不会被覆盖。</p></div></div><button className="primary-button next-step-action" disabled={pending} onClick={() => onStart(workflowId, chapterTarget)}>{pending ? <><LoaderCircle className="spin" />正在启动…</> : <><Sparkles />{refreshing ? "重新生成" : "生成"}{label}</>}</button></section>;
 }
 
 function RecoveryCard({ error, onRetry, pending }: { error?: string; onRetry: () => void; pending: boolean }) {
   return <section className="flow-card action-card"><div className="card-speaker"><CircleAlert size={16} />本次生成未完成</div><h2>我们可以从这里重新开始</h2><p>{error ?? "这次生成已取消，没有修改作品文件。"}</p><button className="secondary-button" disabled={pending} onClick={onRetry}>{pending ? <LoaderCircle className="spin" /> : <RefreshCw />}{pending ? "正在重新生成…" : "重新生成"}</button></section>;
 }
 
-function NovelSidebar({ currentId, onSettings, onPrompts, theme, onThemeChange }: { currentId: string; onSettings: () => void; onPrompts: () => void; theme: ThemeId; onThemeChange: (theme: ThemeId) => void }) {
-  const bootstrap = useQuery({ queryKey: ["bootstrap"], queryFn: api.bootstrap });
-  return <aside className="novel-sidebar"><Link to="/" className="brand"><span className="brand-mark"><Feather size={19} /></span><span>ANI 小说 Agent</span></Link><Link to="/" className="new-novel"><Plus size={17} />新建作品</Link><nav><span className="sidebar-label">作品与主对话</span>{bootstrap.data?.novels.map((novel) => <Link key={novel.id} to={`/novels/${novel.id}`} className={novel.id === currentId ? "sidebar-novel active" : "sidebar-novel"}><BookOpen size={17} /><span>{novel.title}</span></Link>)}</nav><div className="sidebar-footer"><ThemeSwitcher compact value={theme} onChange={onThemeChange} /><button className="sidebar-settings" onClick={onPrompts}><Pencil size={17} />提示词管理</button><button className="sidebar-settings" onClick={onSettings}><Settings2 size={17} />模型设置</button></div></aside>;
-}
-
-const volumePhaseLabels: Record<VolumeProgressPhase, string> = {
-  active: "创作中",
-  handoff_pending: "待整理承接",
-  handoff_ready: "承接已就绪",
-  audit_pending: "待完本验收",
-  audit_blocked: "验收待修复",
-  completed: "整部已完本",
-  planning: "待规划",
-};
-
-function nextActionLabel(next: NextAction, run?: RunView) {
-  if (run?.status === "running") return `正在${run.workflowId ? workflowLabels[run.workflowId] : "推进任务"}`;
-  if (run?.status === "awaiting_review") return `等待确认${run.workflowId ? workflowLabels[run.workflowId] : "创作提案"}`;
-  if (next.type === "collect_opening_choices") return "继续开书讨论";
-  if (next.type === "configure_volume") return `规划第 ${next.volume} 卷`;
-  if (next.type === "approve_chapter_range") return `批准第 ${next.chapter} 章起`;
-  if (next.type === "complete_novel") return "已完成，可导出";
-  if (next.type === "completion_blocked") return "处理完本问题";
-  return `${next.type === "refresh_artifact" ? "刷新" : "生成"}${next.workflowId ? workflowLabels[next.workflowId] : "创作工件"}`;
-}
-
-function NovelProgressWorkbench({ novel, next, run }: { novel: NovelState; next: NextAction; run?: RunView }) {
-  const [expanded, setExpanded] = useState(false);
-  if (!novel.openingChoices) return null;
-  const progress = buildNovelProgress(novel);
-  const focus = progress.focusVolume;
-  const range = focus.endChapter ? `第 ${focus.startChapter}–${focus.endChapter} 章` : `从第 ${focus.startChapter} 章开始`;
-  const status = nextActionLabel(next, run);
-  return <section className={expanded ? "novel-progress-workbench expanded" : "novel-progress-workbench"} aria-label="小说生产进度">
-    <div className="novel-progress-summary">
-      <div className="progress-volume-mark"><Flag size={17} /><span>{progress.mode === "legacy" ? "单卷" : `第 ${focus.number} 卷`}</span></div>
-      <div className="progress-volume-copy"><strong>{volumePhaseLabels[focus.phase]}</strong><small>{progress.mode === "legacy" ? "旧版作品继续沿用原生产链" : range}</small></div>
-      <div className="progress-meter" aria-label={focus.totalChapters ? `本卷已完成 ${focus.completedChapters} / ${focus.totalChapters} 章` : "本卷等待规划"}><span><i style={{ width: `${focus.percent}%` }} /></span><small>{focus.totalChapters ? `${focus.completedChapters}/${focus.totalChapters} 章稳定` : "范围待确定"}</small></div>
-      <div className="progress-stat"><strong>{progress.stableChapters}</strong><small>稳定章节</small></div>
-      <div className="progress-now"><small>当前阶段</small><strong>{status}</strong></div>
-      <button type="button" className="progress-expand" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>{expanded ? "收起" : "查看各卷"}<ChevronDown size={16} /></button>
-    </div>
-    {expanded && <div className="volume-progress-list">{progress.volumes.map((volume) => <article className={`volume-progress-item ${volume.phase}`} key={volume.number}>
-      <header><span>第 {volume.number} 卷{volume.final ? " · 最终卷" : ""}</span><em>{volumePhaseLabels[volume.phase]}</em></header>
-      <div className="volume-progress-range"><span>{volume.endChapter ? `第 ${volume.startChapter}–${volume.endChapter} 章` : `从第 ${volume.startChapter} 章开始`}</span><strong>{volume.totalChapters ? `${volume.completedChapters}/${volume.totalChapters}` : "待定"}</strong></div>
-      <div className="volume-progress-track"><i style={{ width: `${volume.percent}%` }} /></div>
-    </article>)}</div>}
-  </section>;
-}
-
-function ArtifactPanel({ novelId, artifacts, open, onClose, onExport }: { novelId: string; artifacts: Record<string, { status: string; protected: boolean }>; open: boolean; onClose: () => void; onExport: () => void }) {
-  const queryClient = useQueryClient();
-  const [selectedKey, setSelectedKey] = useState("");
-  const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<"all" | "pending" | "ready" | "protected">("all");
-  const [expandedChapters, setExpandedChapters] = useState<number[]>([]);
-  const artifact = useQuery({ queryKey: ["artifact", novelId, selectedKey], queryFn: () => api.artifact(novelId, selectedKey), enabled: Boolean(selectedKey) });
-  const [content, setContent] = useState("");
-  const [editing, setEditing] = useState(false);
-  useEffect(() => { if (artifact.data) setContent(artifact.data.content); }, [artifact.data]);
-  useEffect(() => { setEditing(false); }, [selectedKey]);
-  const save = useMutation({ mutationFn: () => api.editArtifact(novelId, selectedKey, content, artifact.data?.artifact.sha256 ?? ""), onSuccess: async () => { setEditing(false); await Promise.all([queryClient.invalidateQueries({ queryKey: ["artifact", novelId, selectedKey] }), queryClient.invalidateQueries({ queryKey: ["novel", novelId] })]); } });
-  if (!open) return null;
-  const stages: Array<[string, string]> = [["book:novel_brief", "小说简报"], ["book:story_bible", "故事圣经"], ["book:world_bible", "世界圣经"], ["book:character_cast", "角色阵容"], ["book:volume_strategy", "卷战略"], ["book:volume_outline", "当前卷骨架"], ["book:completion_audit", "完本验收"]];
-  const chapterNames: Record<string, string> = { chapter_draft: "正文草稿", chapter_plan: "章节计划", chapter_review: "审查报告", context_package: "上下文包", continuity_update: "连续性更新", humanization_revision: "人性化修订", quality_debt: "质量债务", quality_repair: "质量修复" };
-  const labelFor = (key: string) => chapterNames[key.replace(/^chapter:\d+:/, "")] ?? key.replace(/^chapter:\d+:/, "").replaceAll("_", " ");
-  const matches = (key: string, label: string) => { const item = artifacts[key]; const queryMatches = !search || `${label} ${key}`.toLowerCase().includes(search.toLowerCase()); return queryMatches && (filter === "all" || filter === "ready" && item?.status === "ready" || filter === "pending" && item?.status !== "ready" || filter === "protected" && item?.protected); };
-  const volumeItems = Object.keys(artifacts).filter((key) => /^volume:\d+:(outline|handoff)$/.test(key)).sort();
-  const bookItems = stages.filter(([key, label]) => matches(key, label));
-  const chapters = Object.keys(artifacts).filter((key) => key.startsWith("chapter:")).reduce<Record<number, string[]>>((groups, key) => { const chapter = Number(/^chapter:(\d+):/.exec(key)?.[1]); if (chapter) (groups[chapter] ??= []).push(key); return groups; }, {});
-  const chapterNumbers = Object.keys(chapters).map(Number).sort((a, b) => b - a);
-  const latestChapter = chapterNumbers[0];
-  const isExpanded = (chapter: number) => expandedChapters.includes(chapter) || expandedChapters.length === 0 && chapter === latestChapter;
-  const toggleChapter = (chapter: number) => setExpandedChapters((current) => current.includes(chapter) ? current.filter((item) => item !== chapter) : [...current, chapter]);
-  const statusText = (item: typeof artifacts[string] | undefined) => item?.protected ? "已保护" : item?.status === "ready" ? "已完成" : item?.status === "stale" ? "待刷新" : "等待上游";
-  const itemNode = (key: string, label: string, compact = false) => { const item = artifacts[key]; return <button type="button" key={key} disabled={!item} onClick={() => setSelectedKey(key)} className={`artifact-item ${compact ? "compact" : ""} ${item?.status === "ready" ? "ready" : item?.status === "stale" ? "active" : "locked"}`}><span>{item?.status === "ready" ? <Check size={14} /> : ""}</span><div><strong>{label}</strong><small>{statusText(item)}</small></div></button>; };
-  return <><aside className="artifact-panel"><div className="panel-heading"><div><span className="sidebar-label">作品上下文</span><h3>创作工件</h3><small>{Object.values(artifacts).filter((item) => item.status === "ready").length} 项已完成</small></div><button className="icon-button" aria-label="收起工件栏" onClick={onClose}><PanelRightClose size={19} /></button></div><div className="artifact-tools"><label><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索工件" /></label><div>{([ ["all", "全部"], ["pending", "待处理"], ["ready", "已完成"], ["protected", "已保护"] ] as const).map(([value, label]) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}</button>)}</div></div><div className="artifact-scroll"><section className="artifact-section"><header><span>书级工件</span><small>稳定基础</small></header>{bookItems.length ? bookItems.map(([key, label]) => itemNode(key, label, true)) : <p className="artifact-empty">没有匹配的书级工件</p>}</section>{volumeItems.length > 0 && <section className="artifact-section"><header><span>卷级工件</span><small>{volumeItems.length} 项</small></header>{volumeItems.map((key) => itemNode(key, key.replace(/^volume:(\d+):/, "第 $1 卷 · ").replace("outline", "卷骨架").replace("handoff", "卷间承接"), true))}</section>}<section className="artifact-section chapter-section"><header><span>章节工件</span><small>{chapterNumbers.length} 章</small></header>{chapterNumbers.map((chapter) => { const all = chapters[chapter] ?? []; const items = all.filter((key) => matches(key, labelFor(key))); const completed = all.filter((key) => artifacts[key]?.status === "ready").length; if (!items.length) return null; const expanded = isExpanded(chapter); return <div className={expanded ? "chapter-group expanded" : "chapter-group"} key={chapter}><button className="chapter-toggle" onClick={() => toggleChapter(chapter)}><span className="chapter-index">{String(chapter).padStart(2, "0")}</span><span><strong>第 {chapter} 章</strong><small>{completed}/{all.length} 项已完成</small></span><ChevronRight size={16} /></button>{expanded && <AnimatedContent className="chapter-artifacts" distance={12} duration={.28}>{items.sort().map((key) => itemNode(key, labelFor(key), true))}</AnimatedContent>}</div>; })}{!chapterNumbers.length && <p className="artifact-empty">章节开始创作后，相关工件会按章节收纳在这里。</p>}</section></div><div className="artifact-footer"><button className="secondary-button wide" onClick={onExport}>导出稳定章节 TXT</button><div className="context-note"><strong>创作控制</strong><p>编辑已提交工件会自动保护作者内容，并标记下游需要刷新。</p></div></div></aside>{selectedKey && <div className="modal-backdrop"><section className="modal artifact-modal" role="dialog" aria-modal="true"><div className="modal-heading"><div><span className="eyebrow">权威工件</span><h2>{selectedKey}</h2><p>{artifact.data?.artifact.protected ? "作者已保护，Agent 不会覆盖。" : "保存编辑后将自动设为作者保护。"}</p></div><button className="icon-button" aria-label="关闭" onClick={() => setSelectedKey("")}><X /></button></div><div className="artifact-modal-body">{artifact.isLoading ? <div className="loading"><LoaderCircle className="spin" />正在读取…</div> : editing ? <textarea className="artifact-editor" rows={24} value={content} onChange={(event) => setContent(event.target.value)} /> : <div className="message-markdown artifact-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown></div>}<ErrorNotice error={artifact.error ?? save.error} /></div><div className="modal-footer">{editing ? <><button className="secondary-button" onClick={() => { setContent(artifact.data?.content ?? content); setEditing(false); }}>取消编辑</button><button className="primary-button" disabled={!artifact.data || save.isPending || content === artifact.data.content} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" /> : <Check />}保存并保护</button></> : <button className="secondary-button" disabled={!artifact.data} onClick={() => setEditing(true)}><Pencil />编辑源码</button>}</div></section></div>}</>;
-}
-
-function ExportComplete({ novelId, run }: { novelId: string; run: RunView }) {
-  return <section className="flow-card complete-card"><div className="complete-mark"><Check /></div><h2>稳定章节已导出</h2><p>已汇总 {run.chapterCount ?? 0} 章。你可以直接下载 TXT 文件。</p>{run.exportPath && <a className="primary-button" href={api.exportDownloadUrl(novelId, run.exportPath)}><Download size={17} />下载 TXT</a>}</section>;
-}
-
 function NovelPage({ onSettings, onPrompts, theme, onThemeChange }: { onSettings: () => void; onPrompts: () => void; theme: ThemeId; onThemeChange: (theme: ThemeId) => void }) {
   const { id = "" } = useParams();
   const queryClient = useQueryClient();
   const bootstrap = useQuery({ queryKey: ["bootstrap"], queryFn: api.bootstrap });
-  const novel = useQuery({ queryKey: ["novel", id], queryFn: () => api.novel(id), enabled: Boolean(id) });
+  const workspace = useQuery({ queryKey: ["workspace", id], queryFn: () => api.workspace(id), enabled: Boolean(id), retry: false, refetchInterval: (query) => query.state.data?.run?.status === "running" ? 4_000 : false });
   const chat = useQuery({ queryKey: ["chat", id], queryFn: () => api.chat(id), enabled: Boolean(id) && Boolean(bootstrap.data?.models.configured), retry: false });
-  const storageKey = `ani-novel-run:${id}`;
-  const [runId, setRunId] = useState(() => localStorage.getItem(storageKey) ?? "");
-  const [artifactsOpen, setArtifactsOpen] = useState(true);
-  const run = useQuery({ queryKey: ["run", runId], queryFn: () => api.run(runId), enabled: Boolean(runId), refetchInterval: (query) => query.state.data?.status === "running" ? 2_000 : false, retry: false });
-  const start = useMutation({ mutationFn: ({ workflowId, target }: { workflowId: WorkflowId; target?: string }) => api.startRun(id, workflowId, target), onSuccess: (value) => { setRunId(value.runId); localStorage.setItem(storageKey, value.runId); } });
-  const range = useMutation({ mutationFn: ({ start, end, autoApproveMilestones }: { start: number; end: number; autoApproveMilestones: boolean }) => api.autoDirector(id, start, end, autoApproveMilestones), onSuccess: async (value) => { setRunId(value.runId); localStorage.setItem(storageKey, value.runId); await queryClient.invalidateQueries({ queryKey: ["novel", id] }); } });
-  const volume = useMutation({ mutationFn: (plan: { number: number; startChapter: number; endChapter: number; final: boolean }) => api.configureVolume(id, plan), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["novel", id] }); } });
-  const exportRun = useMutation({ mutationFn: () => api.exportNovel(id), onSuccess: (value) => { setRunId(value.runId); localStorage.setItem(storageKey, value.runId); } });
+  const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("production");
+  const [selectedArtifact, setSelectedArtifact] = useState("");
+  const [selectedAsset, setSelectedAsset] = useState("");
+  const [openedFile, setOpenedFile] = useState("");
+  const [artifactEditing, setArtifactEditing] = useState(false);
+  const [fileEditing, setFileEditing] = useState(false);
+  const [conversationContext, setConversationContext] = useState<ConversationContextTarget>();
+  const [revisionMode, setRevisionMode] = useState<ConversationRevisionMode | undefined>();
+  const [agentOpeningProposal, setAgentOpeningProposal] = useState<OpeningPresetProposal | undefined>();
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(() => { try { return !window.matchMedia("(max-width: 760px)").matches && window.localStorage.getItem("ani-novel-agent-sidebar") !== "closed"; } catch { return true; } });
+  const workflowStream = useStreamWorkflow({ debugMode: false, onError: () => undefined });
+  const observedRunRef = useRef("");
+  const refreshWorkspace = async () => { await queryClient.invalidateQueries({ queryKey: ["workspace", id] }); };
+  const start = useMutation({ mutationFn: ({ workflowId, target }: { workflowId: WorkflowId; target?: string }) => api.startRun(id, workflowId, target), onSuccess: refreshWorkspace });
+  const range = useMutation({ mutationFn: ({ start, end, autoApproveMilestones }: { start: number; end: number; autoApproveMilestones: boolean }) => api.autoDirector(id, start, end, autoApproveMilestones), onSuccess: refreshWorkspace });
+  const volume = useMutation({ mutationFn: (plan: { number: number; startChapter: number; endChapter: number; final: boolean }) => api.configureVolume(id, plan), onSuccess: refreshWorkspace });
+  const exportRun = useMutation({ mutationFn: () => api.exportNovel(id), onSuccess: refreshWorkspace });
   const openingProposal = useMutation({ mutationFn: () => api.proposePreset(id) });
 
-  useEffect(() => { openingProposal.reset(); }, [id]);
-
+  useEffect(() => { openingProposal.reset(); setAgentOpeningProposal(undefined); setWorkspaceSection("production"); setSelectedArtifact(""); setSelectedAsset(""); setOpenedFile(""); setArtifactEditing(false); setFileEditing(false); setConversationContext(undefined); setRevisionMode(undefined); setNavigationOpen(false); }, [id]);
   useEffect(() => {
-    const authoritativeRunId = novel.data?.novel.activeRunId;
-    if (authoritativeRunId && authoritativeRunId !== runId) { setRunId(authoritativeRunId); localStorage.setItem(storageKey, authoritativeRunId); }
-  }, [novel.data?.novel.activeRunId, runId, storageKey]);
-
+    const mobile = window.matchMedia("(max-width: 760px)");
+    const closeDrawer = (event: MediaQueryListEvent | MediaQueryList) => { if (event.matches) setAgentOpen(false); };
+    closeDrawer(mobile); mobile.addEventListener("change", closeDrawer);
+    return () => mobile.removeEventListener("change", closeDrawer);
+  }, []);
+  useEffect(() => { try { if (!window.matchMedia("(max-width: 760px)").matches) window.localStorage.setItem("ani-novel-agent-sidebar", agentOpen ? "open" : "closed"); } catch { /* current session still works */ } }, [agentOpen]);
   useEffect(() => {
-    if (!runId) return;
-    const events = new EventSource(`/workbench-api/runs/${runId}/events`);
-    const refresh = () => { void queryClient.invalidateQueries({ queryKey: ["run", runId] }); void queryClient.invalidateQueries({ queryKey: ["novel", id] }); };
-    ["artifact.proposed", "approval.required", "artifact.committed", "run.failed", "run.completed"].forEach((name) => events.addEventListener(name, refresh));
-    return () => events.close();
-  }, [id, queryClient, runId]);
+    const focus = workspace.data?.focus;
+    if (workspaceSection !== "production") return;
+    if (focus?.kind === "generation" || focus?.kind === "review" || focus?.kind === "blocked") { setSelectedArtifact(""); setArtifactEditing(false); }
+    else if (focus?.kind === "artifact") { setSelectedArtifact(focus.artifactKey); setArtifactEditing(false); }
+  }, [workspace.data?.focus, workspaceSection]);
+  useEffect(() => { if (workspace.data?.focus.kind !== "review") setRevisionMode(undefined); }, [workspace.data?.focus.kind]);
+  useEffect(() => {
+    const run = workspace.data?.run;
+    const key = run?.status === "running" && run.workflowId ? `${run.workflowId}:${run.runId}` : "";
+    if (!key) {
+      if (observedRunRef.current) workflowStream.closeStreamsAndReset();
+      observedRunRef.current = "";
+      return;
+    }
+    if (observedRunRef.current === key) return;
+    workflowStream.closeStreamsAndReset();
+    observedRunRef.current = key;
+    void workflowStream.observeWorkflowStream.mutateAsync({ workflowId: run!.workflowId!, runId: run!.runId, storeRunResult: null }).then(refreshWorkspace).catch(() => undefined);
+  }, [workspace.data?.run?.runId, workspace.data?.run?.status, workspace.data?.run?.workflowId]);
+  useEffect(() => {
+    if (!observedRunRef.current) return;
+    const timer = window.setTimeout(() => { void refreshWorkspace(); }, 350);
+    return () => window.clearTimeout(timer);
+  }, [workflowStream.streamResult]);
+  useEffect(() => () => workflowStream.closeStreamsAndReset(), []);
 
-  const resetRun = () => { setRunId(""); localStorage.removeItem(storageKey); };
-  const refresh = async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["run", runId] }), queryClient.invalidateQueries({ queryKey: ["novel", id] })]); };
-  const saveChoices = async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["novel", id] }), queryClient.invalidateQueries({ queryKey: ["chat", id] }), queryClient.invalidateQueries({ queryKey: ["bootstrap"] })]); };
-  const cancel = async () => { if (runId) { await api.review(runId, { action: "cancel" }); resetRun(); } };
-  const retryFailedRun = (failed: RunView) => {
-    if (!failed.workflowId || failed.workflowId === "auto-director" || failed.workflowId === "chapter-range") { resetRun(); return; }
-    start.mutate({ workflowId: failed.workflowId, target: failed.target });
+  const activeOpeningProposal = openingProposal.data ?? agentOpeningProposal;
+  const resetOpeningProposal = useCallback(() => { openingProposal.reset(); setAgentOpeningProposal(undefined); }, [openingProposal]);
+  const saveChoices = async () => { resetOpeningProposal(); await Promise.all([refreshWorkspace(), queryClient.invalidateQueries({ queryKey: ["chat", id] }), queryClient.invalidateQueries({ queryKey: ["bootstrap"] })]); };
+  const cancel = async () => { const runId = workspace.data?.run?.runId; if (runId) { await api.review(runId, { action: "cancel" }); await refreshWorkspace(); } };
+  const retryRun = () => {
+    const projection = workspace.data;
+    const workflowId = projection?.run?.workflowId;
+    if (workflowId && workflowId !== "auto-director" && workflowId !== "chapter-range") {
+      const next = projection.nextAction;
+      const target = "artifactKey" in next && next.artifactKey.startsWith("chapter:") ? next.artifactKey.split(":")[1] : undefined;
+      start.mutate({ workflowId, target });
+      return;
+    }
+    const next = projection?.nextAction;
+    if (next?.type === "produce_artifact" || next?.type === "refresh_artifact") {
+      if (next.workflowId) start.mutate({ workflowId: next.workflowId, target: next.artifactKey.startsWith("chapter:") ? next.artifactKey.split(":")[1] : undefined });
+    } else if (next?.type === "approve_chapter_range") range.mutate({ start: next.chapter, end: next.chapter, autoApproveMilestones: false });
+    else if (next?.type === "completion_blocked") start.mutate({ workflowId: next.workflowId });
   };
-  const currentRun = run.data;
-  const flow = (sendMessage: (text: string) => Promise<void>, isRunning: boolean, messageCount: number) => !novel.data?.novel.openingChoices
-    ? openingProposal.data ? <PresetProposalCard novelId={id} proposal={openingProposal.data} onSaved={saveChoices} onReset={() => openingProposal.reset()} /> : messageCount === 0 ? <DiscoveryCard isRunning={isRunning} onSend={sendMessage} /> : null
-    : currentRun?.status === "awaiting_review" && currentRun.proposal ? <BriefProposal key={`${runId}-${currentRun.proposal.openingHook}`} run={currentRun} onUpdated={refresh} onCanceled={resetRun} />
-      : currentRun?.status === "awaiting_review" && currentRun.artifactProposal ? <ArtifactProposalCard key={`${runId}-${currentRun.artifactProposal.content.length}`} run={currentRun} onUpdated={refresh} onCanceled={resetRun} />
-          : currentRun?.status === "running" ? <GenerationProgress label={currentRun.workflowId ? workflowLabels[currentRun.workflowId] : undefined} onCancel={cancel} />
-            : currentRun?.status === "committed" && currentRun.workflowId === "novel-export" ? <ExportComplete novelId={id} run={currentRun} />
-          : currentRun?.status === "failed" || currentRun?.status === "canceled" ? <RecoveryCard error={currentRun.error?.message} pending={start.isPending} onRetry={() => retryFailedRun(currentRun)} />
-          : novel.data?.nextAction ? <NextStepCard next={novel.data.nextAction} pending={start.isPending || range.isPending || volume.isPending} onStart={(workflowId, target) => start.mutate({ workflowId, target })} onRange={(startChapter, endChapter, autoApproveMilestones) => range.mutate({ start: startChapter, end: endChapter, autoApproveMilestones })} onVolume={(plan) => volume.mutate(plan)} /> : null;
+  const projection = workspace.data;
+  const reviewRun: RunView | undefined = projection?.review && projection.run ? (() => {
+    const structured = novelBriefSchema.safeParse(projection.review!.proposal.metadata.structured);
+    return { ...projection.run!, novelId: id, executionStatus: "suspended", artifactProposal: projection.review!.proposal, ...(structured.success ? { proposal: structured.data } : {}) };
+  })() : undefined;
+  const requestRevision = (proposal?: ArtifactProposal) => {
+    if (!reviewRun) return;
+    setRevisionMode({ label: projection?.review?.artifactKey === "novel-brief" ? "小说简报" : (projection?.focus.title ?? "当前工件"), onSubmit: async (feedback) => { await api.review(reviewRun.runId, { action: "revise", feedback, ...(proposal ? { proposal } : {}) }); setRevisionMode(undefined); await refreshWorkspace(); }, onExit: () => setRevisionMode(undefined) });
+    setAgentOpen(true);
+  };
+  const contextLabel = projection?.focus.kind === "review" ? (projection.review?.artifactKey === "novel-brief" ? "小说简报提案" : projection.focus.title) : conversationContext?.label ?? (selectedArtifact || (workspaceSection === "assets" ? "作品资产" : workspaceSection === "files" ? "文件管理" : workspaceSection === "capabilities" ? "创作能力" : workspaceSection === "observability" ? "运行统计" : projection?.focus.title));
+  const currentArtifactKey = conversationContext?.kind === "artifact" ? conversationContext.value : selectedArtifact || projection?.review?.artifactKey;
+  const currentFilePath = conversationContext?.kind === "file" ? conversationContext.value : undefined;
+  const openArtifact = (key: string, startEditing = false) => { setSelectedArtifact(key); setArtifactEditing(startEditing); setOpenedFile(""); setFileEditing(false); };
+  const openFile = (path: string, startEditing = false) => { setOpenedFile(path); setFileEditing(startEditing); setSelectedArtifact(""); setArtifactEditing(false); };
+  const conversation = chat.data ? <Conversation novelId={id} initialMessages={chat.data.messages} revisionMode={revisionMode} contextLabel={contextLabel} currentArtifactKey={currentArtifactKey} currentFilePath={currentFilePath} onOpeningPresetReady={setAgentOpeningProposal} onConversationChange={() => Promise.all([refreshWorkspace(), queryClient.invalidateQueries({ queryKey: ["chat", id] })]).then(() => undefined)} discoveryAction={projection?.phase === "discovery" && !activeOpeningProposal ? { pending: openingProposal.isPending, error: openingProposal.error, onConfirm: () => openingProposal.mutate() } : undefined} emptyState={({ sendMessage, isRunning }) => <DiscoveryCard isRunning={isRunning} onSend={sendMessage} />} /> : <div className="workspace-loading"><LoaderCircle className="spin" />正在恢复创作对话…</div>;
+  const busy = start.isPending || range.isPending || volume.isPending || exportRun.isPending;
+  const productionContent = !projection ? <div className="workspace-loading"><LoaderCircle className="spin" />正在恢复作品工作台…</div>
+    : activeOpeningProposal ? <PresetProposalCard novelId={id} proposal={activeOpeningProposal} onSaved={saveChoices} onReset={resetOpeningProposal} />
+    : projection.focus.kind === "conversation" ? <section className="flow-card action-card conversation-handoff"><div className="card-speaker"><Sparkles size={16} />灵感发现</div><h2>先把想法说完整</h2><p>所有对话和快捷选择都在右侧。你可以随时补充设定，准备好后再整理成开书方案。</p><button type="button" className="secondary-button" onClick={() => setAgentOpen(true)}><MessageCircle size={16} />打开右侧对话</button></section>
+    : projection.focus.kind === "review" && reviewRun?.proposal ? <BriefProposal key={`${reviewRun.runId}-${reviewRun.proposal.openingHook}`} run={reviewRun} onUpdated={refreshWorkspace} onCanceled={refreshWorkspace} onRequestRevision={() => requestRevision()} />
+    : projection.focus.kind === "review" && reviewRun?.artifactProposal ? <ArtifactProposalCard key={`${reviewRun.runId}-${reviewRun.artifactProposal.content.length}`} run={reviewRun} onUpdated={refreshWorkspace} onCanceled={refreshWorkspace} onRequestRevision={requestRevision} />
+    : projection.focus.kind === "generation" && projection.run ? <GenerationProgress run={projection.run} label={projection.run.workflowId ? workflowLabels[projection.run.workflowId] : undefined} onCancel={cancel} />
+    : projection.focus.kind === "blocked" ? <RecoveryCard error={projection.focus.message} pending={start.isPending} onRetry={retryRun} />
+    : selectedArtifact ? <ArtifactReviewWorkspace novelId={id} artifactKey={selectedArtifact} startEditing={artifactEditing} onSaved={refreshWorkspace} />
+    : <NextStepCard next={projection.nextAction} pending={busy} onStart={(workflowId, target) => workflowId === "novel-export" ? exportRun.mutate() : start.mutate({ workflowId, target })} onRange={(startChapter, endChapter, autoApproveMilestones) => range.mutate({ start: startChapter, end: endChapter, autoApproveMilestones })} onVolume={(plan) => volume.mutate(plan)} />;
+  const focusContent = workspaceSection === "assets"
+    ? selectedArtifact ? <ArtifactReviewWorkspace novelId={id} artifactKey={selectedArtifact} startEditing={artifactEditing} onSaved={async () => { await Promise.all([refreshWorkspace(), queryClient.invalidateQueries({ queryKey: ["assets", id] })]); }} /> : openedFile ? <NovelFileWorkspace novelId={id} path={openedFile} startEditing={fileEditing} onClose={() => { setOpenedFile(""); setFileEditing(false); }} onSaved={refreshWorkspace} /> : <AssetCenter novelId={id} selectedAsset={selectedAsset} onSelectAsset={setSelectedAsset} onOpenArtifact={openArtifact} onOpenFile={openFile} onUseAsContext={setConversationContext} />
+    : workspaceSection === "files" ? openedFile ? <NovelFileWorkspace novelId={id} path={openedFile} startEditing={fileEditing} onClose={() => { setOpenedFile(""); setFileEditing(false); }} onSaved={refreshWorkspace} /> : <NovelFileManager novelId={id} onOpenArtifact={openArtifact} onOpenFile={openFile} onUseAsContext={setConversationContext} />
+    : workspaceSection === "capabilities" ? <CapabilityCenter />
+      : workspaceSection === "observability" ? <ObservabilityCenter novelId={id} />
+      : productionContent;
+  const showAgent = Boolean(projection && (agentOpen || revisionMode));
+  const focusTitle = selectedArtifact || openedFile || (workspaceSection === "assets" ? "作品资产" : workspaceSection === "files" ? "文件管理" : workspaceSection === "capabilities" ? "创作能力" : workspaceSection === "observability" ? "运行统计" : projection?.focus.title) || "作品工作台";
+  const returnToTask = workspaceSection !== "production" || selectedArtifact ? () => { setWorkspaceSection("production"); setSelectedArtifact(""); } : undefined;
 
-  return <div className={artifactsOpen ? "novel-layout" : "novel-layout panel-closed"}><NovelSidebar currentId={id} onSettings={onSettings} onPrompts={onPrompts} theme={theme} onThemeChange={onThemeChange} /><main className="conversation-column"><header className="conversation-header"><Link to="/" className="mobile-menu" aria-label="返回书架"><Menu size={20} /></Link><div><small>当前作品</small><h1>{novel.data?.novel.title ?? "正在打开…"}</h1></div><div className="header-actions"><div className="mobile-theme-switcher"><ThemeSwitcher value={theme} onChange={onThemeChange} /></div><span className="agent-status"><i />Agent 已就绪</span>{!artifactsOpen && <button className="quiet-button" onClick={() => setArtifactsOpen(true)}>查看工件</button>}</div></header>{novel.data?.novel && novel.data.nextAction && <NovelProgressWorkbench novel={novel.data.novel} next={novel.data.nextAction} run={currentRun} />}
-    {novel.isLoading || chat.isLoading ? <div className="loading conversation-loading"><LoaderCircle className="spin" />正在恢复这部作品的对话…</div> : chat.data ? <Conversation novelId={id} initialMessages={chat.data.messages} discoveryAction={!novel.data?.novel.openingChoices && !openingProposal.data ? { pending: openingProposal.isPending, error: openingProposal.error, onConfirm: () => openingProposal.mutate() } : undefined}>{({ sendMessage, isRunning, messageCount }) => { const node = flow(sendMessage, isRunning, messageCount); const flowError = novel.error ?? run.error ?? start.error ?? range.error ?? volume.error ?? exportRun.error; return node || flowError ? <>{node}<ErrorNotice error={flowError} /></> : null; }}</Conversation> : <div className="loading conversation-loading"><ErrorNotice error={chat.error ?? novel.error} /></div>}
-  </main><ArtifactPanel novelId={id} artifacts={novel.data?.novel.artifacts ?? {}} open={artifactsOpen} onClose={() => setArtifactsOpen(false)} onExport={() => exportRun.mutate()} /></div>;
+  return <div className="novel-workbench-page"><header className="workbench-topbar"><Link to="/" className="brand"><span className="brand-mark"><Feather size={18} /></span><span>ANI 小说 Agent</span></Link><div className="workbench-title"><small>当前作品</small><h1>{projection?.novel.title ?? "正在打开…"}</h1></div><div className="workbench-global-actions"><ThemeSwitcher compact value={theme} onChange={onThemeChange} /><button className="quiet-button" onClick={onPrompts}><Pencil size={16} />提示词</button><button className="quiet-button" onClick={onSettings}><Settings2 size={16} />模型</button></div></header>
+    {projection ? <NovelWorkbench agentOpen={showAgent} navigation={<PlatformNavigator projection={projection} section={workspaceSection} selectedArtifact={selectedArtifact} onSelectSection={(section) => { setWorkspaceSection(section); setSelectedArtifact(""); setOpenedFile(""); setArtifactEditing(false); setFileEditing(false); }} onSelectArtifact={(key) => { setWorkspaceSection("production"); setSelectedArtifact(key); setOpenedFile(""); setArtifactEditing(false); setFileEditing(false); setNavigationOpen(false); }} mobileOpen={navigationOpen} onCloseMobile={() => setNavigationOpen(false)} />} main={<WorkspaceMain title={focusTitle} agentOpen={showAgent} onOpenNavigation={() => setNavigationOpen(true)} onToggleAgent={() => setAgentOpen((value) => !value)} onReturnToTask={returnToTask}>{focusContent}<ErrorNotice error={workspace.error ?? chat.error ?? start.error ?? range.error ?? volume.error ?? exportRun.error} /></WorkspaceMain>} agent={<AgentSidebar open={showAgent} onClose={() => { setAgentOpen(false); revisionMode?.onExit(); }} contextLabel={contextLabel} revisionMode={Boolean(revisionMode)} onExitRevision={() => revisionMode?.onExit()}>{conversation}</AgentSidebar>} dock={<RunDock run={projection.run} pending={start.isPending} onCancel={cancel} onRecover={retryRun} />} /> : focusContent}
+  </div>;
 }
 
 export function App() {

@@ -1,10 +1,14 @@
 export const THEMES = [
-  { id: "warm-paper", label: "书卷暖色", description: "保留当前的米白与琥珀色创作氛围。" },
-  { id: "minimal-white", label: "纯白简约", description: "纯白画布、克制边框和更安静的阅读界面。" },
+  { id: "daylight", label: "白天", description: "明亮、温和，适合白天长时间创作。" },
+  { id: "night", label: "夜晚", description: "降低亮度与对比度，适合夜间阅读和写作。" },
+  { id: "system", label: "跟随系统", description: "根据操作系统的浅色或深色模式自动切换。" },
+  // Keep the original IDs valid so existing local preferences continue to work.
+  { id: "warm-paper", label: "书卷暖色", description: "兼容的暖色创作主题。" },
+  { id: "minimal-white", label: "专业黑白", description: "兼容的黑白编辑主题。" },
 ] as const;
 
 export type ThemeId = (typeof THEMES)[number]["id"];
-export const DEFAULT_THEME: ThemeId = "warm-paper";
+export const DEFAULT_THEME: ThemeId = "daylight";
 const STORAGE_KEY = "ani-novel-theme";
 
 export function isThemeId(value: string | null): value is ThemeId {

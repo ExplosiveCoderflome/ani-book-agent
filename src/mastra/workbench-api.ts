@@ -5,9 +5,9 @@ import {
   bootstrap,
   capabilities,
   chatSession,
-  chatStream,
   novelRepository,
   novelWorkspace,
+  novelWorkspaceProjection,
   providers,
   proposeOpeningPreset,
   reviewRun,
@@ -19,7 +19,6 @@ import {
   startWorkflowRun,
   testModelConnection,
 } from "../application/workbench-service";
-import { runEvents } from "../application/run-events";
 import {
   createNovelInputSchema,
   chapterRangeInputSchema,
@@ -32,8 +31,10 @@ import {
   modelSettingsInputSchema,
   openingChoicesInputSchema,
   startRunInputSchema,
+  workspaceFileEditInputSchema,
 } from "../shared/contracts";
 import { modelSettings } from "../infrastructure/model-settings";
+import { readObservabilityStats } from "../application/observability-stats";
 import { mastraStorage } from "./runtime-storage";
 import { listPromptBlocks, promptBlock, previewPromptDraft, publishPromptDraft, restorePromptDefault, savePromptDraft } from "./prompts/prompt-blocks";
 
@@ -71,6 +72,7 @@ export const workbenchApiRoutes = [
   route("/workbench-api/bootstrap", "GET", async (c) => c.json(await bootstrap())),
   route("/workbench-api/capabilities", "GET", async (c) => c.json(await capabilities())),
   route("/workbench-api/observability/prune", "POST", async (c) => c.json({ results: await mastraStorage.prune({ maxBatches: 20, maxRows: 20_000 }) })),
+  route("/workbench-api/observability/stats", "GET", async (c) => c.json(await readObservabilityStats(c.req.query("novelId") || undefined))),
   route("/workbench-api/providers", "GET", async (c) => c.json({ providers: await providers() })),
   route("/workbench-api/model-settings", "PUT", async (c) => {
     const body = modelSettingsInputSchema.parse(await input(c, modelSettingsInputSchema));
@@ -91,11 +93,8 @@ export const workbenchApiRoutes = [
     return c.json(await novelRepository.create(body.title, body.approvalMode), 201);
   }),
   route("/workbench-api/novels/:id", "GET", async (c) => c.json(await novelWorkspace(c.req.param("id")))),
+  route("/workbench-api/novels/:id/workspace", "GET", async (c) => c.json(await novelWorkspaceProjection(c.req.param("id")))),
   route("/workbench-api/novels/:id/chat", "GET", async (c) => c.json(await chatSession(c.req.param("id")))),
-  route("/workbench-api/novels/:id/chat", "POST", async (c) => {
-    const body = z.object({ message: z.string().trim().min(1).max(20_000) }).parse(await c.req.json());
-    return new Response(await chatStream(c.req.param("id"), body.message, c.req.raw.signal), { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" } });
-  }),
   route("/workbench-api/novels/:id/opening-preset/propose", "POST", async (c) => c.json(await proposeOpeningPreset(c.req.param("id")))),
   route("/workbench-api/novels/:id/opening-choices", "PUT", async (c) => {
     const body = openingChoicesInputSchema.parse(await input(c, openingChoicesInputSchema));
@@ -123,6 +122,13 @@ export const workbenchApiRoutes = [
     return c.json(await novelRepository.editCommittedBrief(c.req.param("id"), body.brief, body.expectedSha256));
   }),
   route("/workbench-api/novels/:id/artifacts", "GET", async (c) => c.json({ artifacts: await novelRepository.listArtifacts(c.req.param("id")) })),
+  route("/workbench-api/novels/:id/assets", "GET", async (c) => c.json({ assets: await novelRepository.listAssets(c.req.param("id")) })),
+  route("/workbench-api/novels/:id/files", "GET", async (c) => c.json({ files: await novelRepository.listNovelFiles(c.req.param("id")) })),
+  route("/workbench-api/novels/:id/files/content", "GET", async (c) => c.json(await novelRepository.readNovelFile(c.req.param("id"), c.req.query("path") ?? ""))),
+  route("/workbench-api/novels/:id/workspace-files", "PUT", async (c) => {
+    const body = workspaceFileEditInputSchema.parse(await input(c, workspaceFileEditInputSchema));
+    return c.json(await novelRepository.writeWorkspaceFile(c.req.param("id"), body.path, body.content, body.expectedSha256));
+  }),
   route("/workbench-api/novels/:id/artifacts/:key", "GET", async (c) => c.json(await novelRepository.readArtifact(c.req.param("id"), decodeURIComponent(c.req.param("key"))))),
   route("/workbench-api/novels/:id/artifacts/:key", "PUT", async (c) => {
     const body = editArtifactInputSchema.parse(await input(c, editArtifactInputSchema));
@@ -137,10 +143,6 @@ export const workbenchApiRoutes = [
     return new Response(result.content, { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(result.fileName)}` } });
   }),
   route("/workbench-api/runs/:runId", "GET", async (c) => c.json(await runView(c.req.param("runId")))),
-  route("/workbench-api/runs/:runId/events", "GET", async (c) => new Response(
-    runEvents.stream(c.req.param("runId"), c.req.raw.signal),
-    { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } },
-  )),
   route("/workbench-api/runs/:runId/review", "POST", async (c) => {
     const body = genericReviewRunInputSchema.parse(await input(c, genericReviewRunInputSchema));
     return c.json(await reviewRun(c.req.param("runId"), body), 202);

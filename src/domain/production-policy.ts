@@ -1,4 +1,4 @@
-import { artifactKey, bookStages, chapterStages, completionAuditBlockers, completionAuditKey, completionAuditReportBlockers, stageWorkflow, volumeHandoffKey, volumeOutlineKey, type NextAction, type NovelState } from "./novel-state";
+import { artifactKey, bookStages, chapterStages, completionAuditBlockers, completionAuditKey, completionAuditReportBlockers, isMultiVolumeProduction, stageWorkflow, volumeHandoffKey, volumeOutlineKey, type NextAction, type NovelState } from "./novel-state";
 
 export function decideNextAction(state: NovelState): NextAction {
   if (state.productionStatus === "completed") return { type: "complete_novel", volume: state.currentVolume, chapter: Math.max(1, state.continuity?.lastCommittedChapter ?? 1), reason: "整部小说已完成，可以导出稳定章节。" };
@@ -13,7 +13,7 @@ export function decideNextAction(state: NovelState): NextAction {
   if (!state.openingChoices) return { type: "collect_opening_choices", reason: "先通过对话确认开书方向，或把选择交给 AI。" };
 
   // schema v1 remains readable through the original fixed volume outline chain.
-  const stableBookStages = state.schemaVersion === 1 ? bookStages : bookStages.filter((stage) => stage !== "volume_outline");
+  const stableBookStages = isMultiVolumeProduction(state) ? bookStages.filter((stage) => stage !== "volume_outline") : bookStages;
   for (const stage of stableBookStages) {
     const key = artifactKey(stage);
     const artifact = state.artifacts[key];
@@ -25,7 +25,7 @@ export function decideNextAction(state: NovelState): NextAction {
     }
   }
 
-  if (state.schemaVersion === 1) return legacyChapterAction(state);
+  if (!isMultiVolumeProduction(state)) return legacyChapterAction(state);
 
   const lastChapter = state.continuity?.lastCommittedChapter ?? 0;
   if (lastChapter > 0) {
