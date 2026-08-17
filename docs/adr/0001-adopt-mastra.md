@@ -18,12 +18,11 @@ Mastra 负责：
 
 Domain Core 继续负责：
 
-- 小说生产合法状态转换；
-- 唯一下一步；
+- 合法操作集合与阻断原因；
 - 作者授权与保护；
-- 下游 stale 传播；
+- 文件哈希、补丁幂等与输入过期；
 - 章节串行提交；
-- 创作工件的权威边界。
+- Markdown/YAML 权威边界。
 
 ## 原因
 
@@ -35,10 +34,10 @@ Domain Core 继续负责：
 - 不保留与 Mastra 重复的 Run/Step store。
 - 不把 Mastra Memory 当成小说事实库。
 - 不把 Workflow snapshot 当成小说进度权威。
-- 不允许 Agent 或 Tool 绕过 Domain Core 直接提交工件。
+- 不允许 Agent 绕过补丁合同直接提交权威文件。
 
 ## 后果
 
 - 运行层对 Mastra 有明确依赖；领域层保持框架无关。
 - 旧的阶段一源码、测试、构建物和运行数据库被清除。
-- 后续先完成一条端到端工作流，再扩展多 Agent、Memory、MCP 和评估。
+- 产品内只保留一个章节生产 Workflow；Studio 仍可用于开发调试。

@@ -5,6 +5,7 @@ export class AppError extends Error {
     public readonly status = 400,
     public readonly recoverable = true,
     public readonly fieldErrors?: Record<string, string[]>,
+    public readonly nextAction?: "retry" | "reread" | "author_approval" | "replan",
   ) {
     super(message);
   }
@@ -19,6 +20,7 @@ export function errorBody(error: unknown) {
           code: error.code,
           message: error.message,
           recoverable: error.recoverable,
+          ...(error.nextAction ? { nextAction: error.nextAction } : {}),
           ...(error.fieldErrors ? { fieldErrors: error.fieldErrors } : {}),
         },
       },

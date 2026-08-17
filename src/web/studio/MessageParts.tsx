@@ -1,189 +1,69 @@
 import type { MastraDBMessage } from "@mastra/core/agent";
 import { MessageFactory } from "@mastra/react/ui";
-import type { DataPart, DynamicToolPart, FilePart, MessageRenderers, MessageStatusRenderers, ReasoningPart, SourceDocumentPart, SourceUrlPart, TextPart, ToolInvocationPart } from "@mastra/react/ui";
+import type { DynamicToolPart, MessageRenderers, TextPart, ToolInvocationPart } from "@mastra/react/ui";
+import { Check, ChevronDown, CircleAlert, LoaderCircle, Wrench } from "lucide-react";
 import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Check, ChevronDown, CircleAlert, FileText, Link2, LoaderCircle, ShieldCheck, TriangleAlert, Wrench, X } from "lucide-react";
-import { chatChoicesSchema, openingPresetProposalSchema, type OpeningPresetProposal } from "../../shared/contracts";
+import { patchProposalSchema, presentChoicesSchema, type PatchProposal } from "../../shared/contracts";
 
-export type ToolActions = {
-  approve: (toolCallId: string, resumeData?: unknown) => Promise<void>;
-  decline: (toolCallId: string) => Promise<void>;
-  approvals: Record<string, { status: "approved" | "declined" }>;
-};
+export type AgentActivity = { title: string; detail: string };
+type ChoiceHandler = (message: string, activity?: AgentActivity) => void;
 
-const toolLabels: Record<string, string> = {
-  get_novel_status: "读取作品状态",
-  list_novel_artifacts: "列出小说工件",
-  read_novel_artifact: "读取小说工件",
-  search_novel_artifacts: "检索小说工件",
-  read_workspace_file: "读取工作文件",
-  write_workspace_file: "写入工作文件",
-  get_chapter_context: "读取章节上下文",
-  inspect_continuity: "检查连续性",
-  list_workflow_capabilities: "读取生产能力",
-  prepare_opening_preset: "整理开书预设",
-  prepareOpeningPresetTool: "整理开书预设",
-  start_current_next_action: "启动当前步骤",
-  present_chat_choices: "提供快捷选择",
-};
-
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const field = (value: unknown, key: string) => isRecord(value) ? value[key] : undefined;
-
-const stringify = (value: unknown) => {
-  if (value === undefined) return "";
-  if (typeof value === "string") return value;
-  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
-};
-
-function TextPartView({ part }: { part: TextPart }) {
-  return <div className="studio-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{part.text}</ReactMarkdown></div>;
-}
-
-function ReasoningPartView({ part, streamActive }: { part: ReasoningPart; streamActive: boolean }) {
-  const value = "text" in part && typeof part.text === "string" ? part.text : "reasoning" in part && typeof part.reasoning === "string" ? part.reasoning : "";
-  const streaming = streamActive && (!('state' in part) || part.state === "streaming");
-  if (!value && streaming) return <div className="studio-reasoning-pending"><LoaderCircle className="spin" size={14} />正在生成</div>;
-  if (!value) return null;
-  return <details className="studio-reasoning" open={streaming}><summary><span>生成过程</span><ChevronDown size={14} /></summary><div>{value}</div></details>;
-}
-
-function FilePartView({ part }: { part: FilePart }) {
-  const filename = "filename" in part && typeof part.filename === "string" ? part.filename : "附件";
-  const mediaType = "mediaType" in part && typeof part.mediaType === "string" ? part.mediaType : undefined;
-  return <div className="studio-file-part"><FileText size={15} /><span>{filename}</span>{mediaType && <small>{mediaType}</small>}</div>;
-}
-
-type ToolMetadata = { pending: boolean; suspendPayload?: unknown };
-
-export type ToolLifecycle = "running" | "finished" | "awaiting" | "interrupted" | "failed";
-export function resolveToolLifecycle({ state, output, errorText, awaitingApproval, streamActive }: { state?: string; output?: unknown; errorText?: string; awaitingApproval: boolean; streamActive: boolean }): ToolLifecycle {
-  if (state === "output-error" || Boolean(errorText)) return "failed";
-  if (state === "result" || state === "output-available" || state === "output-denied" || output !== undefined) return "finished";
-  if (awaitingApproval) return "awaiting";
-  return streamActive ? "running" : "interrupted";
-}
-
-function toolMetadata(message: MastraDBMessage, toolName: string, toolCallId: string): ToolMetadata {
-  const metadata = message.content.metadata;
-  for (const key of ["requireApprovalMetadata", "pendingToolApprovals", "suspendedTools"] as const) {
-    const source = field(metadata, key);
-    const entry = field(source, toolCallId) ?? field(source, toolName);
-    if (entry !== undefined) return { pending: true, suspendPayload: field(entry, "suspendPayload") };
+const labels: Record<string, string> = { read_project: "读取作品", search_project: "搜索作品", read_skill: "加载创作方法", present_choices: "展示创作方向", propose_patch: "提交作品提案", start_job: "启动生产任务" };
+const record = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const text = (value: unknown) => { if (typeof value === "string") return value; try { return JSON.stringify(value, null, 2); } catch { return "工具返回了无法显示的结果。"; } };
+export const errorText = (value: unknown): string => {
+  if (typeof value === "string") {
+    const message = value.trim();
+    if (!message || message === "[object Object]") return "工具执行失败，请重试。";
+    if (message.length > 500 || message.includes("APICallError") || message.includes("requestBodyValues") || message.includes("responseHeaders")) return "模型服务调用失败，请重试；若持续失败，请检查模型设置。";
+    return message;
   }
-  return { pending: false };
-}
-
-function ToolCard({ toolName, toolCallId, input, output, errorText, state, actions, metadata, streamActive }: { toolName: string; toolCallId: string; input: unknown; output: unknown; errorText?: string; state?: string; actions: ToolActions; metadata: ToolMetadata; streamActive: boolean }) {
-  const failed = state === "output-error" || Boolean(errorText);
-  const approval = actions.approvals[toolCallId];
-  const lifecycle = resolveToolLifecycle({ state, output, errorText, awaitingApproval: !approval && (metadata.pending || state === "approval-requested"), streamActive });
-  const finished = lifecycle === "finished";
-  const awaiting = lifecycle === "awaiting";
-  const interrupted = lifecycle === "interrupted";
-  const label = toolLabels[toolName] ?? toolName;
-  return <details className={`studio-tool-card ${failed ? "failed" : interrupted ? "interrupted" : finished ? "finished" : "running"}`} open={!finished && !interrupted || awaiting || failed}>
-    <summary><span className="studio-tool-icon"><Wrench size={14} /></span><span><strong>{label}</strong>{label !== toolName && <small>{toolName}</small>}</span><span className="studio-tool-state">{approval ? approval.status === "approved" ? "已批准" : "已拒绝" : failed ? "失败" : finished ? "完成" : awaiting ? "等待确认" : interrupted ? "未完成" : "执行中"}</span><ChevronDown size={14} /></summary>
-    <div className="studio-tool-body">
-      {input !== undefined && <section><h4>工具参数</h4><pre>{stringify(input)}</pre></section>}
-      {metadata.suspendPayload !== undefined && <section><h4>暂停数据</h4><pre>{stringify(metadata.suspendPayload)}</pre></section>}
-      {output !== undefined && <section><h4>工具结果</h4><pre>{stringify(output)}</pre></section>}
-      {errorText && <div className="studio-tool-error"><CircleAlert size={15} />{errorText}</div>}
-      {interrupted && <div className="studio-tool-interrupted"><CircleAlert size={15} /><span>本次运行在工具返回结果前结束，没有写入权威内容。可以重新发送或继续当前任务。</span></div>}
-      {awaiting && <div className="studio-tool-approval"><ShieldCheck size={16} /><span>该工具请求需要你的确认</span><div><button type="button" className="primary-button compact" onClick={() => void actions.approve(toolCallId)}><Check size={14} />批准</button><button type="button" className="quiet-button compact" onClick={() => void actions.decline(toolCallId)}><X size={14} />拒绝</button></div></div>}
-    </div>
-  </details>;
-}
-
-function ToolInvocationView({ part, actions, message, streamActive }: { part: ToolInvocationPart; actions: ToolActions; message: MastraDBMessage; streamActive: boolean }) {
-  const invocation = part.toolInvocation;
-  return <ToolCard toolName={invocation.toolName} toolCallId={invocation.toolCallId} input={invocation.args} output={invocation.result} errorText={invocation.errorText} state={invocation.state} actions={actions} metadata={toolMetadata(message, invocation.toolName, invocation.toolCallId)} streamActive={streamActive} />;
-}
-
-function ChoiceList({ choices, onChoice }: { choices: Array<{ label: string; description: string; message: string }>; onChoice: (message: string) => void }) {
-  return <div className="studio-choice-list">{choices.map((choice) => <button type="button" key={choice.message} onClick={() => onChoice(choice.message)}><strong>{choice.label}</strong><small>{choice.description}</small></button>)}</div>;
-}
-
-function DynamicToolView({ part, actions, message, onChoice, streamActive }: { part: DynamicToolPart; actions: ToolActions; message: MastraDBMessage; onChoice: (message: string) => void; streamActive: boolean }) {
-  const toolName = part.toolName ?? part.type.replace(/^tool-/, "");
-  const toolCallId = part.toolCallId ?? `${part.type}-unknown`;
-  const errorText = part.state === "output-error" ? stringify(part.output) || "工具执行失败" : undefined;
-  const choices = toolName === "present_chat_choices" ? chatChoicesSchema.safeParse(part.output) : undefined;
-  return <>{choices?.success && choices.data.choices.length ? <ChoiceList choices={choices.data.choices} onChoice={onChoice} /> : null}<ToolCard toolName={toolName} toolCallId={toolCallId} input={part.input} output={part.output} errorText={errorText} state={part.state} actions={actions} metadata={toolMetadata(message, toolName, toolCallId)} streamActive={streamActive} /></>;
-}
-
-function DataPartView({ part, onChoice }: { part: DataPart; onChoice: (message: string) => void }) {
-  const data = "data" in part ? part.data : undefined;
-  if (data === undefined || data === null) return null;
-  if (isRecord(data) && typeof data.message === "string") return <div className="studio-data-status"><LoaderCircle className="spin" size={14} />{data.message}</div>;
-  if (part.type === "data-choices") {
-    const parsed = chatChoicesSchema.safeParse(data);
-    if (parsed.success && parsed.data.choices.length) return <div className="studio-choice-list">{parsed.data.choices.map((choice) => <button type="button" key={choice.message} onClick={() => onChoice(choice.message)}><strong>{choice.label}</strong><small>{choice.description}</small></button>)}</div>;
-  }
-  return <details className="studio-data-part"><summary>{part.type.replace(/^data-/, "")}</summary><pre>{stringify(data)}</pre></details>;
-}
-
-function SourceUrlView({ part }: { part: SourceUrlPart }) {
-  return <a className="studio-source-part" href={part.url} target="_blank" rel="noreferrer"><Link2 size={14} /><span>{part.title ?? part.url}</span></a>;
-}
-
-function SourceDocumentView({ part }: { part: SourceDocumentPart }) {
-  return <div className="studio-source-part"><FileText size={14} /><span>{part.title || part.filename || "参考资料"}</span><small>{part.mediaType}</small></div>;
-}
-
-const statusRenderers: MessageStatusRenderers = {
-  Error: ({ text }) => <div className="studio-status-message error"><CircleAlert size={16} /><div><strong>运行失败</strong><span>{text || "Agent 没有完成这次请求。"}</span></div></div>,
-  Warning: ({ text }) => <div className="studio-status-message warning"><TriangleAlert size={16} /><div><strong>需要注意</strong><span>{text}</span></div></div>,
-  Tripwire: ({ text }) => <div className="studio-status-message warning"><ShieldCheck size={16} /><div><strong>已停止输出</strong><span>{text}</span></div></div>,
-  Pending: ({ children }) => <div className="studio-message-pending">{children}</div>,
-  Task: ({ passed, text, suppressFeedback }) => suppressFeedback ? null : <div className={`studio-status-message ${passed ? "success" : "warning"}`}>{passed ? <Check size={16} /> : <TriangleAlert size={16} />}<span>{text || (passed ? "任务已完成" : "任务仍需继续")}</span></div>,
+  if (record(value)) { const nested = record(value.error) ? value.error : value; if (typeof nested.message === "string") return errorText(nested.message); }
+  return "工具执行失败，请重试。";
 };
 
-export function hasRenderableMessage(message: MastraDBMessage) {
-  const status = field(message.content.metadata, "status");
-  if (status === "error" || status === "warning" || status === "tripwire") return true;
-  return message.content.parts.some((part) => {
-    if (part.type === "text") return typeof part.text === "string" && part.text.trim().length > 0;
-    if (part.type === "reasoning") {
-      const value = "text" in part && typeof part.text === "string" ? part.text : "reasoning" in part && typeof part.reasoning === "string" ? part.reasoning : "";
-      return Boolean(value.trim() || ("state" in part && part.state === "streaming"));
-    }
-    if (part.type === "step-start") return false;
-    if (part.type.startsWith("data-")) return field(part, "data") != null;
-    return true;
-  });
+function TextView({ part }: { part: TextPart }) { return <div className="message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{part.text}</ReactMarkdown></div>; }
+function ChoiceList({ output, onChoice }: { output: unknown; onChoice: ChoiceHandler }) {
+  const parsed = presentChoicesSchema.safeParse(output);
+  if (!parsed.success) return null;
+  const activity = parsed.data.kind === "blueprint"
+    ? { title: "正在落实你选择的蓝图", detail: "Agent 会整理正式蓝图与连续性账本，完成后请你确认，尚不会自动开写。" }
+    : parsed.data.kind === "seed"
+      ? { title: "正在沿这个方向继续构思", detail: "Agent 会展开这个创作种子，并在需要你判断时给出下一组选项。" }
+      : { title: "正在落实你的选择", detail: "Agent 会结合已有讨论继续推进，结果会直接显示在这里。" };
+  return <div className={`choice-grid ${parsed.data.kind}`}>{parsed.data.choices.map((choice) => <button key={choice.id} onClick={() => onChoice(choice.message, activity)}><strong>{choice.label}</strong><span>{choice.description}</span>{choice.details && <dl>{Object.entries(choice.details).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>}</button>)}</div>;
 }
-
-export function messageForDisplay(message: MastraDBMessage): MastraDBMessage {
-  const signal = field(message.content.metadata, "signal");
-  return message.role === "signal" && field(signal, "type") === "user" ? { ...message, role: "user" } as MastraDBMessage : message;
+function ToolCard({ name, input, output, state, onChoice }: { name: string; input: unknown; output: unknown; state?: string; onChoice: ChoiceHandler }) {
+  const failed = state === "output-error" || record(output) && output.ok === false;
+  const running = !output && !failed && state !== "output-available" && state !== "result";
+  return <><ChoiceList output={output} onChoice={onChoice} /><details className={`tool-card ${failed ? "failed" : running ? "running" : "done"}`} open={failed || running}><summary><Wrench size={14} /><span><strong>{labels[name] ?? name}</strong><small>{name}</small></span><em>{failed ? "失败" : running ? "执行中" : "完成"}</em><ChevronDown size={14} /></summary><div>{input !== undefined && <pre>{text(input)}</pre>}{failed ? <p className="tool-error"><CircleAlert size={14} />{errorText(output)}</p> : output !== undefined && name !== "present_choices" ? <pre>{text(output)}</pre> : null}</div></details></>;
 }
+function ToolInvocation({ part, onChoice }: { part: ToolInvocationPart; onChoice: ChoiceHandler }) { const value = part.toolInvocation; return <ToolCard name={value.toolName} input={value.args} output={value.result ?? value.errorText} state={value.state} onChoice={onChoice} />; }
+function DynamicTool({ part, onChoice }: { part: DynamicToolPart; onChoice: ChoiceHandler }) { return <ToolCard name={part.toolName ?? part.type.replace(/^tool-/, "")} input={part.input} output={part.output} state={part.state} onChoice={onChoice} />; }
 
-export function openingPresetFromMessage(message: MastraDBMessage): OpeningPresetProposal | undefined {
+export function patchProposalFromMessage(message: MastraDBMessage): PatchProposal | undefined {
   for (const part of [...message.content.parts].reverse()) {
-    const invocation = part.type === "tool-invocation" ? part.toolInvocation : undefined;
-    if (invocation && (invocation.toolName === "prepare_opening_preset" || invocation.toolName === "prepareOpeningPresetTool")) {
-      const parsed = openingPresetProposalSchema.safeParse(invocation.result);
-      if (parsed.success) return parsed.data;
-    }
+    const output = part.type === "tool-invocation" ? part.toolInvocation.result : part.type.startsWith("tool-") && "output" in part ? part.output : undefined;
+    const candidate = record(output) && output.ok === true ? output.proposal : undefined;
+    const parsed = patchProposalSchema.safeParse(candidate);
+    if (parsed.success && parsed.data.status === "pending") return parsed.data;
   }
-  return undefined;
 }
+export function messageForDisplay(message: MastraDBMessage): MastraDBMessage { const signal = record(message.content.metadata?.signal) ? message.content.metadata?.signal : undefined; return message.role === "signal" && signal?.type === "user" ? { ...message, role: "user" } as MastraDBMessage : message; }
+export function hasRenderableMessage(message: MastraDBMessage) { return message.content.parts.some((part) => part.type === "text" ? Boolean(part.text.trim()) : part.type !== "step-start"); }
 
-export const messageText = (message: MastraDBMessage) => message.content.parts.filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
-
-export function StudioMessage({ message, actions, onChoice, streamActive = false }: { message: MastraDBMessage; actions: ToolActions; onChoice: (message: string) => void; streamActive?: boolean }) {
+export function StudioMessage({ message, onChoice }: { message: MastraDBMessage; onChoice: ChoiceHandler }) {
   const renderers = useMemo<MessageRenderers>(() => ({
-    Text: (part) => <TextPartView part={part} />,
-    Reasoning: (part) => <ReasoningPartView part={part} streamActive={streamActive} />,
-    File: (part) => <FilePartView part={part} />,
-    Data: (part) => <DataPartView part={part} onChoice={onChoice} />,
-    ToolInvocation: (part) => <ToolInvocationView part={part} actions={actions} message={message} streamActive={streamActive} />,
-    DynamicTool: (part) => <DynamicToolView part={part} actions={actions} message={message} onChoice={onChoice} streamActive={streamActive} />,
-    SourceUrl: (part) => <SourceUrlView part={part} />,
-    SourceDocument: (part) => <SourceDocumentView part={part} />,
-  }), [actions, message, onChoice, streamActive]);
-  return <MessageFactory message={message} {...renderers} status={statusRenderers} />;
+    Text: (part) => <TextView part={part} />,
+    Reasoning: (part) => <details className="reasoning"><summary><LoaderCircle size={13} />思考过程</summary><p>{text("text" in part ? part.text : "reasoning" in part ? part.reasoning : "")}</p></details>,
+    ToolInvocation: (part) => <ToolInvocation part={part} onChoice={onChoice} />,
+    DynamicTool: (part) => <DynamicTool part={part} onChoice={onChoice} />,
+    File: (part) => <div className="file-part">{text("filename" in part ? part.filename : "附件")}</div>,
+    Data: (part) => <pre>{text("data" in part ? part.data : part)}</pre>,
+    SourceUrl: (part) => <a href={part.url} target="_blank" rel="noreferrer">{part.title ?? part.url}</a>,
+    SourceDocument: (part) => <div>{part.title ?? part.filename ?? "参考资料"}</div>,
+  }), [onChoice]);
+  return <MessageFactory message={message} {...renderers} status={{ Error: ({ text: value }) => <div className="message-error"><CircleAlert />{errorText(value)}</div>, Warning: ({ text: value }) => <div className="message-warning">{text(value)}</div>, Pending: ({ children }) => <div><LoaderCircle className="spin" />{children}</div>, Task: ({ passed, text: value }) => <div>{passed && <Check size={14} />}{text(value)}</div>, Tripwire: ({ text: value }) => <div>{text(value)}</div> }} />;
 }

@@ -9,6 +9,9 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5175,
     strictPort: true,
+    watch: {
+      ignored: ["**/.codegraph/**", "**/.mastra/**", "**/.runtime/**"],
+    },
     proxy: {
       "/workbench-api": mastraTarget,
       "/api": mastraTarget,

@@ -11,6 +11,10 @@ interface StoredSettings {
   profiles?: Partial<Record<ModelProfileName, { providerId: string; modelId: string; parameters?: { temperature?: number; maxOutputTokens?: number; topP?: number } }>>;
 }
 
+interface LegacyStoredSettings extends Omit<StoredSettings, "profiles"> {
+  profiles?: Record<string, { providerId: string; modelId: string; parameters?: { temperature?: number; maxOutputTokens?: number; topP?: number } }>;
+}
+
 interface StoredSecrets {
   version: 1;
   providers: Record<string, string>;
@@ -62,8 +66,18 @@ export class ModelSettingsStore {
   }
 
   async selection(): Promise<StoredSettings | undefined> {
-    const value = await readJson<StoredSettings | undefined>(this.settingsPath, undefined);
-    return value?.providerId && value.modelId ? value : undefined;
+    const value = await readJson<LegacyStoredSettings | undefined>(this.settingsPath, undefined);
+    if (!value?.providerId || !value.modelId) return undefined;
+    const profiles = value.profiles ?? {};
+    return {
+      providerId: value.providerId,
+      modelId: value.modelId,
+      profiles: {
+        ...(profiles.chat ? { chat: profiles.chat } : {}),
+        ...(profiles.writer ?? profiles.drafting ? { writer: profiles.writer ?? profiles.drafting } : {}),
+        ...(profiles.critic ?? profiles.review ? { critic: profiles.critic ?? profiles.review } : {}),
+      },
+    };
   }
 
   async save(providerId: string, modelId: string, credentials: Record<string, string>) {

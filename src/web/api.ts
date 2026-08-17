@@ -1,86 +1,46 @@
-import type { AgentProfile, ArtifactProposal, AssetRecord, NovelBrief, NovelFileRecord, NovelSummary, OpeningPresetProposal, ProjectRecipe, ProviderCatalogItem, RunView, SkillDefinition, ToolCapability, WorkspaceProjection } from "../shared/contracts";
-import type { NovelState, NextAction, WorkflowId } from "../domain";
-import type { WorkflowApproval } from "../shared/workflow-catalog";
-import type { MastraDBMessage } from "@mastra/core/agent";
-
-export class WorkbenchApiError extends Error {
-  constructor(public readonly code: string, message: string, public readonly recoverable: boolean) {
-    super(message);
-  }
-}
+import type { FileContent, NovelFileView, NovelSummary, PatchProposal, ProductionJob, ProductionJobRequest, ProjectSnapshot, ProviderCatalogItem, SkillBindingsView, SkillDraftView, SkillRecordView, SkillSandboxView, SkillValidationView, SkillVersionView } from "../shared/contracts";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
-  const body = await response.json().catch(() => ({}));
+  const response = await fetch(url, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) } });
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = body?.error;
-    throw new WorkbenchApiError(error?.code ?? "REQUEST_FAILED", error?.message ?? "操作失败，请重试。", error?.recoverable ?? true);
+    const value = payload?.error;
+    throw new Error(typeof value?.message === "string" ? value.message : typeof payload?.message === "string" ? payload.message : `请求失败（${response.status}）`);
   }
-  return body as T;
+  return payload as T;
 }
-
-export interface Bootstrap {
-  models: {
-    configured: boolean;
-    selection?: { providerId: string; modelId: string };
-    configuredProviders: string[];
-    secretPersistence: "windows-dpapi-current-user" | "session-only";
-  };
-  novels: NovelSummary[];
-}
-export interface PromptBlockView { id: string; name: string; description: string; defaultContent: string; draftContent?: string; publishedContent?: string; draftVersion?: string; publishedVersion?: string; activeSource: "official" | "custom"; draftSource?: "official" | "custom"; group: "对话引导" | "书级策划" | "章节生产" | "审查修复"; usage: string; order: number }
-export interface ObservabilityStats { generatedAt: string; scope: "novel" | "all"; totals: { total: number; success: number; error: number; running: number; averageDurationMs: number; inputTokens: number; outputTokens: number; totalTokens: number }; spans: Array<{ type: string; count: number }>; tools: Array<{ name: string; count: number; errors: number }>; recent: Array<{ traceId: string; name: string; spanType: string; status: "success" | "error" | "running"; startedAt: string; durationMs?: number; error?: string }> }
+const json = (value: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(value) });
 
 export const api = {
-  bootstrap: () => request<Bootstrap>("/workbench-api/bootstrap"),
+  bootstrap: () => request<{ models: { configured: boolean; selection?: { providerId: string; modelId: string }; configuredProviders: string[] }; novels: NovelSummary[] }>("/workbench-api/bootstrap"),
   providers: () => request<{ providers: ProviderCatalogItem[] }>("/workbench-api/providers"),
-  saveModel: (body: { providerId: string; modelId: string; credentials: Record<string, string> }) =>
-    request<Bootstrap["models"]>("/workbench-api/model-settings", { method: "PUT", body: JSON.stringify(body) }),
+  saveModel: (value: { providerId: string; modelId: string; credentials: Record<string, string> }) => request("/workbench-api/model-settings", { method: "PUT", body: JSON.stringify(value) }),
   testModel: () => request<{ ok: true; latencyMs: number; model: string }>("/workbench-api/model-settings/test", { method: "POST" }),
-  modelProfiles: () => request<{ default?: { providerId: string; modelId: string }; profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }> }>("/workbench-api/model-profiles"),
-  saveModelProfiles: (profiles: Record<string, { providerId: string; modelId: string; parameters?: Record<string, number> }>) => request("/workbench-api/model-profiles", { method: "PUT", body: JSON.stringify({ profiles }) }),
-  prompts: () => request<{ prompts: PromptBlockView[] }>("/workbench-api/prompts"),
-  prompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}`),
-  savePromptDraft: (id: string, content: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/draft`, { method: "PUT", body: JSON.stringify({ content }) }),
-  previewPrompt: (id: string, content: string) => request<{ id: string; content: string }>(`/workbench-api/prompts/${encodeURIComponent(id)}/preview`, { method: "POST", body: JSON.stringify({ content }) }),
-  publishPrompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/publish`, { method: "POST" }),
-  restorePrompt: (id: string) => request<PromptBlockView>(`/workbench-api/prompts/${encodeURIComponent(id)}/restore-default`, { method: "POST" }),
-  capabilities: () => request<{
-    agent: { id: string; tools: string[]; processors: string[] };
-    agents: Array<{ id: string; name: string; tools: string[] }>;
-    tools: ToolCapability[];
-    skills: SkillDefinition[];
-    agentProfiles: AgentProfile[];
-    defaultProjectRecipe: ProjectRecipe;
-    workflows: Array<{ id: WorkflowId; name: string; description: string; target: string; approval: WorkflowApproval; stages: string[] }>;
-    prompts: Array<{ id: string; name: string; description: string }>;
-  }>("/workbench-api/capabilities"),
-  observabilityStats: (novelId?: string) => request<ObservabilityStats>(`/workbench-api/observability/stats${novelId ? `?novelId=${encodeURIComponent(novelId)}` : ""}`),
-  createNovel: (title: string, approvalMode: "milestone_approval" | "auto" = "milestone_approval") => request<NovelState>("/workbench-api/novels", { method: "POST", body: JSON.stringify({ title, approvalMode }) }),
-  novel: (id: string) => request<{ novel: NovelState; nextAction: NextAction; milestone: string }>(`/workbench-api/novels/${id}`),
-  workspace: (id: string) => request<WorkspaceProjection>(`/workbench-api/novels/${id}/workspace`),
-  chat: (id: string) => request<{ messages: MastraDBMessage[] }>(`/workbench-api/novels/${id}/chat`),
-  proposePreset: (id: string) => request<OpeningPresetProposal>(`/workbench-api/novels/${id}/opening-preset/propose`, { method: "POST" }),
-  saveChoices: (id: string, body: { workingTitle?: string; storyDirection?: string; genre?: string; tone?: string; channel: string; format: string; primaryReward: string }) =>
-    request<NovelState>(`/workbench-api/novels/${id}/opening-choices`, { method: "PUT", body: JSON.stringify(body) }),
-  advance: (id: string) => request<RunView>(`/workbench-api/novels/${id}/advance`, { method: "POST" }),
-  startRun: (id: string, workflowId: WorkflowId, target?: string) => request<RunView>(`/workbench-api/novels/${id}/runs`, { method: "POST", body: JSON.stringify({ workflowId, target, input: {} }) }),
-  artifacts: (id: string) => request<{ artifacts: NovelState["artifacts"][string][] }>(`/workbench-api/novels/${id}/artifacts`),
-  assets: (id: string) => request<{ assets: AssetRecord[] }>(`/workbench-api/novels/${id}/assets`),
-  files: (id: string) => request<{ files: NovelFileRecord[] }>(`/workbench-api/novels/${id}/files`),
-  file: (id: string, path: string) => request<{ path: string; kind: NovelFileRecord["kind"]; size: number; modifiedAt: string; sha256: string; content: string }>(`/workbench-api/novels/${id}/files/content?path=${encodeURIComponent(path)}`),
-  editWorkspaceFile: (id: string, path: string, content: string, expectedSha256?: string) => request<{ path: string; sha256: string; created: boolean }>(`/workbench-api/novels/${id}/workspace-files`, { method: "PUT", body: JSON.stringify({ path, content, expectedSha256 }) }),
-  artifact: (id: string, key: string) => request<{ artifact: NovelState["artifacts"][string]; content: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`),
-  editArtifact: (id: string, key: string, content: string, expectedSha256: string) => request<{ state: NovelState; sha256: string }>(`/workbench-api/novels/${id}/artifacts/${encodeURIComponent(key)}`, { method: "PUT", body: JSON.stringify({ content, expectedSha256 }) }),
-  chapterRange: (id: string, start: number, end: number) => request<RunView>(`/workbench-api/novels/${id}/chapter-ranges`, { method: "POST", body: JSON.stringify({ start, end }) }),
-  configureVolume: (id: string, plan: { number: number; startChapter: number; endChapter: number; final: boolean }) => request<{ novel: NovelState; nextAction: NextAction }>(`/workbench-api/novels/${id}/volumes`, { method: "PUT", body: JSON.stringify(plan) }),
-  autoDirector: (id: string, startChapter: number | undefined, endChapter: number, autoApproveMilestones = false) => request<RunView>(`/workbench-api/novels/${id}/auto-director`, { method: "POST", body: JSON.stringify({ startChapter, endChapter, autoApproveMilestones }) }),
-  exportNovel: (id: string, fileName?: string) => request<RunView>(`/workbench-api/novels/${id}/export`, { method: "POST", body: JSON.stringify({ fileName }) }),
-  exportDownloadUrl: (id: string, path: string) => `/workbench-api/novels/${id}/export?path=${encodeURIComponent(path)}`,
-  run: (id: string) => request<RunView>(`/workbench-api/runs/${id}`),
-  review: (id: string, body: { action: "approve"; brief?: NovelBrief; proposal?: ArtifactProposal } | { action: "revise"; feedback: string; proposal?: ArtifactProposal } | { action: "cancel" }) =>
-    request<RunView>(`/workbench-api/runs/${id}/review`, { method: "POST", body: JSON.stringify(body) }),
+  createNovel: (title: string) => request<{ novelId: string }>("/workbench-api/novels", json({ title })),
+  snapshot: (id: string) => request<ProjectSnapshot>(`/workbench-api/novels/${id}/snapshot`),
+  chat: (id: string) => request<{ messages: any[] }>(`/workbench-api/novels/${id}/chat`),
+  files: (id: string) => request<{ files: NovelFileView[] }>(`/workbench-api/novels/${id}/files`),
+  file: (id: string, path: string) => request<FileContent>(`/workbench-api/novels/${id}/files/content?path=${encodeURIComponent(path)}`),
+  saveFile: (id: string, value: { path: string; content: string; expectedSha256: string }) => request<FileContent>(`/workbench-api/novels/${id}/files`, { method: "PUT", body: JSON.stringify(value) }),
+  approveProposal: (id: string, proposal: PatchProposal) => request<{ proposal: PatchProposal; job?: ProductionJob }>(`/workbench-api/novels/${id}/proposals/approve`, json(proposal)),
+  rejectProposal: (id: string, proposal: PatchProposal) => request<PatchProposal>(`/workbench-api/novels/${id}/proposals/reject`, json(proposal)),
+  startJob: (id: string, value: ProductionJobRequest) => request<ProductionJob>(`/workbench-api/novels/${id}/jobs`, json(value)),
+  jobAction: (id: string, jobId: string, value: { action: "continue" | "revise" | "cancel"; feedback?: string }) => request<ProductionJob>(`/workbench-api/novels/${id}/jobs/${jobId}/actions`, json(value)),
+  skills: () => request<{ skills: SkillRecordView[] }>("/workbench-api/skills"),
+  skill: (id: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}`),
+  skillVersions: (id: string) => request<{ versions: SkillVersionView[] }>(`/workbench-api/skills/${id}/versions`),
+  createSkill: (value: SkillDraftView) => request<{ record: SkillRecordView; version: SkillVersionView }>("/workbench-api/skills", json(value)),
+  importSkill: (value: SkillDraftView) => request<{ record: SkillRecordView; version: SkillVersionView }>("/workbench-api/skills/import", json(value)),
+  importGitSkill: (value: { url: string; ref?: string; subdir?: string }) => request<{ record: SkillRecordView; version: SkillVersionView }>("/workbench-api/skills/import", json({ source: "git", ...value })),
+  importZipSkill: (base64: string) => request<{ record: SkillRecordView; version: SkillVersionView }>("/workbench-api/skills/import", json({ source: "zip", base64 })),
+  deriveSkill: (id: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}/derive`, json({})),
+  saveSkill: (id: string, value: SkillDraftView) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}/draft`, { method: "PUT", body: JSON.stringify(value) }),
+  validateSkill: (id: string) => request<SkillValidationView>(`/workbench-api/skills/${id}/validate`, json({})),
+  testSkill: (id: string, prompt: string) => request<{ skillId: string; versionId: string; output: string; elapsedMs: number; usedFiles: string[]; scriptExecution: "disabled" | "not_required"; traceId?: string }>(`/workbench-api/skills/${id}/test`, json({ prompt })),
+  publishSkill: (id: string, expectedVersionId: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}/publish`, json({ expectedVersionId })),
+  rollbackSkill: (id: string, versionId: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}/rollback`, json({ versionId })),
+  archiveSkill: (id: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}/archive`, json({})),
+  sandboxCapabilities: () => request<SkillSandboxView>("/workbench-api/skills/sandbox/capabilities"),
+  novelSkills: (id: string) => request<{ bindings: SkillBindingsView; file: FileContent }>(`/workbench-api/novels/${id}/skills`),
+  saveNovelSkills: (id: string, bindings: SkillBindingsView, expectedSha256: string) => request<{ bindings: SkillBindingsView; file: FileContent }>(`/workbench-api/novels/${id}/skills`, { method: "PUT", body: JSON.stringify({ bindings, expectedSha256 }) }),
 };

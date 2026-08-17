@@ -1,127 +1,39 @@
 import { RequestContext } from "@mastra/core/request-context";
-import type { CoreUserMessage } from "@mastra/core/llm";
 import type { MastraDBMessage } from "@mastra/core/agent";
 import { useChat } from "@mastra/react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Check, CircleAlert, FileText, LoaderCircle, Paperclip, Send, Square, X } from "lucide-react";
-import { StudioMessage, hasRenderableMessage, messageForDisplay, messageText, openingPresetFromMessage, type ToolActions } from "./studio/MessageParts";
-import type { OpeningPresetProposal } from "../shared/contracts";
+import { CircleAlert, LoaderCircle, Send, Square } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PatchProposal, ProductionJob } from "../shared/contracts";
+import { errorText, hasRenderableMessage, messageForDisplay, patchProposalFromMessage, StudioMessage, type AgentActivity } from "./studio/MessageParts";
 
-const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-type Attachment = { name: string; mimeType: string; data: string; size: number };
-
-async function readAttachment(file: File): Promise<Attachment> {
-  if (file.size > MAX_ATTACHMENT_BYTES) throw new Error(`${file.name} 超过 5 MB，暂时无法发送。`);
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error ?? new Error(`无法读取 ${file.name}`));
-    reader.readAsDataURL(file);
-  });
-  return { name: file.name, mimeType: file.type || "application/octet-stream", data: dataUrl.slice(dataUrl.indexOf(",") + 1), size: file.size };
+export function mergeConversationMessages(initial: MastraDBMessage[], live: MastraDBMessage[]) {
+  const merged = new Map(initial.map((message) => [message.id, message]));
+  for (const message of live) merged.set(message.id, message);
+  return [...merged.values()];
 }
 
-export type ConversationRevisionMode = { label: string; onSubmit: (text: string) => Promise<void>; onExit: () => void };
-
-export function Conversation({ novelId, initialMessages, discoveryAction, emptyState, revisionMode, contextLabel, currentArtifactKey, currentFilePath, onConversationChange, onOpeningPresetReady }: {
-  novelId: string;
-  initialMessages: MastraDBMessage[];
-  discoveryAction?: { pending: boolean; error: unknown; onConfirm: () => void };
-  emptyState?: (actions: { sendMessage: (text: string) => Promise<void>; isRunning: boolean }) => ReactNode;
-  revisionMode?: ConversationRevisionMode;
-  contextLabel?: string;
-  currentArtifactKey?: string;
-  currentFilePath?: string;
-  onConversationChange?: () => void | Promise<void>;
-  onOpeningPresetReady?: (proposal: OpeningPresetProposal) => void;
-}) {
-  const [revisionNotice, setRevisionNotice] = useState("");
-  const [chatError, setChatError] = useState("");
-  const [compatibilityStream, setCompatibilityStream] = useState(false);
-  const [showPending, setShowPending] = useState(false);
-  const listRef = useRef<HTMLDivElement>(null);
-  const followOutputRef = useRef(true);
-  const openingPresetMessageRef = useRef("");
-  const requestContext = useMemo(() => new RequestContext<any>([
-    ["novelId", novelId], ["taskType", revisionMode ? "review" : "chat"], ["modelProfile", revisionMode ? "review" : "chat"],
-    ["currentArtifactKey", currentArtifactKey ?? ""], ["currentFilePath", currentFilePath ?? ""], ["novelContext", contextLabel ?? ""],
-  ]), [currentArtifactKey, currentFilePath, contextLabel, novelId, revisionMode]);
-  const { messages, tasks, isRunning, isAwaitingToolApproval, sendMessage, cancelRun, approveToolCall, declineToolCall, toolCallApprovals } = useChat({
-    agentId: "novel-production-agent", resourceId: novelId, threadId: novelId, initialMessages, requestContext,
-    enableThreadSignals: true, onThreadSignalsUnsupported: () => setCompatibilityStream(true),
-  });
-  const running = isRunning || isAwaitingToolApproval;
-  const renderableMessages = useMemo(() => messages.filter(hasRenderableMessage).map(messageForDisplay), [messages]);
-  const lastHasOutput = renderableMessages.at(-1)?.role === "assistant";
-
-  const sendText = useCallback(async (raw: string, attachments: Attachment[] = []) => {
-    const text = raw.trim();
-    if ((!text && !attachments.length) || running) return;
-    setChatError(""); followOutputRef.current = true;
-    try {
-      if (revisionMode) { setRevisionNotice(""); await revisionMode.onSubmit(text); setRevisionNotice("修改要求已提交，正在重新生成。"); return; }
-      const coreUserMessages: CoreUserMessage[] = attachments.length ? [{ role: "user", content: attachments.map((file) => ({ type: "file" as const, data: file.data, filename: file.name, mimeType: file.mimeType })) }] : [];
-      await sendMessage({ message: text, coreUserMessages, threadId: novelId, requestContext });
-      await onConversationChange?.();
-    } catch (error) { setChatError(error instanceof Error ? error.message : "消息发送失败，请重试。"); }
-  }, [novelId, onConversationChange, requestContext, revisionMode, running, sendMessage]);
-
-  useEffect(() => { setRevisionNotice(""); setChatError(""); setCompatibilityStream(false); }, [novelId, revisionMode]);
+export function Conversation({ novelId, initialMessages, centered = false, job, externalActivity, appliedProposalIds = [], onProposal, onChange }: { novelId: string; initialMessages: MastraDBMessage[]; centered?: boolean; job?: ProductionJob; externalActivity?: AgentActivity; appliedProposalIds?: string[]; onProposal: (proposal?: PatchProposal) => void; onChange: () => void | Promise<void> }) {
+  const [value, setValue] = useState(""); const [error, setError] = useState(""); const [activity, setActivity] = useState<AgentActivity>(); const list = useRef<HTMLDivElement>(null);
+  const context = useMemo(() => new RequestContext<any>([["novelId", novelId], ["taskType", "chat"], ["modelProfile", "chat"]]), [novelId]);
+  const { messages, isRunning, sendMessage, cancelRun } = useChat({ agentId: "novel-agent", resourceId: novelId, threadId: novelId, initialMessages, requestContext: context, enableThreadSignals: true });
+  const allMessages = useMemo(() => mergeConversationMessages(initialMessages, messages), [initialMessages, messages]);
+  const visible = useMemo(() => allMessages.filter(hasRenderableMessage).map(messageForDisplay), [allMessages]);
+  const send = useCallback(async (raw: string, nextActivity: AgentActivity = { title: "正在处理你的消息", detail: "Agent 正在读取作品上下文并决定下一步，完成后会直接在这里回复。" }) => { const message = raw.trim(); if (!message || isRunning) return; setError(""); setValue(""); setActivity(nextActivity); try { await sendMessage({ message, threadId: novelId, requestContext: context }); await onChange(); } catch (reason) { setError(errorText(reason instanceof Error ? reason.message : reason)); } }, [context, isRunning, novelId, onChange, sendMessage]);
+  useEffect(() => { const proposal = [...allMessages].reverse().map(patchProposalFromMessage).find((item) => item && !appliedProposalIds.includes(item.id)); onProposal(proposal); }, [allMessages, appliedProposalIds, onProposal]);
   useEffect(() => {
-    const message = [...messages].reverse().find((item) => openingPresetFromMessage(item));
-    const proposal = message && openingPresetFromMessage(message);
-    if (!proposal || message.id === openingPresetMessageRef.current) return;
-    openingPresetMessageRef.current = message.id;
-    onOpeningPresetReady?.(proposal);
-  }, [messages, onOpeningPresetReady]);
-  useEffect(() => {
-    if (!running || lastHasOutput) { setShowPending(false); return; }
-    const timer = window.setTimeout(() => setShowPending(true), 280);
-    return () => window.clearTimeout(timer);
-  }, [lastHasOutput, running]);
-  useEffect(() => { if (followOutputRef.current && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [messages, showPending, tasks]);
-
-  const actions = useMemo<ToolActions>(() => ({
-    approve: async (id, resumeData) => { await approveToolCall(id, resumeData); await onConversationChange?.(); },
-    decline: async (id) => { await declineToolCall(id); await onConversationChange?.(); },
-    approvals: toolCallApprovals,
-  }), [approveToolCall, declineToolCall, onConversationChange, toolCallApprovals]);
-
-  return <div className="studio-conversation">
-    <div className="studio-conversation-head"><div><span className="eyebrow">{contextLabel ? `当前上下文 · ${contextLabel}` : "创作线程"}</span><strong>Agent</strong></div>{running && <span className="studio-running"><LoaderCircle className="spin" size={14} />{isAwaitingToolApproval ? "等待确认" : "正在运行"}</span>}</div>
-    <div className="studio-message-list" ref={listRef} onScroll={(event) => { const element = event.currentTarget; followOutputRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; }}>
-      {renderableMessages.map((message) => <article className={`studio-message ${message.role}`} key={message.id} data-message-id={message.id}><StudioMessage message={message} actions={actions} onChoice={(choice) => void sendText(choice)} streamActive={running && message.id === renderableMessages.at(-1)?.id} />{message.role === "assistant" && messageText(message).trim() && <div className="studio-message-actions"><button type="button" onClick={() => void navigator.clipboard?.writeText(messageText(message))}>复制</button></div>}</article>)}
-      {!renderableMessages.length && emptyState?.({ sendMessage: (text) => sendText(text), isRunning: running })}
-      {tasks.length > 0 && <section className="studio-task-list" aria-label="Agent 任务"><header>任务进度</header>{tasks.map((task) => <div className={task.status} key={task.id}><span /><strong>{task.status === "in_progress" ? task.activeForm : task.content}</strong><small>{task.status === "completed" ? "完成" : task.status === "in_progress" ? "进行中" : "等待"}</small></div>)}</section>}
-      {showPending && <div className="studio-pending"><LoaderCircle className="spin" size={16} />正在连接创作服务…</div>}
-    </div>
-    <div className="studio-composer-wrap">
-      {discoveryAction && renderableMessages.some((message) => message.role === "user") && <div className="studio-discovery-action"><div><strong>开书讨论中</strong><span>等你把想法说完整后，再整理成开书方案。</span></div><button type="button" disabled={running || discoveryAction.pending} onClick={discoveryAction.onConfirm}>{discoveryAction.pending ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}{discoveryAction.pending ? "正在整理…" : "我说完了，整理方案"}</button></div>}
-      {Boolean(discoveryAction?.error) && <div className="studio-error"><CircleAlert size={16} />{discoveryAction?.error instanceof Error ? discoveryAction.error.message : "整理失败，请重试。"}</div>}
-      {compatibilityStream && <div className="studio-stream-notice">当前服务使用兼容流模式，消息内容不受影响。</div>}
-      {chatError && <div className="studio-error"><CircleAlert size={16} />{chatError}</div>}
-      {revisionNotice && <div className="studio-notice">{revisionNotice}</div>}
-      <Composer onSend={sendText} onCancel={cancelRun} running={running} revisionMode={revisionMode} onError={setChatError} />
-      <small className="studio-disclaimer">AI 可能犯错，重要创作决定以你批准的工件为准。</small>
-    </div>
-  </div>;
-}
-
-function Composer({ onSend, onCancel, onError, running, revisionMode }: { onSend: (text: string, attachments?: Attachment[]) => Promise<void>; onCancel: () => void; onError: (message: string) => void; running: boolean; revisionMode?: ConversationRevisionMode }) {
-  const [value, setValue] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [readingFiles, setReadingFiles] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const submit = () => { const text = value.trim(); if ((!text && !attachments.length) || running || readingFiles) return; const pendingAttachments = attachments; setValue(""); setAttachments([]); void onSend(text, pendingAttachments); };
-  const chooseFiles = async (files: FileList | null) => {
-    if (!files?.length) return;
-    setReadingFiles(true); onError("");
-    try { const added = await Promise.all(Array.from(files).map(readAttachment)); setAttachments((current) => [...current, ...added]); }
-    catch (error) { onError(error instanceof Error ? error.message : "附件读取失败。"); }
-    finally { setReadingFiles(false); if (inputRef.current) inputRef.current.value = ""; }
-  };
-  return <div className="studio-composer-shell">
-    {attachments.length > 0 && <div className="studio-attachment-list">{attachments.map((file, index) => <span key={`${file.name}-${index}`}><FileText size={14} /><span><strong>{file.name}</strong><small>{Math.ceil(file.size / 1024)} KB</small></span><button type="button" aria-label={`移除 ${file.name}`} onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={13} /></button></span>)}</div>}
-    <div className="studio-composer"><input ref={inputRef} type="file" hidden multiple disabled={running || Boolean(revisionMode)} onChange={(event) => void chooseFiles(event.target.files)} /><button type="button" className="studio-attach-button" aria-label="添加附件" title={revisionMode ? "修改模式暂不支持附件" : "添加附件（单个不超过 5 MB）"} disabled={running || readingFiles || Boolean(revisionMode)} onClick={() => inputRef.current?.click()}>{readingFiles ? <LoaderCircle className="spin" size={17} /> : <Paperclip size={17} />}</button><textarea value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); } }} placeholder={revisionMode ? `说明希望如何调整${revisionMode.label}……` : "聊聊这本书……"} aria-label={revisionMode ? "说明修改要求" : "发送对话消息"} rows={1} /><button type="button" className="studio-composer-button" aria-label={running ? "停止回答" : "发送消息"} onClick={running ? onCancel : submit}>{running ? <Square size={17} /> : <Send size={17} />}</button></div>
-  </div>;
+    if (!isRunning) return;
+    void onChange();
+    const timer = window.setInterval(() => void onChange(), 1_500);
+    return () => window.clearInterval(timer);
+  }, [isRunning, onChange]);
+  useEffect(() => { if (list.current) list.current.scrollTop = list.current.scrollHeight; }, [allMessages, isRunning]);
+  const jobActivity: AgentActivity | undefined = job && ["queued", "running", "awaiting_author", "failed"].includes(job.status) ? job.status === "failed"
+    ? { title: "章节生产未完成", detail: job.error?.message ?? "任务已经停止，可以修正问题后重新开始。" }
+    : job.status === "awaiting_author"
+    ? { title: "章节生产已暂停", detail: `第 ${job.cursor ?? job.scope.fromChapter ?? "当前"} 章需要你的判断。处理下方提示后会从当前进度继续。` }
+    : { title: job.goal === "write_chapters" ? "正在连续生成章节" : job.goal === "review_project" ? "正在审查作品" : job.goal === "export" ? "正在导出作品" : "正在处理文件修订", detail: job.goal === "write_chapters" ? `目标：第 ${job.scope.fromChapter ?? "?"}–${job.scope.toChapter ?? "?"} 章。规划、写作和审查会依次完成，你可以留在当前页面。` : job.goal === "review_project" ? job.brief ?? "Critic 正在按你的目标读取证据并生成审查报告。" : "任务仍在后台运行，完成后文件列表会自动更新。" }
+    : undefined;
+  const currentActivity = externalActivity ?? jobActivity ?? (isRunning ? activity : undefined);
+  const activityRunning = isRunning || Boolean(externalActivity) || job?.status === "running" || job?.status === "queued";
+  return <section className={`conversation ${centered ? "centered" : ""}`}><header><div><small>ANI AGENT</small><strong>创作搭档</strong></div>{currentActivity && <span><LoaderCircle className={activityRunning ? "spin" : ""} size={14} />{job?.status === "awaiting_author" && !isRunning && !externalActivity ? "等待你处理" : job?.status === "failed" && !externalActivity ? "未完成" : "进行中"}</span>}</header><div className="message-list" ref={list}>{visible.map((message) => <article className={`message ${message.role}`} key={message.id}><StudioMessage message={message} onChoice={(choice, nextActivity) => void send(choice, nextActivity)} /></article>)}{currentActivity && <div className="agent-activity" role="status" aria-live="polite"><LoaderCircle className={activityRunning ? "spin" : ""} /><div><strong>{currentActivity.title}</strong><span>{currentActivity.detail}</span></div></div>}{!visible.length && !currentActivity && <div className="conversation-empty"><h2>从一个真正想写的念头开始。</h2><p>可以说题材、某种阅读感觉，甚至只说一句“我还没想好”。</p><button onClick={() => void send("我完全没有想法，请给我五个差异明显的开书种子。", { title: "正在寻找创作方向", detail: "Agent 会生成五个差异明显的开书种子，完成后请你选择一个。" })}>帮我找一个方向</button></div>}</div>{visible.length > 0 && centered && <button className="finish-discovery" disabled={isRunning} onClick={() => void send("我说完了，请整理两份差异明显、可以直接开写的作品蓝图。", { title: "正在生成两份作品蓝图", detail: "读取已有构思 → 形成两个差异方案 → 完成后等待你选择；现在不会自动开写。" })}>生成两份蓝图</button>}{error && <div className="composer-error"><CircleAlert size={15} />{error}</div>}<div className="composer"><textarea value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(value); } }} placeholder="描述想法，或让 Agent 继续……" rows={2} /><button aria-label={isRunning ? "停止" : "发送"} onClick={isRunning ? cancelRun : () => void send(value)}>{isRunning ? <Square /> : <Send />}</button></div></section>;
 }
