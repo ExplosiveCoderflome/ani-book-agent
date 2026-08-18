@@ -76,6 +76,7 @@ export class ModelSettingsStore {
         ...(profiles.chat ? { chat: profiles.chat } : {}),
         ...(profiles.writer ?? profiles.drafting ? { writer: profiles.writer ?? profiles.drafting } : {}),
         ...(profiles.critic ?? profiles.review ? { critic: profiles.critic ?? profiles.review } : {}),
+        ...(profiles.analysis ? { analysis: profiles.analysis } : {}),
       },
     };
   }
@@ -122,7 +123,7 @@ export class ModelSettingsStore {
   async runtimeSelection(profile?: ModelProfileName): Promise<{ providerId: string; modelId: string; model: string; parameters: { temperature?: number; maxOutputTokens?: number; topP?: number } }> {
     const selection = await this.selection();
     if (!selection) throw new AppError("MODEL_NOT_CONFIGURED", "请先选择并配置一个模型。", 409, true);
-    const effective = profile ? selection.profiles?.[profile] ?? selection : selection;
+    const effective = profile ? selection.profiles?.[profile] ?? (profile === "analysis" ? selection.profiles?.critic : undefined) ?? selection : selection;
     const credentials = await this.credentials(effective.providerId);
     if (!credentials || !Object.keys(credentials).length) {
       throw new AppError("MODEL_NOT_CONFIGURED", "当前模型还没有可用的密钥。", 409, true);

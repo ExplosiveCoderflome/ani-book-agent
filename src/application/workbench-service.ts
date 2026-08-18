@@ -52,10 +52,10 @@ export async function jobView(novelId: string, jobId: string): Promise<Productio
 }
 
 export async function projectSnapshot(novelId: string): Promise<ProjectSnapshot> {
-  const [novel, files] = await Promise.all([novelRepository.get(novelId), novelRepository.listFiles(novelId)]);
+  const [novel, files, ledger] = await Promise.all([novelRepository.get(novelId), novelRepository.listFiles(novelId), novelRepository.readLedger(novelId)]);
   const activeJob = novel.activeJobId ? await jobView(novelId, novel.activeJobId).catch(() => undefined) : undefined;
   const { availableOperations } = await import("../domain");
-  return { novel, files, activeJob, availability: availableOperations(novel, activeJob) };
+  return { novel, files, characterStates: ledger.characters, activeJob, availability: availableOperations(novel, activeJob) };
 }
 
 export async function startProductionJob(novelId: string, input: ProductionJobRequest): Promise<ProductionJob> {

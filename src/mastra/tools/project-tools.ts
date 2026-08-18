@@ -3,11 +3,12 @@ import { z } from "zod";
 import { AppError } from "../../application/errors";
 import { novelStateSchema, patchChangeSchema, patchProposalSchema, productionJobRequestSchema, productionJobSchema } from "../../domain";
 import { NovelRepository } from "../../infrastructure/novel-repository";
-import { presentChoicesSchema } from "../../shared/contracts";
 import { readSkill } from "../skill-loader";
 import { skillRegistry } from "../../application/skill-service";
+import { ReferenceRepository } from "../../infrastructure/reference-repository";
 
 const repository = new NovelRepository();
+const references = new ReferenceRepository();
 const errorSchema = z.object({ code: z.string(), message: z.string(), recoverable: z.boolean(), nextAction: z.enum(["retry", "reread", "author_approval", "replan"]).optional() });
 const failedSchema = z.object({ ok: z.literal(false), error: errorSchema });
 function novelId(context: { requestContext: { get(key: string): unknown } }) { return z.string().uuid().parse(context.requestContext.get("novelId")); }
@@ -49,19 +50,16 @@ export const readSkillTool = createTool({
   } catch (error) { return failure(error); } },
 });
 
-export const presentChoicesToolInputSchema = presentChoicesSchema.catch({ kind: "decision", choices: [] });
-
-export const presentChoicesTool = createTool({
-  id: "present_choices",
-  description: "把本轮已经形成的 2-5 个创作方向展示为可点击选项；蓝图候选必须恰好两份且差异落在故事发动机。",
-  inputSchema: presentChoicesToolInputSchema,
-  outputSchema: z.union([presentChoicesSchema, failedSchema]),
-  execute: async (input) => {
-    const parsed = presentChoicesSchema.safeParse(input);
-    return parsed.success
-      ? parsed.data
-      : { ok: false as const, error: { code: "INVALID_TOOL_INPUT", message: "选项参数格式不完整，请使用一个完整 JSON 对象重新调用 present_choices。", recoverable: true, nextAction: "retry" as const } };
-  },
+export const readReferenceTool = createTool({
+  id: "read_reference",
+  description: "读取已完成的全局拆书报告、阶段或章节分析，用于把抽象方法应用到当前作品。只读且有界；不得将参考书专有事实写入当前作品账本。",
+  inputSchema: z.object({ referenceId: z.string().uuid(), analysisId: z.string(), kind: z.enum(["report", "segment", "chapter"]), id: z.string().max(120).optional() }),
+  outputSchema: z.union([z.object({ ok: z.literal(true), referenceId: z.string(), analysisId: z.string(), kind: z.string(), content: z.string() }), failedSchema]),
+  execute: async (input) => { try {
+    const state = await references.get(input.referenceId); const analysis = state.analyses.find((item) => item.id === input.analysisId && item.status === "completed"); if (!analysis) throw new AppError("REFERENCE_ANALYSIS_NOT_FOUND", "没有找到已完成的拆书结果。", 404, true, undefined, "reread");
+    const relative = input.kind === "report" ? analysis.reportPath ?? "report.md" : input.kind === "segment" ? `segments/${input.id}.yaml` : `chapters/${input.id}.yaml`;
+    return { ok: true as const, referenceId: input.referenceId, analysisId: input.analysisId, kind: input.kind, content: await references.readAnalysisFile(input.referenceId, input.analysisId, relative, 40_000) };
+  } catch (error) { return failure(error); } },
 });
 
 export const proposePatchTool = createTool({
@@ -84,4 +82,11 @@ export const startJobTool = createTool({
   execute: async (input, context) => { try { const { startProductionJob } = await import("../../application/workbench-service"); return { ok: true as const, job: await startProductionJob(novelId(context), input) }; } catch (error) { return failure(error); } },
 });
 
-export const projectTools = { readProjectTool, searchProjectTool, readSkillTool, presentChoicesTool, proposePatchTool, startJobTool };
+export const projectTools = {
+  read_project: readProjectTool,
+  search_project: searchProjectTool,
+  read_skill: readSkillTool,
+  read_reference: readReferenceTool,
+  propose_patch: proposePatchTool,
+  start_job: startJobTool,
+};

@@ -13,3 +13,5 @@ test-results/
 *.sqlite3-wal
 novels/*
 !novels/.gitkeep
+reference-library/*
+!reference-library/.gitkeep

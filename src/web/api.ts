@@ -1,7 +1,7 @@
-import type { FileContent, NovelFileView, NovelSummary, PatchProposal, ProductionJob, ProductionJobRequest, ProjectSnapshot, ProviderCatalogItem, SkillBindingsView, SkillDraftView, SkillRecordView, SkillSandboxView, SkillValidationView, SkillVersionView } from "../shared/contracts";
+import type { DeconstructionFocus, DeconstructionMode, FileContent, ModelProfileName, NovelFileView, NovelSummary, PatchProposal, ProductionJob, ProductionJobRequest, ProjectSnapshot, ProviderCatalogItem, ReferenceAnalysisView, ReferenceDetailView, ReferenceJob, ReferenceState, SkillBindingsView, SkillDraftView, SkillRecordView, SkillSandboxView, SkillValidationView, SkillVersionView, TokenEstimate } from "../shared/contracts";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) } });
+  const response = await fetch(url, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...(init?.headers ?? {}) } });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const value = payload?.error;
@@ -15,8 +15,23 @@ export const api = {
   bootstrap: () => request<{ models: { configured: boolean; selection?: { providerId: string; modelId: string }; configuredProviders: string[] }; novels: NovelSummary[] }>("/workbench-api/bootstrap"),
   providers: () => request<{ providers: ProviderCatalogItem[] }>("/workbench-api/providers"),
   saveModel: (value: { providerId: string; modelId: string; credentials: Record<string, string> }) => request("/workbench-api/model-settings", { method: "PUT", body: JSON.stringify(value) }),
+  modelProfiles: () => request<{ default?: ModelProfileSelection; profiles: Partial<Record<ModelProfileName, ModelProfileSelection>> }>("/workbench-api/model-profiles"),
+  saveModelProfiles: (profiles: Partial<Record<ModelProfileName, ModelProfileSelection | null>>) => request("/workbench-api/model-profiles", { method: "PUT", body: JSON.stringify({ profiles }) }),
   testModel: () => request<{ ok: true; latencyMs: number; model: string }>("/workbench-api/model-settings/test", { method: "POST" }),
   createNovel: (title: string) => request<{ novelId: string }>("/workbench-api/novels", json({ title })),
+  references: () => request<{ references: ReferenceState[] }>("/workbench-api/references"),
+  reference: (id: string) => request<ReferenceDetailView>(`/workbench-api/references/${id}`),
+  importReference: (file: File, title: string, rightsConfirmed: boolean) => { const form = new FormData(); form.set("file", file); form.set("title", title); form.set("rightsConfirmed", String(rightsConfirmed)); return request<{ state: ReferenceState; manifest: ReferenceDetailView["manifest"]; duplicate: boolean }>("/workbench-api/references/import", { method: "POST", body: form }); },
+  confirmReference: (id: string, manifestHash: string) => request<ReferenceDetailView>(`/workbench-api/references/${id}/manifest`, { method: "PUT", body: JSON.stringify({ manifestHash }) }),
+  deleteReference: (id: string) => request<{ deleted: true }>(`/workbench-api/references/${id}`, { method: "DELETE" }),
+  estimateReference: (id: string, mode: DeconstructionMode, focuses: DeconstructionFocus[]) => request<TokenEstimate>(`/workbench-api/references/${id}/estimate`, json({ mode, focuses })),
+  startReferenceJob: (id: string, value: { mode: DeconstructionMode; focuses: DeconstructionFocus[]; manifestHash: string; tokenBudget: number }) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs`, json(value)),
+  referenceJob: (id: string, jobId: string) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs/${jobId}`),
+  referenceJobAction: (id: string, jobId: string, value: { action: "continue" | "add_budget" | "cancel"; additionalTokens?: number }) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs/${jobId}/actions`, json(value)),
+  referenceAnalysis: (id: string, analysisId: string) => request<ReferenceAnalysisView>(`/workbench-api/references/${id}/analyses/${analysisId}`),
+  referenceSegment: (id: string, analysisId: string, segmentId: string) => request<{ content: string }>(`/workbench-api/references/${id}/analyses/${analysisId}/segments/${segmentId}`),
+  referenceChapter: (id: string, analysisId: string, chapterId: string) => request<{ content: string }>(`/workbench-api/references/${id}/analyses/${analysisId}/chapters/${chapterId}`),
+  referenceSource: (id: string, start: number, end: number) => request<{ start: number; end: number; content: string }>(`/workbench-api/references/${id}/source?start=${start}&end=${end}`),
   snapshot: (id: string) => request<ProjectSnapshot>(`/workbench-api/novels/${id}/snapshot`),
   chat: (id: string) => request<{ messages: any[] }>(`/workbench-api/novels/${id}/chat`),
   files: (id: string) => request<{ files: NovelFileView[] }>(`/workbench-api/novels/${id}/files`),
@@ -27,6 +42,7 @@ export const api = {
   startJob: (id: string, value: ProductionJobRequest) => request<ProductionJob>(`/workbench-api/novels/${id}/jobs`, json(value)),
   jobAction: (id: string, jobId: string, value: { action: "continue" | "revise" | "cancel"; feedback?: string }) => request<ProductionJob>(`/workbench-api/novels/${id}/jobs/${jobId}/actions`, json(value)),
   skills: () => request<{ skills: SkillRecordView[] }>("/workbench-api/skills"),
+  reloadBuiltinSkills: () => request<{ checked: number; updated: string[] }>("/workbench-api/skills/reload-builtins", { method: "POST" }),
   skill: (id: string) => request<{ record: SkillRecordView; version: SkillVersionView }>(`/workbench-api/skills/${id}`),
   skillVersions: (id: string) => request<{ versions: SkillVersionView[] }>(`/workbench-api/skills/${id}/versions`),
   createSkill: (value: SkillDraftView) => request<{ record: SkillRecordView; version: SkillVersionView }>("/workbench-api/skills", json(value)),
@@ -44,3 +60,5 @@ export const api = {
   novelSkills: (id: string) => request<{ bindings: SkillBindingsView; file: FileContent }>(`/workbench-api/novels/${id}/skills`),
   saveNovelSkills: (id: string, bindings: SkillBindingsView, expectedSha256: string) => request<{ bindings: SkillBindingsView; file: FileContent }>(`/workbench-api/novels/${id}/skills`, { method: "PUT", body: JSON.stringify({ bindings, expectedSha256 }) }),
 };
+
+type ModelProfileSelection = { providerId: string; modelId: string; parameters?: { temperature?: number; maxOutputTokens?: number; topP?: number } };

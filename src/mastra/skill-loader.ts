@@ -3,7 +3,7 @@ import path from "node:path";
 import { AppError } from "../application/errors";
 import { skillRegistry } from "../application/skill-service";
 
-export const skillIds = ["discovery", "blueprint", "volume-planning", "chapter-writing", "critique", "project-review"] as const;
+export const skillIds = ["discovery", "blueprint", "character-planning", "volume-planning", "chapter-writing", "critique", "project-review"] as const;
 export type SkillId = typeof skillIds[number];
 
 const root = () => path.resolve(process.env.INIT_CWD ?? process.cwd(), "src", "mastra");

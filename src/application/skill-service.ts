@@ -13,13 +13,13 @@ import {
   type SkillSandboxCapabilities, type SkillValidationResult, type SkillVersion,
 } from "../domain";
 
-const builtinIds = ["discovery", "blueprint", "volume-planning", "chapter-writing", "critique", "project-review"] as const;
+const builtinIds = ["discovery", "blueprint", "character-planning", "volume-planning", "chapter-writing", "critique", "project-review"] as const;
 const maxFileBytes = 5 * 1024 * 1024;
 const maxTotalBytes = 50 * 1024 * 1024;
 const repository = new NovelRepository();
 const skills = mastraStorage.stores!.skills!;
 const blobs = mastraStorage.stores!.blobs!;
-let seeded: Promise<void> | undefined;
+let seeded: Promise<string[]> | undefined;
 const execFile = promisify(execFileCallback);
 
 export type SkillDraftInput = {
@@ -194,6 +194,7 @@ export class SkillRegistryService {
   private async seedBuiltins() {
     await this.init();
     const root = path.resolve(process.env.INIT_CWD ?? process.cwd(), "src", "mastra", "skills");
+    const updated: string[] = [];
     for (const id of builtinIds) {
       const source = await readFile(path.join(root, id, "SKILL.md"), "utf8");
       const parsed = stripFrontmatter(source);
@@ -210,6 +211,7 @@ export class SkillRegistryService {
         await skills.create({ skill: { id, ...data } as any });
         const latest = await skills.getLatestVersion(id);
         if (latest) await skills.update({ id, activeVersionId: latest.id, status: "published" });
+        updated.push(id);
       } else {
         const latest = await skills.getLatestVersion(id);
         if ((latest?.metadata as any)?.app?.contentHash !== digest) {
@@ -218,9 +220,17 @@ export class SkillRegistryService {
           await skills.createVersion({ id: randomUUID(), skillId: id, versionNumber: (latest?.versionNumber ?? 0) + 1, ...data, changedFields: ["instructions", "files"], changeMessage: "官方 Skill 更新" } as any);
           const next = await skills.getLatestVersion(id);
           if (next) await skills.update({ id, activeVersionId: next.id, status: "published" });
+          updated.push(id);
         }
       }
     }
+    return updated;
+  }
+  async reloadBuiltins() {
+    if (seeded) await seeded.catch(() => undefined);
+    seeded = this.seedBuiltins();
+    const updated = await seeded;
+    return { checked: builtinIds.length, updated };
   }
   async list(status?: "draft" | "published" | "archived") {
     await this.ensureSeeded();

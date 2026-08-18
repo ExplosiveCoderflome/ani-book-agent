@@ -42,7 +42,8 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
     await assert.rejects(() => repository.prepareProposal(created.novelId, { intent: "旧哈希", summary: "旧哈希", changes: [{ operation: "replace", path: blueprint.path, baseSha256: "0".repeat(64), content: "新蓝图" }] }), isCode("FILE_STALE"));
 
     await assert.rejects(() => repository.commitChapter(created.novelId, 2, "# 第二章", { characterUpdates: [], worldRules: [], threads: [], changes: [] }), isCode("CHAPTER_SEQUENCE"));
-    await repository.commitChapter(created.novelId, 1, "# 第一章\n正文", { characterUpdates: [], worldRules: [], threads: [{ id: "promise", kind: "promise", text: "找到故乡", status: "open" }], changes: ["主角离村"] });
+    await repository.commitChapter(created.novelId, 1, "# 第一章\n正文", { characterUpdates: [{ id: "guide", name: "阿宁", role: "向导", goal: "带主角过河", state: "已经同行", knowledge: [], relationships: ["主角：临时同伴"] }], worldRules: [], threads: [{ id: "promise", kind: "promise", text: "找到故乡", status: "open" }], changes: ["主角离村"] }, [{ id: "guide", content: "# 阿宁\n\n> 角色 ID：guide\n\n- 叙事功能：带领主角进入陌生地域，并持续制造信任压力。\n- 外在目标：完成过河交易。\n- 内在需要：重新学会信任同行者。\n- 核心矛盾：需要主角合作，却不愿暴露真实来历。\n- 行为与声音：说话简短，先谈条件再提供帮助。\n- 人物弧检查点：近期决定是否履行约定。\n" }]);
+    assert.match((await repository.readProjectFile(created.novelId, "book/characters/guide.md")).content, /角色 ID：guide/);
     const chapter = await repository.readProjectFile(created.novelId, "chapters/chapter-001.md");
     const saved = await repository.saveAuthorFile(created.novelId, chapter.path, `${chapter.content}\n作者修改`, chapter.sha256);
     assert.equal(saved.source, "author");

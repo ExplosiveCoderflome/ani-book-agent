@@ -1,3 +1,5 @@
+import { ZodError } from "zod";
+
 export class AppError extends Error {
   constructor(
     public readonly code: string,
@@ -5,7 +7,11 @@ export class AppError extends Error {
     public readonly status = 400,
     public readonly recoverable = true,
     public readonly fieldErrors?: Record<string, string[]>,
-    public readonly nextAction?: "retry" | "reread" | "author_approval" | "replan",
+    public readonly nextAction?:
+      | "retry"
+      | "reread"
+      | "author_approval"
+      | "replan",
   ) {
     super(message);
   }
@@ -22,6 +28,30 @@ export function errorBody(error: unknown) {
           recoverable: error.recoverable,
           ...(error.nextAction ? { nextAction: error.nextAction } : {}),
           ...(error.fieldErrors ? { fieldErrors: error.fieldErrors } : {}),
+        },
+      },
+    };
+  }
+
+  if (error instanceof ZodError) {
+    const first = error.issues[0];
+    const field = first?.path[0];
+    return {
+      status: 400,
+      body: {
+        error: {
+          code: "INVALID_INPUT",
+          message: first?.message ?? "请求参数不正确。",
+          recoverable: true,
+          ...(typeof field === "string"
+            ? {
+                fieldErrors: {
+                  [field]: error.issues
+                    .filter((issue) => issue.path[0] === field)
+                    .map((issue) => issue.message),
+                },
+              }
+            : {}),
         },
       },
     };

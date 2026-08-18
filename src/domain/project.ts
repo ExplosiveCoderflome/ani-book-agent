@@ -92,10 +92,15 @@ export const operationAvailabilitySchema = z.object({
 export type OperationAvailability = z.infer<typeof operationAvailabilitySchema>;
 
 export const continuityDeltaSchema = z.object({
-  characterUpdates: z.array(z.object({ id: z.string(), name: z.string().optional(), state: z.string().optional(), knowledge: z.array(z.string()).default([]), relationships: z.array(z.string()).default([]) })).default([]),
+  characterUpdates: z.array(z.object({ id: z.string(), name: z.string().optional(), role: z.string().optional(), goal: z.string().optional(), state: z.string().optional(), knowledge: z.array(z.string()).default([]), relationships: z.array(z.string()).default([]) })).default([]),
   worldRules: z.array(z.object({ id: z.string(), rule: z.string(), exceptions: z.array(z.string()).default([]) })).default([]),
   threads: z.array(z.object({ id: z.string(), kind: z.enum(["promise", "mystery", "conflict"]), text: z.string(), status: z.enum(["open", "advanced", "resolved"]) })).default([]),
   changes: z.array(z.string()).default([]),
+});
+
+export const characterProfileCreateSchema = z.object({
+  id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  content: z.string().min(80).max(12_000),
 });
 
 export const criticResultSchema = z.object({
@@ -103,6 +108,7 @@ export const criticResultSchema = z.object({
   summary: z.string(),
   issues: z.array(z.object({ evidence: z.string(), severity: z.enum(["low", "medium", "high", "critical"]), repair: z.string() })).default([]),
   continuityDelta: continuityDeltaSchema,
+  newCharacterProfiles: z.array(characterProfileCreateSchema).max(5).default([]),
 });
 export type CriticResult = z.infer<typeof criticResultSchema>;
 
@@ -121,7 +127,7 @@ export function normalizeNovelPath(value: string): string {
 }
 
 export function patchApproval(state: NovelState, changes: Array<z.infer<typeof patchChangeSchema>>): "auto" | "author" {
-  if (changes.some((change) => change.path === "book/blueprint.md")) return "author";
+  if (changes.some((change) => change.path === "book/blueprint.md" || change.path.startsWith("book/characters/"))) return "author";
   return changes.some((change) => {
     const record = state.files[change.path];
     return record?.protected || record?.source === "author";
@@ -142,10 +148,12 @@ export function mergeLedger(ledger: NovelLedger, chapter: number, delta: z.infer
     const current = next.characters.find((item) => item.id === update.id);
     if (current) {
       if (update.name) current.name = update.name;
+      if (update.role) current.role = update.role;
+      if (update.goal) current.goal = update.goal;
       if (update.state) current.state = update.state;
       current.knowledge = unique([...current.knowledge, ...update.knowledge]);
-      current.relationships = unique([...current.relationships, ...update.relationships]);
-    } else next.characters.push({ id: update.id, name: update.name ?? update.id, role: "待补充", goal: "待补充", state: update.state ?? "未知", knowledge: update.knowledge, relationships: update.relationships });
+      if (update.relationships.length) current.relationships = unique(update.relationships);
+    } else next.characters.push({ id: update.id, name: update.name ?? update.id, role: update.role ?? "待补充", goal: update.goal ?? "待补充", state: update.state ?? "未知", knowledge: update.knowledge, relationships: update.relationships });
   }
   for (const rule of delta.worldRules) {
     const index = next.worldRules.findIndex((item) => item.id === rule.id);

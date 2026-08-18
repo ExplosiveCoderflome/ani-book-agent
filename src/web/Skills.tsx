@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, Copy, FileCode, FilePlus, FolderInput, LoaderCircle, PackageOpen, Play, RotateCcw, Save, ShieldAlert, Sparkles, Upload } from "lucide-react";
+import { ArrowLeft, Check, Copy, FileCode, FilePlus, FolderInput, LoaderCircle, PackageOpen, Play, RefreshCw, RotateCcw, Save, ShieldAlert, Sparkles, Upload } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import type { SkillBindingsView, SkillDraftView, SkillFileView, SkillRecordView } from "../shared/contracts";
 import { api } from "./api";
@@ -35,12 +35,13 @@ function sourceLabel(skill: SkillRecordView) { return skill.official ? "官方" 
 const skillPresentation: Record<string, { label: string; description: string }> = {
   discovery: { label: "开书探索", description: "把模糊念头整理成题材、冲突和故事方向" },
   blueprint: { label: "故事蓝图", description: "确定主角、核心矛盾、主线和结局走向" },
+  "character-planning": { label: "角色规划", description: "规划角色动力、关系张力、人物弧并同步当前事实" },
   "volume-planning": { label: "卷与节奏规划", description: "拆分卷目标、关键转折和章节推进节奏" },
   "chapter-writing": { label: "章节写作", description: "根据章节计划生成连贯的正文内容" },
   critique: { label: "章节质量审阅", description: "检查人物、情节、节奏和表达问题" },
   "project-review": { label: "全书项目审查", description: "从全局检查设定一致性、伏笔和长线质量" },
 };
-const skillOrder = ["discovery", "blueprint", "volume-planning", "chapter-writing", "critique", "project-review"];
+const skillOrder = ["discovery", "blueprint", "character-planning", "volume-planning", "chapter-writing", "critique", "project-review"];
 function skillInfo(skill: SkillRecordView) { return skillPresentation[skill.id] ?? { label: skill.name, description: skill.description }; }
 
 export function SkillLibrary() {
@@ -56,6 +57,7 @@ export function SkillLibrary() {
     onSuccess: async (result) => { await client.invalidateQueries({ queryKey: ["skills"] }); navigate("/skills/" + result.record.id); },
   });
   const derive = useMutation({ mutationFn: api.deriveSkill, onSuccess: async (result) => { await client.invalidateQueries({ queryKey: ["skills"] }); navigate("/skills/" + result.record.id); } });
+  const reload = useMutation({ mutationFn: api.reloadBuiltinSkills, onSuccess: async () => { await client.invalidateQueries({ queryKey: ["skills"] }); } });
   const imported = useMutation({
     mutationFn: async (list: FileList) => {
       const raw = [...list]; const prefix = raw[0]?.webkitRelativePath.split("/")[0] ?? "";
@@ -72,11 +74,12 @@ export function SkillLibrary() {
   const gitImport = useMutation({ mutationFn: api.importGitSkill, onSuccess: async (result) => { await client.invalidateQueries({ queryKey: ["skills"] }); navigate("/skills/" + result.record.id); } });
   const zipImport = useMutation({ mutationFn: async (file: File) => api.importZipSkill(binaryString(await file.arrayBuffer())), onSuccess: async (result) => { await client.invalidateQueries({ queryKey: ["skills"] }); navigate("/skills/" + result.record.id); } });
   return <main className="skills-page">
-    <header className="skills-topbar"><Link to="/"><ArrowLeft />作品</Link><div><small>CREATIVE METHODS</small><h1>创作 Skill</h1></div><div className="skills-top-actions"><label className="button-like"><FolderInput />导入目录<input type="file" multiple {...({ webkitdirectory: "" } as any)} onChange={(event) => event.currentTarget.files?.length && imported.mutate(event.currentTarget.files)} /></label><label className="button-like"><PackageOpen />导入 ZIP<input type="file" accept=".zip,application/zip" onChange={(event) => event.currentTarget.files?.[0] && zipImport.mutate(event.currentTarget.files[0])} /></label><button className="quiet-action" disabled={gitImport.isPending} onClick={() => { const url = window.prompt("输入 HTTPS Git 仓库地址"); if (!url) return; const subdir = window.prompt("Skill 子目录（仓库根目录请留空）") || undefined; gitImport.mutate({ url, subdir }); }}><PackageOpen />从 Git 导入</button><button onClick={() => setCreating(true)}><FilePlus />新建 Skill</button></div></header>
+    <header className="skills-topbar"><Link to="/"><ArrowLeft />作品</Link><div><small>CREATIVE METHODS</small><h1>创作 Skill</h1></div><div className="skills-top-actions"><button className="quiet-action" disabled={reload.isPending} onClick={() => reload.mutate()} title="重新读取仓库中的内置 SKILL.md"><RefreshCw className={reload.isPending ? "spin" : ""} />{reload.isPending ? "正在刷新" : "刷新内置 Skill"}</button><label className="button-like"><FolderInput />导入目录<input type="file" multiple {...({ webkitdirectory: "" } as any)} onChange={(event) => event.currentTarget.files?.length && imported.mutate(event.currentTarget.files)} /></label><label className="button-like"><PackageOpen />导入 ZIP<input type="file" accept=".zip,application/zip" onChange={(event) => event.currentTarget.files?.[0] && zipImport.mutate(event.currentTarget.files[0])} /></label><button className="quiet-action" disabled={gitImport.isPending} onClick={() => { const url = window.prompt("输入 HTTPS Git 仓库地址"); if (!url) return; const subdir = window.prompt("Skill 子目录（仓库根目录请留空）") || undefined; gitImport.mutate({ url, subdir }); }}><PackageOpen />从 Git 导入</button><button onClick={() => setCreating(true)}><FilePlus />新建 Skill</button></div></header>
+    {reload.data && <p className="skill-refresh-result">{reload.data.updated.length ? `已刷新 ${reload.data.updated.length} 个：${reload.data.updated.map((id) => skillPresentation[id]?.label ?? id).join("、")}` : `已检查 ${reload.data.checked} 个内置 Skill，没有文件变化。`}</p>}
     <section className="skills-summary"><div><strong>{skills.data?.skills.length ?? "—"}</strong><span>可用方法</span></div><div><strong>{skills.data?.skills.filter((item) => item.status === "published").length ?? "—"}</strong><span>已发布</span></div><div className={sandbox.data?.configured ? "ok" : "warning"}>{sandbox.data?.configured ? <Check /> : <ShieldAlert />}<span>{sandbox.data?.configured ? "隔离执行已配置" : "脚本执行未配置"}</span></div></section>
     {creating && <section className="skill-create-panel"><div><small>新建草稿</small><h2>先写清楚它解决什么创作问题</h2></div><label>名称<input value={name} onChange={(event) => setName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))} placeholder="character-arc" /></label><label>使用说明<input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="用于规划人物成长弧和关键转折" /></label><div><button disabled={!name || !description || create.isPending} onClick={() => create.mutate()}>{create.isPending ? <LoaderCircle className="spin" /> : <Sparkles />}创建</button><button className="quiet-action" onClick={() => setCreating(false)}>取消</button></div>{create.error && <p className="skill-error">{create.error.message}</p>}</section>}
     {skills.isLoading ? <div className="skill-loading"><LoaderCircle className="spin" />正在读取 Skill…</div> : <section className="skill-grid">{skills.data?.skills.map((skill) => <article className="skill-card" key={skill.id}><header><span className={skill.official ? "official" : ""}>{sourceLabel(skill)}</span><small>{skill.status === "published" ? "已发布" : skill.status === "draft" ? "草稿" : "已归档"}</small></header><Link to={"/skills/" + skill.id}><h2>{skill.name}</h2><p>{skill.description}</p></Link><footer><div>{skill.taskTypes.slice(0, 3).map((task) => <span key={task}>{task}</span>)}</div>{skill.official ? <button disabled={derive.isPending} onClick={() => derive.mutate(skill.id)}><Copy />派生编辑</button> : <Link to={"/skills/" + skill.id}>打开</Link>}</footer></article>)}</section>}
-    {(skills.error || imported.error || zipImport.error || gitImport.error || derive.error) && <p className="skill-error">{(skills.error ?? imported.error ?? zipImport.error ?? gitImport.error ?? derive.error)?.message}</p>}
+    {(skills.error || reload.error || imported.error || zipImport.error || gitImport.error || derive.error) && <p className="skill-error">{(skills.error ?? reload.error ?? imported.error ?? zipImport.error ?? gitImport.error ?? derive.error)?.message}</p>}
   </main>;
 }
 

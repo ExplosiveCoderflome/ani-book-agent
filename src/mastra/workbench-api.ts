@@ -8,9 +8,11 @@ import { modelSettings } from "../infrastructure/model-settings";
 import { productionJobRequestSchema, skillBindingsSchema, skillFileSchema, skillNameSchema } from "../domain";
 import { modelProfilesInputSchema, modelSettingsInputSchema } from "../shared/contracts";
 import { skillRegistry } from "../application/skill-service";
+import { confirmReferenceManifest, deleteReference, estimateReference, importReference, listReferences, referenceAnalysis, referenceChapter, referenceDetail, referenceJobAction, referenceJobView, referenceSegment, referenceSource, startReferenceJob } from "../application/reference-service";
+import { deconstructionFocusSchema, deconstructionModeSchema, referenceJobRequestSchema } from "../domain";
 
 type Handler = (c: any) => Promise<Response>;
-function route(path: string, method: "GET" | "POST" | "PUT", handler: Handler) {
+function route(path: string, method: "GET" | "POST" | "PUT" | "DELETE", handler: Handler) {
   return { path, method, handler: async (c: any) => { try { return await handler(c); } catch (error) { const result = errorBody(error); return c.json(result.body, result.status); } } };
 }
 async function body<T extends z.ZodType>(c: any, schema: T): Promise<z.output<T>> { return schema.parse(await c.req.json()); }
@@ -31,6 +33,19 @@ export const workbenchApiRoutes = [
   route("/workbench-api/model-profiles", "PUT", async (c) => c.json(await modelSettings.saveProfiles(await body(c, modelProfilesInputSchema)))),
   route("/workbench-api/novels", "GET", async (c) => c.json({ novels: await listNovels() })),
   route("/workbench-api/novels", "POST", async (c) => c.json(await createNovel((await body(c, z.object({ title: z.string().max(80).default("未命名作品") }))).title), 201)),
+  route("/workbench-api/references/import", "POST", async (c) => { const form = await c.req.formData(); const file = form.get("file"); if (!(file instanceof File)) throw new Error("请选择 TXT 或 Markdown 文件。"); return c.json(await importReference({ fileName: file.name, title: String(form.get("title") ?? "") || undefined, bytes: Buffer.from(await file.arrayBuffer()), rightsConfirmed: form.get("rightsConfirmed") === "true" }), 201); }),
+  route("/workbench-api/references", "GET", async (c) => c.json({ references: await listReferences() })),
+  route("/workbench-api/references/:id", "GET", async (c) => c.json(await referenceDetail(c.req.param("id")))),
+  route("/workbench-api/references/:id", "DELETE", async (c) => c.json(await deleteReference(c.req.param("id")))),
+  route("/workbench-api/references/:id/manifest", "PUT", async (c) => c.json(await confirmReferenceManifest(c.req.param("id"), (await body(c, z.object({ manifestHash: z.string().length(64) }))).manifestHash))),
+  route("/workbench-api/references/:id/estimate", "POST", async (c) => { const input = await body(c, z.object({ mode: deconstructionModeSchema, focuses: z.array(deconstructionFocusSchema).max(3).default([]) })); return c.json(await estimateReference(c.req.param("id"), input.mode, input.focuses)); }),
+  route("/workbench-api/references/:id/jobs", "POST", async (c) => c.json(await startReferenceJob(c.req.param("id"), await body(c, referenceJobRequestSchema)), 202)),
+  route("/workbench-api/references/:id/jobs/:jobId", "GET", async (c) => c.json(await referenceJobView(c.req.param("id"), c.req.param("jobId")))),
+  route("/workbench-api/references/:id/jobs/:jobId/actions", "POST", async (c) => c.json(await referenceJobAction(c.req.param("id"), c.req.param("jobId"), await body(c, z.object({ action: z.enum(["continue", "add_budget", "cancel"]), additionalTokens: z.number().int().positive().optional() }))))),
+  route("/workbench-api/references/:id/analyses/:analysisId", "GET", async (c) => c.json(await referenceAnalysis(c.req.param("id"), c.req.param("analysisId")))),
+  route("/workbench-api/references/:id/analyses/:analysisId/segments/:segmentId", "GET", async (c) => c.json(await referenceSegment(c.req.param("id"), c.req.param("analysisId"), c.req.param("segmentId")))),
+  route("/workbench-api/references/:id/analyses/:analysisId/chapters/:chapterId", "GET", async (c) => c.json(await referenceChapter(c.req.param("id"), c.req.param("analysisId"), c.req.param("chapterId")))),
+  route("/workbench-api/references/:id/source", "GET", async (c) => c.json(await referenceSource(c.req.param("id"), Number(c.req.query("start")), Number(c.req.query("end"))))),
   route("/workbench-api/novels/:id/snapshot", "GET", async (c) => c.json(await projectSnapshot(c.req.param("id")))),
   route("/workbench-api/novels/:id/chat", "GET", async (c) => c.json(await chatSession(c.req.param("id")))),
   route("/workbench-api/novels/:id/files", "GET", async (c) => c.json({ files: await listFiles(c.req.param("id")) })),
@@ -38,6 +53,7 @@ export const workbenchApiRoutes = [
   route("/workbench-api/novels/:id/files", "PUT", async (c) => c.json(await saveAuthorFile(c.req.param("id"), await body(c, z.object({ path: z.string(), content: z.string().max(500_000), expectedSha256: z.string().length(64) }))))),
   route("/workbench-api/skills", "GET", async (c) => c.json({ skills: await skillRegistry.list(c.req.query("status") as "draft" | "published" | "archived" | undefined) })),
   route("/workbench-api/skills", "POST", async (c) => c.json(await skillRegistry.create(await body(c, skillDraftInput)), 201)),
+  route("/workbench-api/skills/reload-builtins", "POST", async (c) => c.json(await skillRegistry.reloadBuiltins())),
   route("/workbench-api/skills/import", "POST", async (c) => { const parsed = skillImportInput.parse(await c.req.json()); if ("source" in parsed) return c.json(parsed.source === "git" ? await skillRegistry.importGit(parsed) : await skillRegistry.importArchive(parsed.base64), 201); return c.json(await skillRegistry.create(parsed, "imported"), 201); }),
   route("/workbench-api/skills/:skillId", "GET", async (c) => c.json(await skillRegistry.get(c.req.param("skillId")))),
   route("/workbench-api/skills/:skillId/versions", "GET", async (c) => c.json({ versions: await skillRegistry.versions(c.req.param("skillId")) })),

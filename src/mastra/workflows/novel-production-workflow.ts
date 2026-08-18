@@ -1,7 +1,7 @@
 import { RequestContext } from "@mastra/core/request-context";
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
-import { criticResultSchema, productionJobRequestSchema, type CriticResult, type ProductionJobRequest } from "../../domain";
+import { characterProfileCreateSchema, continuityDeltaSchema, criticResultSchema, productionJobRequestSchema, type CriticResult, type ProductionJobRequest } from "../../domain";
 import { modelSettings } from "../../infrastructure/model-settings";
 import { NovelRepository, novelStateHash } from "../../infrastructure/novel-repository";
 import { novelAgent, novelCritic } from "../agents/novel-agent";
@@ -17,6 +17,13 @@ export const productionWorkflowInputSchema = productionJobRequestSchema.extend({
 const resumeSchema = z.object({ action: z.enum(["continue", "revise", "cancel"]), feedback: z.string().max(2_000).optional() });
 const suspendSchema = z.object({ jobId: z.string(), chapter: z.number().int().positive(), summary: z.string(), issues: criticResultSchema.shape.issues });
 const outputSchema = z.object({ status: z.enum(["completed", "canceled"]), novelId: z.string().uuid(), jobId: z.string(), completedThrough: z.number().int().nonnegative(), exportPath: z.string().optional(), reportPath: z.string().optional() });
+const repairedChapterResultSchema = z.object({
+  verdict: z.enum(["accepted", "replan"]),
+  summary: z.string().min(1),
+  text: z.string(),
+  continuityDelta: continuityDeltaSchema,
+  newCharacterProfiles: z.array(characterProfileCreateSchema).max(5).default([]),
+});
 export const projectReviewResultSchema = z.object({
   summary: z.string().min(1).max(4_000),
   strengths: z.array(z.string().max(500)).max(10).default([]),
@@ -40,14 +47,33 @@ async function settings(profile: "writer" | "critic", outputCap: number) {
   return { temperature: selected.parameters.temperature, topP: selected.parameters.topP, maxOutputTokens: Math.min(selected.parameters.maxOutputTokens ?? outputCap, outputCap) };
 }
 
+export function characterAssetPaths(paths: string[]) { return paths.filter((path) => path.startsWith("book/characters/") && path.endsWith(".md")).sort((left, right) => left.localeCompare(right, "zh-CN", { numeric: true })); }
+
+async function readCharacterAssets(novelId: string, paths: string[], maxChars = 50_000) {
+  const parts: string[] = [];
+  let remaining = maxChars;
+  for (const path of characterAssetPaths(paths)) {
+    if (remaining <= 0) break;
+    const file = await repository.readProjectFile(novelId, path, 0, Math.min(12_000, remaining));
+    const section = `### ${path}\n${file.content}`;
+    parts.push(section);
+    remaining -= section.length;
+  }
+  return parts.join("\n\n");
+}
+
 async function ensureVolumePlan(novelId: string, fromChapter: number, toChapter: number, skillVersions: Record<string, string>) {
   const state = await repository.get(novelId);
   const volumePath = `volumes/volume-${String(state.currentVolume).padStart(3, "0")}.md`;
   if (state.files[volumePath]) return volumePath;
-  const blueprint = await repository.readProjectFile(novelId, "book/blueprint.md", 0, 80_000);
-  const skill = await readSkill("volume-planning", skillVersions["volume-planning"]);
+  const [blueprint, ledger, characters, skill] = await Promise.all([
+    repository.readProjectFile(novelId, "book/blueprint.md", 0, 80_000),
+    repository.readProjectFile(novelId, "book/ledger.yaml", 0, 50_000),
+    readCharacterAssets(novelId, Object.keys(state.files)),
+    readSkill("volume-planning", skillVersions["volume-planning"]),
+  ]);
   const context = requestContext(novelId, "writer", skillVersions);
-  const result = await generateWithGuard("生成当前卷计划", (abortSignal) => novelAgent.generate(`${skill}\n\n作品蓝图：\n${blueprint.content}\n\n请规划第 ${fromChapter}-${toChapter} 章。直接输出可保存为当前卷计划的完整 Markdown；每张章节卡都写明目标、阻力、转折、回报和钩子。不要输出 JSON、代码围栏或额外说明。`, { requestContext: context, abortSignal, toolChoice: "none", providerOptions: productionProviderOptions, modelSettings: awaitSettings(3_000) }));
+  const result = await generateWithGuard("生成当前卷计划", (abortSignal) => novelAgent.generate(`${skill}\n\n作品蓝图：\n${blueprint.content}${characters ? `\n\n角色档案（长期设计）：\n${characters}` : ""}\n\n连续性账本（当前事实）：\n${ledger.content}\n\n请规划第 ${fromChapter}-${toChapter} 章。直接输出可保存为当前卷计划的完整 Markdown；每张章节卡都写明目标、阻力、转折、角色推进、回报和钩子。不要输出 JSON、代码围栏或额外说明。`, { requestContext: context, abortSignal, toolChoice: "none", providerOptions: productionProviderOptions, modelSettings: awaitSettings(3_000) }));
   const plan = result.text?.trim();
   if (!plan || plan.length < 200) throw new Error("模型没有返回可用的当前卷计划");
   const proposal = await repository.prepareProposal(novelId, { intent: "建立当前卷计划", summary: `规划第 ${fromChapter}-${toChapter} 章`, changes: [{ operation: "create", path: volumePath, content: plan }] });
@@ -185,9 +211,11 @@ export function chapterOverlapRatio(previous: string, candidate: string) {
 }
 
 async function chapterContext(novelId: string, chapter: number, volumePath: string) {
+  const state = await repository.get(novelId);
   const previousPath = chapter > 1 ? `chapters/chapter-${String(chapter - 1).padStart(3, "0")}.md` : undefined;
-  const [blueprint, ledger, volume, previous] = await Promise.all([
+  const [blueprint, characters, ledger, volume, previous] = await Promise.all([
     repository.readProjectFile(novelId, "book/blueprint.md", 0, 50_000),
+    readCharacterAssets(novelId, Object.keys(state.files)),
     repository.readProjectFile(novelId, "book/ledger.yaml", 0, 50_000),
     repository.readProjectFile(novelId, volumePath, 0, 50_000),
     previousPath ? repository.readProjectFile(novelId, previousPath, 0, 20_000) : undefined,
@@ -197,6 +225,7 @@ async function chapterContext(novelId: string, chapter: number, volumePath: stri
     `## 本次唯一任务\n创作第 ${chapter} 章，只执行下方“当前章节卡”。其他章节卡不属于本次任务。`,
     `## 当前章节卡（唯一执行目标）\n${currentPlan}`,
     `## 作品蓝图（全局约束）\n${blueprint.content}`,
+    characters ? `## 角色档案（长期设计，不代表已经发生）\n${characters}` : "",
     `## 连续性账本（稳定事实）\n${ledger.content}`,
     previous ? `## 上一章稳定正文（只用于承接）\n${previous.content}\n\n上一章内容已经发生，严禁复制、改写或重新表演。第 ${chapter} 章必须从其结尾状态继续，并产生新的目标推进、阻力、转折和净变化。` : "",
   ].filter(Boolean).join("\n\n");
@@ -214,17 +243,18 @@ async function writeChapter(novelId: string, chapter: number, source: string, fe
 
 async function critiqueChapter(novelId: string, chapter: number, source: string, text: string, skillVersions: Record<string, string>): Promise<CriticResult> {
   const context = requestContext(novelId, "critic", skillVersions);
-  const selected = await settings("critic", 2_500);
-  const result = await generateWithGuard(`验收第 ${chapter} 章`, (abortSignal) => novelCritic.generate(`第 ${chapter} 章权威上下文：\n${source}\n\n待验收正文：\n${text}\n\n必须逐项比较“上一章稳定正文”和待验收正文。若待验收正文复制、近似改写或重新表演上一章的主要段落/事件，不得 accepted；可删除重复部分且剩余正文仍完整则 repair，否则 replan。`, { requestContext: context, abortSignal, ...structuredOutputOptions(criticResultSchema), providerOptions: productionProviderOptions, modelSettings: selected }));
+  const [skill, characterSkill, selected] = await Promise.all([readSkill("critique", skillVersions.critique), readSkill("character-planning", skillVersions["character-planning"]), settings("critic", 2_500)]);
+  const result = await generateWithGuard(`验收第 ${chapter} 章`, (abortSignal) => novelCritic.generate(`${skill}\n\n需要创建新角色档案时遵循以下方法：\n${characterSkill}\n\n第 ${chapter} 章权威上下文：\n${source}\n\n待验收正文：\n${text}\n\n必须逐项比较“上一章稳定正文”和待验收正文。若待验收正文复制、近似改写或重新表演上一章的主要段落/事件，不得 accepted；可删除重复部分且剩余正文仍完整则 repair，否则 replan。`, { requestContext: context, abortSignal, ...structuredOutputOptions(criticResultSchema), providerOptions: productionProviderOptions, modelSettings: selected }));
   return requireStructuredOutput(criticResultSchema, result.object, "章节验收");
 }
 
-async function repairChapter(novelId: string, chapter: number, source: string, text: string, review: CriticResult, feedback = "") {
-  const context = requestContext(novelId, "writer");
-  const selected = await settings("writer", 6_000);
-  const result = await generateWithGuard(`修复第 ${chapter} 章`, (abortSignal) => novelAgent.generate(`只做一次范围受控的章节修复。保持已经成立的事件、事实和因果，解决审查证据中的阻断问题。\n\n权威上下文：\n${source}\n\n审查：\n${JSON.stringify(review)}${feedback ? `\n作者意见：${feedback}` : ""}\n\n待修正文：\n${text}\n\n只输出完整最终正文。`, { requestContext: context, abortSignal, toolChoice: "none", providerOptions: productionProviderOptions, modelSettings: selected }));
-  if (!result.text?.trim()) throw new Error("模型没有返回可用修复正文");
-  return result.text.trim();
+async function repairChapter(novelId: string, chapter: number, source: string, text: string, review: CriticResult, feedback = "", skillVersions: Record<string, string> = {}) {
+  const context = requestContext(novelId, "writer", skillVersions);
+  const [characterSkill, selected] = await Promise.all([readSkill("character-planning", skillVersions["character-planning"]), settings("writer", 7_000)]);
+  const result = await generateWithGuard(`修复第 ${chapter} 章`, (abortSignal) => novelAgent.generate(`只做一次范围受控的章节修复。保持已经成立的事件、事实和因果，解决审查证据中的阻断问题。\n\n需要创建新角色档案时遵循以下方法：\n${characterSkill}\n\n权威上下文：\n${source}\n\n审查：\n${JSON.stringify(review)}${feedback ? `\n作者意见：${feedback}` : ""}\n\n待修正文：\n${text}\n\n返回修复后的完整正文，并且只根据修复后的最终正文重新抽取 continuityDelta。若有限修复无法成立，verdict 返回 replan；不得沿用待修稿的角色变化。新增长期角色只有在最终正文中仍然成立且没有对应角色档案时才进入 newCharacterProfiles。`, { requestContext: context, abortSignal, ...structuredOutputOptions(repairedChapterResultSchema), providerOptions: productionProviderOptions, modelSettings: selected }));
+  const repaired = requireStructuredOutput(repairedChapterResultSchema, result.object, "章节修复");
+  if (repaired.verdict === "accepted" && !repaired.text.trim()) throw new Error("模型没有返回可用修复正文");
+  return { ...repaired, text: repaired.text.trim() };
 }
 
 const runStep = createStep({
@@ -263,10 +293,15 @@ const runStep = createStep({
         issues: [{ evidence: "待验收正文从开头复制或近似改写了上一章主体。", severity: "critical", repair: "删除全部复演内容，从上一章结尾后的新事件直接开始，只保留当前章节卡要求的事件。" }, ...review.issues],
       };
       if (review.verdict === "replan" && !resumeData) return suspend({ jobId: inputData.jobId, chapter: cursor, summary: review.summary, issues: review.issues });
-      if (review.verdict !== "accepted") text = await repairChapter(inputData.novelId, cursor, context.source, text, review, resumeData?.feedback ?? "");
+      if (review.verdict !== "accepted") {
+        const repaired = await repairChapter(inputData.novelId, cursor, context.source, text, review, resumeData?.feedback ?? "", inputData.skillVersions);
+        if (repaired.verdict === "replan") return suspend({ jobId: inputData.jobId, chapter: cursor, summary: repaired.summary, issues: review.issues });
+        text = repaired.text;
+        review = { ...review, verdict: "accepted", summary: repaired.summary, issues: [], continuityDelta: repaired.continuityDelta, newCharacterProfiles: repaired.newCharacterProfiles };
+      }
       const repairedOverlap = context.previousChapter ? chapterOverlapRatio(context.previousChapter, text) : 0;
       if (repairedOverlap >= 0.6) return suspend({ jobId: inputData.jobId, chapter: cursor, summary: `第 ${cursor} 章修复后仍与上一章重复，已阻止提交。`, issues: [{ evidence: `修复稿与上一章开头仍有 ${Math.round(repairedOverlap * 100)}% 的实质重叠。`, severity: "critical", repair: "重新规划本章开场与事件链，确认后再继续。" }] });
-      await repository.commitChapter(inputData.novelId, cursor, text, review.continuityDelta);
+      await repository.commitChapter(inputData.novelId, cursor, text, review.continuityDelta, review.newCharacterProfiles);
     }
     await repository.setActiveJob(inputData.novelId, undefined);
     return { status: "completed" as const, novelId: inputData.novelId, jobId: inputData.jobId, completedThrough: to };

@@ -5,7 +5,7 @@ import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
 import {
   ledgerSchema, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
-  type NovelLedger, type NovelState, type PatchProposal,
+  type CriticResult, type NovelLedger, type NovelState, type PatchProposal,
 } from "../domain";
 import { AppError } from "../application/errors";
 import type { FileContent, NovelFileView, NovelSummary } from "../shared/contracts";
@@ -178,7 +178,7 @@ export class NovelRepository {
     return ledgerSchema.parse(parse((await this.readProjectFile(novelId, "book/ledger.yaml", 0, textLimit)).content));
   }
 
-  async commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof mergeLedger>[2]) {
+  async commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof mergeLedger>[2], newCharacterProfiles: CriticResult["newCharacterProfiles"] = []) {
     const state = await this.get(novelId);
     if (state.nextChapter !== chapter) throw new AppError("CHAPTER_SEQUENCE", `当前应提交第 ${state.nextChapter} 章。`, 409, false);
     const ledger = mergeLedger(await this.readLedger(novelId), chapter, delta);
@@ -186,6 +186,7 @@ export class NovelRepository {
     const changes: PatchProposal["changes"] = [
       { operation: state.files[chapterPath] ? "replace" : "create", path: chapterPath, ...(state.files[chapterPath] ? { baseSha256: state.files[chapterPath]!.sha256 } : {}), content: text },
       { operation: state.files["book/ledger.yaml"] ? "replace" : "create", path: "book/ledger.yaml", ...(state.files["book/ledger.yaml"] ? { baseSha256: state.files["book/ledger.yaml"]!.sha256 } : {}), content: stringify(ledger, { lineWidth: 0 }) },
+      ...newCharacterProfiles.filter((profile) => !state.files[`book/characters/${profile.id}.md`]).map((profile) => ({ operation: "create" as const, path: `book/characters/${profile.id}.md`, content: profile.content })),
     ];
     const proposal = await this.prepareProposal(novelId, { intent: `提交第 ${chapter} 章`, summary: `稳定提交第 ${chapter} 章与连续性`, changes });
     const result = await this.applyProposal({ ...proposal, approval: "auto" }, true, (next) => { next.nextChapter = chapter + 1; });
