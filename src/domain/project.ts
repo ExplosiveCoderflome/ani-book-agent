@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { actualTensionObservationSchema } from "./tension-curve";
 
 export const novelPhaseSchema = z.enum(["discovery", "writing", "completed"]);
 export const fileSourceSchema = z.enum(["agent", "author", "imported"]);
@@ -46,6 +47,7 @@ export const patchChangeSchema = z.object({
   path: z.string().trim().min(1).max(240),
   baseSha256: z.string().length(64).optional(),
   content: z.string().max(500_000),
+  overrideLockedNodes: z.boolean().optional(),
 });
 export const patchProposalSchema = z.object({
   id: z.string().uuid(),
@@ -76,7 +78,7 @@ export const productionJobSchema = z.object({
   scope: productionScopeSchema,
   brief: z.string().optional(),
   status: z.enum(["queued", "running", "awaiting_author", "failed", "completed", "canceled"]),
-  cursor: z.number().int().positive().optional(), baseStateHash: z.string().length(64), proposalId: z.string().optional(),
+  cursor: z.number().int().positive().optional(), checkpoint: z.enum(["curve_confirmation", "chapter_review"]).optional(), baseStateHash: z.string().length(64), proposalId: z.string().optional(),
   resultPath: z.string().optional(),
   error: z.object({ code: z.string(), message: z.string(), recoverable: z.boolean() }).optional(),
   createdAt: z.string(), updatedAt: z.string(),
@@ -109,6 +111,7 @@ export const criticResultSchema = z.object({
   issues: z.array(z.object({ evidence: z.string(), severity: z.enum(["low", "medium", "high", "critical"]), repair: z.string() })).default([]),
   continuityDelta: continuityDeltaSchema,
   newCharacterProfiles: z.array(characterProfileCreateSchema).max(5).default([]),
+  actualTension: actualTensionObservationSchema,
 });
 export type CriticResult = z.infer<typeof criticResultSchema>;
 
@@ -127,7 +130,7 @@ export function normalizeNovelPath(value: string): string {
 }
 
 export function patchApproval(state: NovelState, changes: Array<z.infer<typeof patchChangeSchema>>): "auto" | "author" {
-  if (changes.some((change) => change.path === "book/blueprint.md" || change.path.startsWith("book/characters/"))) return "author";
+  if (changes.some((change) => change.path === "book/blueprint.md" || change.path === "book/tension-curve.yaml" || /^volumes\/volume-\d{3}-tension\.yaml$/.test(change.path) || change.path.startsWith("book/characters/"))) return "author";
   return changes.some((change) => {
     const record = state.files[change.path];
     return record?.protected || record?.source === "author";

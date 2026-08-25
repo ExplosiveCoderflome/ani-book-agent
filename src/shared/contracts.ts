@@ -13,8 +13,8 @@ export interface NovelSummary { novelId: string; title: string; phase: "discover
 export interface NovelFileView { path: string; sha256: string; version: number; source: "agent" | "author" | "imported"; protected: boolean; updatedAt: string; size: number }
 export interface FileContent extends NovelFileView { content: string }
 export interface ProjectSnapshot { novel: import("../domain").NovelState; availability: import("../domain").OperationAvailability; files: NovelFileView[]; characterStates: import("../domain").NovelLedger["characters"]; activeJob?: import("../domain").ProductionJob }
-export interface ReferenceDetailView { state: import("../domain").ReferenceState; manifest: import("../domain").ChapterManifest; estimate: import("../domain").TokenEstimate; activeJob?: import("../domain").ReferenceJob }
-export interface ReferenceAnalysisView { analysis: import("../domain").ReferenceAnalysis; report?: string; index?: { chapterCount: number; segmentCount: number; inputTokens: number; outputTokens: number; usageEstimated: boolean } }
+export interface ReferenceDetailView { state: import("../domain").ReferenceState; manifest: import("../domain").ChapterManifest; parser: import("../domain").ChapterParserConfig; estimate: import("../domain").TokenEstimate; activeJob?: import("../domain").ReferenceJob }
+export interface ReferenceAnalysisView { analysis: import("../domain").ReferenceAnalysis; sections: import("../domain").ReferenceSection[]; index?: { chapterCount: number; chapterRange?: import("../domain").ChapterRange; segmentCount: number; inputTokens: number; outputTokens: number; usageEstimated: boolean } }
 
 export type SkillRecordView = import("../domain").SkillRecord;
 export type SkillVersionView = import("../domain").SkillVersion;

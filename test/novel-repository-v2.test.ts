@@ -3,10 +3,15 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { stringify } from "yaml";
 import { AppError } from "../src/application/errors";
 import { NovelRepository, novelStateHash } from "../src/infrastructure/novel-repository";
 
 const ledger = "version: 1\ndecisions: []\ncharacters: []\nworldRules: []\nopenThreads: []\ncontinuity: []\n";
+const bookCurve = stringify({ schemaVersion: 1, kind: "book", title: "全书张力", basis: { blueprintSha256: "0".repeat(64), generatedAt: "2026-08-25T00:00:00.000Z" }, calibration: { status: "aligned", reasons: [] }, points: [
+  { id: "opening", progress: 0, label: "开篇", tension: 30, emotion: { kind: "curiosity", intensity: 2 }, function: "hook", rationale: "建立问题", source: "ai", locked: false },
+  { id: "ending", progress: 100, label: "终局", tension: 92, emotion: { kind: "exhilaration", intensity: 5 }, function: "climax", rationale: "完成总兑现", source: "ai", locked: false },
+], }, { lineWidth: 0 });
 const isCode = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
 
 test("repository enforces hashes, approval, protection, serial chapters and export", async () => {
@@ -25,10 +30,11 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
 
     const opening = await repository.prepareProposal(created.novelId, {
       intent: "确认开书",
-      summary: "写入蓝图和账本",
+      summary: "写入蓝图、账本和张力曲线",
       changes: [
         { operation: "create", path: "book/blueprint.md", content: "# 蓝图\n" },
         { operation: "create", path: "book/ledger.yaml", content: ledger },
+        { operation: "create", path: "book/tension-curve.yaml", content: bookCurve },
       ],
     });
     assert.equal(opening.approval, "author");

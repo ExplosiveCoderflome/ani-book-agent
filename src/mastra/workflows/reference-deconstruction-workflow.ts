@@ -6,10 +6,16 @@ import { z } from "zod";
 import {
   batchAnalysisSchema,
   chapterAnalysisSchema,
+  chapterRangeSchema,
   deconstructionFocusSchema,
   deconstructionModeSchema,
   evidenceSchema,
+  REFERENCE_ANALYSIS_SECTIONS,
+  referenceAnalysisPresetSchema,
+  referenceAnalysisPresetSections,
   referenceAnalysisSchema,
+  referenceAnalysisSectionKeySchema,
+  referenceSectionSchema,
   segmentAnalysisSchema,
   type BatchAnalysis,
   type ChapterAnalysis,
@@ -19,6 +25,7 @@ import {
 import { modelSettings } from "../../infrastructure/model-settings";
 import {
   estimateDeconstruction,
+  referenceChaptersInRange,
   ReferenceRepository,
 } from "../../infrastructure/reference-repository";
 import { deconstructionAgent } from "../agents/deconstruction-agent";
@@ -28,7 +35,7 @@ import {
   structuredOutputOptions,
 } from "../structured-output";
 
-export const DECONSTRUCTION_PROMPT_VERSION = "1";
+export const DECONSTRUCTION_PROMPT_VERSION = "4";
 const repository = new ReferenceRepository();
 const providerOptions = {
   deepseek: { thinking: { type: "disabled" as const } },
@@ -91,7 +98,9 @@ export const referenceWorkflowInputSchema = z.object({
   sourceHash: z.string().length(64),
   manifestHash: z.string().length(64),
   mode: deconstructionModeSchema,
+  preset: referenceAnalysisPresetSchema,
   focuses: z.array(deconstructionFocusSchema),
+  chapterRange: chapterRangeSchema.optional(),
   tokenBudget: z.number().int().min(100_000).max(50_000_000),
   promptVersion: z.literal(DECONSTRUCTION_PROMPT_VERSION),
 });
@@ -113,13 +122,37 @@ const budgetSuspendSchema = z.object({
 const budgetResumeSchema = z.object({ action: z.enum(["continue", "cancel"]) });
 
 const modelEvidenceSchema = z.object({
-  chapterId: z.string(),
-  excerpt: z.string().min(1).max(240),
+  chapterId: z.string().default("__unmatched__"),
+  excerpt: z.string().min(1).max(240).default("未提供可定位证据"),
 });
-const modelChapterSchema = chapterAnalysisSchema
-  .omit({ evidence: true })
-  .extend({ evidence: z.array(modelEvidenceSchema).max(8).default([]) });
-const modelBatchSchema = z.object({
+const modelSceneSchema = z.object({
+  goal: z.string().default("本片段未明确场景目标"),
+  resistance: z.string().default("本片段未明确场景阻力"),
+  turn: z.string().default("本片段未明确场景转折"),
+  outcome: z.string().default("本片段未明确场景结果"),
+});
+const modelThreadSchema = z.object({
+  text: z.string().default("本片段未明确伏笔内容"),
+  action: z.enum(["introduced", "advanced", "resolved"]).default("advanced"),
+});
+const modelCharacterChangeSchema = z.object({
+  name: z.string().default("未明确人物"),
+  before: z.string().optional(),
+  after: z.string().default("本片段未明确交代变化后的状态"),
+  cause: z.string().default("本片段未明确交代变化原因"),
+});
+const modelChapterSchema = chapterAnalysisSchema.omit({ evidence: true, characterChanges: true, endingHook: true, summary: true, scenes: true, causalEvents: true, worldRules: true, threads: true, rewards: true }).extend({
+  summary: z.string().default("本片段未提供摘要"),
+  scenes: z.array(modelSceneSchema).default([]),
+  characterChanges: z.array(modelCharacterChangeSchema).default([]),
+  causalEvents: z.array(z.string()).default([]),
+  worldRules: z.array(z.string()).default([]),
+  threads: z.array(modelThreadSchema).default([]),
+  rewards: z.array(z.string()).default([]),
+  endingHook: z.string().default("本章自然收束，无明确的章末钩子"),
+  evidence: z.array(modelEvidenceSchema).max(8).default([]),
+});
+export const modelBatchSchema = z.object({
   chapters: z.array(modelChapterSchema).min(1),
 });
 const focusModelSchema = z.object({
@@ -127,20 +160,9 @@ const focusModelSchema = z.object({
   mechanisms: z.array(z.string()).max(40),
   evidence: z.array(modelEvidenceSchema).max(20),
 });
-const bookReportSchema = z.object({
-  mechanism: z.string(),
-  marketPromise: z.string(),
-  protagonistEngine: z.string(),
-  structureAndEscalation: z.string(),
-  charactersAndRelationships: z.string(),
-  scenesAndPacing: z.string(),
-  promisesAndPayoffs: z.string(),
-  chapterHooks: z.string(),
-  risks: z.string(),
-  transferableMethods: z.array(z.string()).min(3).max(12),
-  doNotCopy: z.array(z.string()).min(1).max(10),
-  evidenceBoundary: z.string(),
-});
+const modelInsightSchema = z.object({ id: z.string().min(1).max(80), title: z.string().min(1).max(160), mechanism: z.string().min(1), fitFor: z.array(z.string()).min(1).max(6), doNotCopy: z.array(z.string()).min(1).max(6), adaptationHint: z.string().min(1), evidence: z.array(modelEvidenceSchema).max(4).default([]) });
+const modelCandidateSchema = z.object({ name: z.string().min(1), role: z.string().min(1), importance: z.enum(["main", "major", "supporting"]), summary: z.string().min(1), chapterIds: z.array(z.string()).max(60).default([]) });
+const modelSectionSchema = z.object({ summary: z.string().min(1), content: z.string().min(1), structuredData: z.record(z.string(), z.unknown()).default({}), insights: z.array(modelInsightSchema).max(12).default([]), characterCandidates: z.array(modelCandidateSchema).max(30).default([]), evidence: z.array(modelEvidenceSchema).max(20).default([]) });
 
 async function prompt(name: string) {
   const source = await readFile(
@@ -312,6 +334,7 @@ const prepareBatches = createStep({
       manifest,
       inputData.mode,
       inputData.focuses,
+      inputData.chapterRange,
     );
     const required = estimate.inputMax + estimate.outputMax;
     if (
@@ -329,7 +352,7 @@ const prepareBatches = createStep({
       inputData.analysisId,
       inputData.sourceHash,
       inputData.manifestHash,
-      manifest.chapters,
+      referenceChaptersInRange(manifest, inputData.chapterRange),
       18_000,
       source,
     );
@@ -351,11 +374,13 @@ const analyzeBatch = createStep({
       )
       .then((value) => batchAnalysisSchema.safeParse(parse(value)))
       .catch(() => undefined);
+    const sameRanges = (ranges: z.infer<typeof rangeSchema>[]) => JSON.stringify(ranges) === JSON.stringify(inputData.ranges);
     if (
       cached?.success &&
       cached.data.sourceHash === inputData.sourceHash &&
       cached.data.manifestHash === inputData.manifestHash &&
-      cached.data.promptVersion === DECONSTRUCTION_PROMPT_VERSION
+      cached.data.promptVersion === DECONSTRUCTION_PROMPT_VERSION &&
+      sameRanges(cached.data.ranges)
     )
       return cached.data;
     const state = await repository.get(inputData.referenceId);
@@ -376,7 +401,7 @@ const analyzeBatch = createStep({
         )
         .then((value) => batchAnalysisSchema.safeParse(parse(value)))
         .catch(() => undefined);
-      if (!reusable?.success) continue;
+      if (!reusable?.success || !sameRanges(reusable.data.ranges)) continue;
       const reused = batchAnalysisSchema.parse({
         ...reusable.data,
         analysisId: inputData.analysisId,
@@ -687,9 +712,12 @@ const prepareFocus = createStep({
     const latest = (await repository.get(init.referenceId)).analyses.find(
       (item) => item.id === init.analysisId,
     )!;
+    const manifest = await repository.manifest(init.referenceId);
+    const scopedChapters = referenceChaptersInRange(manifest, init.chapterRange);
+    const scopedChars = scopedChapters.reduce((sum, chapter) => sum + chapter.end - chapter.start, 0);
     const expected =
       init.mode === "deep"
-        ? Math.ceil(state.source.chars * 1.3 * init.focuses.length)
+        ? Math.ceil(scopedChars * 1.3 * init.focuses.length)
         : 25_000;
     if (used.inputTokens + used.outputTokens + expected > latest.tokenBudget)
       return suspend({
@@ -699,16 +727,13 @@ const prepareFocus = createStep({
         budget: latest.tokenBudget,
       });
     if (init.mode !== "deep") return [];
-    const [manifest, source] = await Promise.all([
-      repository.manifest(init.referenceId),
-      repository.source(init.referenceId),
-    ]);
+    const source = await repository.source(init.referenceId);
     const batches = makeReferenceBatches(
       init.referenceId,
       init.analysisId,
       init.sourceHash,
       init.manifestHash,
-      manifest.chapters,
+      scopedChapters,
       18_000,
       source,
     );
@@ -772,67 +797,6 @@ const analyzeFocus = createStep({
   },
 });
 
-function reportMarkdown(
-  title: string,
-  report: z.infer<typeof bookReportSchema>,
-  focuses: z.infer<typeof focusResultSchema>[],
-) {
-  const focusText = focuses.length
-    ? [
-        "## 深度专项",
-        ...[...new Set(focuses.map((item) => item.focus))].map(
-          (focus) =>
-            `### ${focus}\n${focuses
-              .filter((item) => item.focus === focus)
-              .map((item) => item.summary)
-              .join("\n")}`,
-        ),
-      ].join("\n\n")
-    : "";
-  return [
-    `# 《${title}》拆书报告`,
-    "",
-    "## 一句话机制判断",
-    report.mechanism,
-    "",
-    "## 核心阅读承诺",
-    report.marketPromise,
-    "",
-    "## 主角行动引擎",
-    report.protagonistEngine,
-    "",
-    "## 结构与升级",
-    report.structureAndEscalation,
-    "",
-    "## 人物与关系",
-    report.charactersAndRelationships,
-    "",
-    "## 场景与节奏",
-    report.scenesAndPacing,
-    "",
-    "## 伏笔与兑现",
-    report.promisesAndPayoffs,
-    "",
-    "## 章节钩子",
-    report.chapterHooks,
-    "",
-    "## 主要风险",
-    report.risks,
-    "",
-    "## 可迁移方法",
-    ...report.transferableMethods.map((item) => `- ${item}`),
-    "",
-    "## 不应复制",
-    ...report.doNotCopy.map((item) => `- ${item}`),
-    "",
-    "## 证据与推断边界",
-    report.evidenceBoundary,
-    "",
-    focusText,
-    "",
-  ].join("\n");
-}
-
 const finalize = createStep({
   id: "finalize-reference-analysis",
   inputSchema: z.array(focusResultSchema),
@@ -866,10 +830,11 @@ const finalize = createStep({
       current.outputTokens +
       focusUsage.inputTokens +
       focusUsage.outputTokens;
-    if (baseUsed + 50_000 > current.tokenBudget)
+    const finalReserve = current.sectionKeys.length * 12_000;
+    if (baseUsed + finalReserve > current.tokenBudget)
       return suspend({
         reason: "budget",
-        required: baseUsed + 50_000,
+        required: baseUsed + finalReserve,
         used: baseUsed,
         budget: current.tokenBudget,
       });
@@ -893,70 +858,42 @@ const finalize = createStep({
       ),
     );
     const settings = await selectedSettings(10_000);
-    const request = `${await prompt("book")}\n\n参考书：${state.title}\n\n${segments.join("\n\n")}${inputData.length ? `\n\n专项结果：\n${JSON.stringify(inputData)}` : ""}`;
-    const generated = await generateWithGuard("生成全书拆解", (abortSignal) =>
-      deconstructionAgent.generate(request, {
-        abortSignal,
-        ...structuredOutputOptions(bookReportSchema),
-        providerOptions,
-        modelSettings: settings,
-      }),
-    );
-    const draft = requireStructuredOutput(
-      bookReportSchema,
-      generated.object,
-      "全书拆解",
-    );
-    const evidence = segments
-      .flatMap((value) => segmentAnalysisSchema.parse(parse(value)).evidence)
-      .slice(0, 40);
-    const verifiedSource = await Promise.all(
-      evidence.map((item) =>
-        repository.sourceSlice(init.referenceId, item.start, item.end),
-      ),
-    );
-    const verifyRequest = `${await prompt("verify")}\n\n阶段证据：\n${segments.join("\n\n")}\n\n按偏移复读的原文证据：\n${verifiedSource.map((item) => `OFFSET ${item.start}-${item.end}: ${item.content}`).join("\n")}\n\n待复核报告：\n${JSON.stringify(draft)}`;
-    const verifiedResult = await generateWithGuard(
-      "复核拆书证据",
-      (abortSignal) =>
-        deconstructionAgent.generate(verifyRequest, {
-          abortSignal,
-          ...structuredOutputOptions(bookReportSchema),
-          providerOptions,
-          modelSettings: settings,
-        }),
-    );
-    const verified = requireStructuredOutput(
-      bookReportSchema,
-      verifiedResult.object,
-      "拆书证据复核",
-    );
-    const finalUsage = addUsage([
-      focusUsage,
-      usage(generated, request, draft),
-      usage(verifiedResult, verifyRequest, verified),
-    ]);
+    const manifest = await repository.manifest(init.referenceId);
+    const ranges = referenceChaptersInRange(manifest, init.chapterRange).map((item) => ({ chapterId: item.id, title: item.title, start: item.start, end: item.end }));
+    const source = await repository.source(init.referenceId);
+    const context = `参考书：${state.title}\n分析范围：${init.chapterRange ? `第 ${init.chapterRange.fromChapter}–${init.chapterRange.toChapter} 章` : "全书"}\n\n阶段事实：\n${segments.join("\n\n")}${inputData.length ? `\n\n专项扫描：\n${JSON.stringify(inputData)}` : ""}`;
+    const makeSection = async (key: z.infer<typeof referenceAnalysisSectionKeySchema>, overview?: unknown) => {
+      const request = `${await prompt("section")}\n\n当前小节：${key}\n${context}${overview ? `\n\n拆书总览：\n${JSON.stringify(overview)}` : ""}`;
+      const generated = await generateWithGuard(`生成拆书小节 ${key}`, (abortSignal) => deconstructionAgent.generate(request, { abortSignal, ...structuredOutputOptions(modelSectionSchema), providerOptions, modelSettings: settings }));
+      const draft = requireStructuredOutput(modelSectionSchema, generated.object, `拆书小节 ${key}`);
+      const evidence = validateEvidence(draft.evidence, ranges, source);
+      const insights = draft.insights.map((item) => ({ ...item, evidence: validateEvidence(item.evidence, ranges, source) }));
+      const title = REFERENCE_ANALYSIS_SECTIONS.find((item) => item.key === key)?.title ?? key;
+      return { section: referenceSectionSchema.parse({ version: 1, key, title, summary: draft.summary, content: draft.content, structuredData: draft.structuredData, evidence, insights, characterCandidates: key === "character_system" ? draft.characterCandidates : [], createdAt: new Date().toISOString() }), usage: usage(generated, request, draft) };
+    };
+    const overviewResult = await makeSection("overview");
+    const remaining = current.sectionKeys.filter((key) => key !== "overview");
+    const generatedSections = await Promise.all(remaining.map((key) => makeSection(key, overviewResult.section.structuredData)));
+    const allSections = [overviewResult.section, ...generatedSections.map((item) => item.section)];
+    await Promise.all(allSections.map((section) => repository.writeAnalysisFile(init.referenceId, init.analysisId, `sections/${section.key}.yaml`, stringify(section, { lineWidth: 0 }))));
+    const finalUsage = addUsage([focusUsage, overviewResult.usage, ...generatedSections.map((item) => item.usage)]);
     const inputTokens = current.inputTokens + finalUsage.inputTokens;
     const outputTokens = current.outputTokens + finalUsage.outputTokens;
-    const reportPath = "report.md";
-    await repository.writeAnalysisFile(
-      init.referenceId,
-      init.analysisId,
-      reportPath,
-      reportMarkdown(state.title, verified, inputData),
-    );
+    const reportPath = "index.yaml";
     await repository.writeAnalysisFile(
       init.referenceId,
       init.analysisId,
       "index.yaml",
       stringify(
         {
-          version: 1,
+          version: 2,
           referenceId: init.referenceId,
           analysisId: init.analysisId,
-          chapterCount: (await repository.manifest(init.referenceId)).chapters
-            .length,
+          chapterCount: referenceChaptersInRange(await repository.manifest(init.referenceId), init.chapterRange).length,
+          chapterRange: init.chapterRange,
           segmentCount: segmentFiles.length,
+          preset: current.preset,
+          sectionKeys: current.sectionKeys,
           inputTokens,
           outputTokens,
           usageEstimated: current.usageEstimated || finalUsage.estimated,

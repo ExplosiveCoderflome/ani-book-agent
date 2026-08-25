@@ -52,12 +52,12 @@ export const readSkillTool = createTool({
 
 export const readReferenceTool = createTool({
   id: "read_reference",
-  description: "读取已完成的全局拆书报告、阶段或章节分析，用于把抽象方法应用到当前作品。只读且有界；不得将参考书专有事实写入当前作品账本。",
-  inputSchema: z.object({ referenceId: z.string().uuid(), analysisId: z.string(), kind: z.enum(["report", "segment", "chapter"]), id: z.string().max(120).optional() }),
+  description: "读取已完成的拆书小节、角色档案、阶段或章节分析，用于把抽象方法应用到当前作品。只读且有界；不得将参考书专有事实写入当前作品账本。",
+  inputSchema: z.object({ referenceId: z.string().uuid(), analysisId: z.string(), kind: z.enum(["section", "character", "segment", "chapter"]), id: z.string().min(1).max(240) }),
   outputSchema: z.union([z.object({ ok: z.literal(true), referenceId: z.string(), analysisId: z.string(), kind: z.string(), content: z.string() }), failedSchema]),
   execute: async (input) => { try {
     const state = await references.get(input.referenceId); const analysis = state.analyses.find((item) => item.id === input.analysisId && item.status === "completed"); if (!analysis) throw new AppError("REFERENCE_ANALYSIS_NOT_FOUND", "没有找到已完成的拆书结果。", 404, true, undefined, "reread");
-    const relative = input.kind === "report" ? analysis.reportPath ?? "report.md" : input.kind === "segment" ? `segments/${input.id}.yaml` : `chapters/${input.id}.yaml`;
+    const relative = input.kind === "section" ? `sections/${input.id}.yaml` : input.kind === "character" ? `characters/${encodeURIComponent(input.id)}.yaml` : input.kind === "segment" ? `segments/${input.id}.yaml` : `chapters/${input.id}.yaml`;
     return { ok: true as const, referenceId: input.referenceId, analysisId: input.analysisId, kind: input.kind, content: await references.readAnalysisFile(input.referenceId, input.analysisId, relative, 40_000) };
   } catch (error) { return failure(error); } },
 });

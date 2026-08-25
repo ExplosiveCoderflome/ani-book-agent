@@ -4,8 +4,10 @@ import path from "node:path";
 import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
 import {
-  ledgerSchema, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
-  type CriticResult, type NovelLedger, type NovelState, type PatchProposal,
+  actualTensionCurveSchema, actualTensionPath, bookTensionCurveSchema, diagnoseTension, isTargetTensionCurvePath, isTensionCurvePath,
+  ledgerSchema, lockedPointChanges, markAuthorEdits, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
+  targetTensionCurveSchema, tensionCurveAssetSchema, volumeTensionCurveSchema, volumeTensionPath,
+  type CriticResult, type NovelLedger, type NovelState, type PatchProposal, type TargetTensionCurve,
 } from "../domain";
 import { AppError } from "../application/errors";
 import type { FileContent, NovelFileView, NovelSummary } from "../shared/contracts";
@@ -114,10 +116,11 @@ export class NovelRepository {
   }
 
   async prepareProposal(novelId: string, input: { intent: string; summary: string; changes: PatchProposal["changes"] }): Promise<PatchProposal> {
-    const changes = input.changes.map((change) => ({ ...change, path: normalizePath(change.path) }));
+    const changes = await this.normalizeCurveBasis(novelId, input.changes.map((change) => ({ ...change, path: normalizePath(change.path) })));
     await Promise.all(changes.filter((change) => change.operation === "replace").map((change) => this.readProjectFile(novelId, change.path, 0, 1)));
     const state = await this.get(novelId);
     this.validateChanges(state, changes);
+    await this.validateLockedCurveChanges(novelId, changes);
     return patchProposalSchema.parse({ id: randomUUID(), novelId, intent: input.intent, summary: input.summary, changes, approval: patchApproval(state, changes), status: "pending", createdAt: new Date().toISOString() });
   }
 
@@ -127,6 +130,7 @@ export class NovelRepository {
     let state = await this.get(proposal.novelId);
     if (state.appliedProposalIds.includes(proposal.id)) return { proposal: { ...proposal, status: "applied" }, state, duplicate: true };
     this.validateChanges(state, proposal.changes);
+    await this.validateLockedCurveChanges(proposal.novelId, proposal.changes);
     const approval = patchApproval(state, proposal.changes);
     if (approval === "author" && !authorApproved) throw new AppError("AUTHOR_APPROVAL_REQUIRED", "这次修改需要作者确认。", 409, true, undefined, "author_approval");
     const backups = new Map<string, string | undefined>();
@@ -149,7 +153,7 @@ export class NovelRepository {
       const prior = state.files[change.path];
       state.files[change.path] = { sha256: sha256(change.content), version: (prior?.version ?? 0) + 1, source: prior?.source === "author" ? "author" : "agent", protected: Boolean(prior?.protected), updatedAt: now };
     }
-    if (state.files["book/blueprint.md"] && state.files["book/ledger.yaml"] && state.phase === "discovery") state.phase = "writing";
+    if (state.files["book/blueprint.md"] && state.files["book/ledger.yaml"] && state.files["book/tension-curve.yaml"] && state.phase === "discovery") state.phase = "writing";
     state.appliedProposalIds = [...state.appliedProposalIds.slice(-199), proposal.id];
     updateState?.(state);
     state.updatedAt = now;
@@ -164,9 +168,19 @@ export class NovelRepository {
     const current = state.files[clean];
     if (!current) throw new AppError("FILE_NOT_FOUND", "没有找到这个作品文件。", 404, false);
     if (current.sha256 !== expectedSha256) throw new AppError("FILE_STALE", "文件已变化，请重新读取后再保存。", 409, true, undefined, "reread");
-    await atomicWrite(this.filePath(novelId, clean), content);
+    let savedContent = content;
+    if (isTargetTensionCurvePath(clean)) {
+      try {
+        const before = targetTensionCurveSchema.parse(parse((await this.readProjectFile(novelId, clean, 0, textLimit)).content));
+        const after = targetTensionCurveSchema.parse(parse(content));
+        savedContent = stringify(markAuthorEdits(before, after), { lineWidth: 0 });
+      } catch (error) { throw curveError(error); }
+    } else if (isTensionCurvePath(clean)) {
+      throw new AppError("ACTUAL_CURVE_READ_ONLY", "实际张力曲线由 Critic 维护，不能手工编辑。", 409, false);
+    }
+    await atomicWrite(this.filePath(novelId, clean), savedContent);
     const now = new Date().toISOString();
-    state.files[clean] = { sha256: sha256(content), version: current.version + 1, source: "author", protected: true, updatedAt: now };
+    state.files[clean] = { sha256: sha256(savedContent), version: current.version + 1, source: "author", protected: true, updatedAt: now };
     state.updatedAt = now;
     await this.writeState(state);
     return this.readProjectFile(novelId, clean);
@@ -178,7 +192,7 @@ export class NovelRepository {
     return ledgerSchema.parse(parse((await this.readProjectFile(novelId, "book/ledger.yaml", 0, textLimit)).content));
   }
 
-  async commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof mergeLedger>[2], newCharacterProfiles: CriticResult["newCharacterProfiles"] = []) {
+  async commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof mergeLedger>[2], newCharacterProfiles: CriticResult["newCharacterProfiles"] = [], actualTension?: CriticResult["actualTension"]) {
     const state = await this.get(novelId);
     if (state.nextChapter !== chapter) throw new AppError("CHAPTER_SEQUENCE", `当前应提交第 ${state.nextChapter} 章。`, 409, false);
     const ledger = mergeLedger(await this.readLedger(novelId), chapter, delta);
@@ -188,6 +202,26 @@ export class NovelRepository {
       { operation: state.files["book/ledger.yaml"] ? "replace" : "create", path: "book/ledger.yaml", ...(state.files["book/ledger.yaml"] ? { baseSha256: state.files["book/ledger.yaml"]!.sha256 } : {}), content: stringify(ledger, { lineWidth: 0 }) },
       ...newCharacterProfiles.filter((profile) => !state.files[`book/characters/${profile.id}.md`]).map((profile) => ({ operation: "create" as const, path: `book/characters/${profile.id}.md`, content: profile.content })),
     ];
+    const targetPath = volumeTensionPath(state.currentVolume);
+    const planPath = `volumes/volume-${String(state.currentVolume).padStart(3, "0")}.md`;
+    if (actualTension && state.files[targetPath] && state.files[planPath]) {
+      const [targetFile, existingActual] = await Promise.all([
+        this.readProjectFile(novelId, targetPath, 0, textLimit),
+        state.files[actualTensionPath(state.currentVolume)] ? this.readProjectFile(novelId, actualTensionPath(state.currentVolume), 0, textLimit) : undefined,
+      ]);
+      const target = volumeTensionCurveSchema.parse(parse(targetFile.content));
+      const matchedEvidence = actualTension.evidence.filter((excerpt) => normalizedForEvidence(text).includes(normalizedForEvidence(excerpt)));
+      const observation = matchedEvidence.length ? { ...actualTension, evidence: matchedEvidence } : { ...actualTension, evidence: ["正文证据未能精确定位；该观察仅供走势参考。"], confidence: Math.min(actualTension.confidence, .35) };
+      const prior = existingActual ? actualTensionCurveSchema.parse(parse(existingActual.content)) : undefined;
+      const points = [...(prior?.points.filter((point) => point.chapter !== chapter) ?? []), { id: `chapter-${String(chapter).padStart(3, "0")}`, chapter, ...observation }].sort((left, right) => left.chapter - right.chapter);
+      const actualPath = actualTensionPath(state.currentVolume);
+      const actual = actualTensionCurveSchema.parse({
+        schemaVersion: 1, kind: "actual", volume: state.currentVolume,
+        basis: { targetCurveSha256: targetFile.sha256, volumePlanSha256: state.files[planPath]!.sha256, chapterHashes: { ...(prior?.basis.chapterHashes ?? {}), [String(chapter)]: sha256(text) }, generatedAt: new Date().toISOString() },
+        points, diagnostics: diagnoseTension(points, target.points),
+      });
+      changes.push({ operation: state.files[actualPath] ? "replace" : "create", path: actualPath, ...(state.files[actualPath] ? { baseSha256: state.files[actualPath]!.sha256 } : {}), content: stringify(actual, { lineWidth: 0 }) });
+    }
     const proposal = await this.prepareProposal(novelId, { intent: `提交第 ${chapter} 章`, summary: `稳定提交第 ${chapter} 章与连续性`, changes });
     const result = await this.applyProposal({ ...proposal, approval: "auto" }, true, (next) => { next.nextChapter = chapter + 1; });
     return { state: result.state, path: chapterPath, sha256: result.state.files[chapterPath]!.sha256 };
@@ -243,10 +277,60 @@ export class NovelRepository {
           throw new AppError("LEDGER_INVALID", `账本内容不符合结构化合同：${detail}`, 400, true, undefined, "retry");
         }
       }
+      if (isTensionCurvePath(change.path)) {
+        try {
+          const asset = tensionCurveAssetSchema.parse(parse(change.content));
+          if (change.path === "book/tension-curve.yaml" && asset.kind !== "book") throw new Error("资产类型与路径不匹配");
+          if (/^volumes\/volume-\d{3}-tension\.yaml$/.test(change.path) && asset.kind !== "volume") throw new Error("资产类型与路径不匹配");
+          if (/tension-actual\.yaml$/.test(change.path) && asset.kind !== "actual") throw new Error("资产类型与路径不匹配");
+          const pathVolume = Number(change.path.match(/volume-(\d{3})-tension/)?.[1]);
+          if (Number.isFinite(pathVolume) && "volume" in asset && asset.volume !== pathVolume) throw new Error("资产卷号与文件路径不匹配");
+        } catch (error) { throw curveError(error); }
+      }
     }
     const opensBook = changes.some((change) => change.path === "book/blueprint.md");
     const suppliesLedger = Boolean(state.files["book/ledger.yaml"]) || changes.some((change) => change.path === "book/ledger.yaml");
     if (opensBook && !suppliesLedger) throw new AppError("LEDGER_REQUIRED", "确认作品蓝图时必须在同一提案中提交连续性账本。", 400, true, undefined, "retry");
+    const suppliesCurve = Boolean(state.files["book/tension-curve.yaml"]) || changes.some((change) => change.path === "book/tension-curve.yaml");
+    if (opensBook && !suppliesCurve) throw new AppError("TENSION_CURVE_REQUIRED", "确认作品蓝图时必须在同一提案中提交全书张力曲线。", 400, true, undefined, "retry");
+  }
+
+  private async validateLockedCurveChanges(novelId: string, changes: PatchProposal["changes"]) {
+    for (const change of changes.filter((item) => item.operation === "replace" && isTargetTensionCurvePath(item.path))) {
+      const before = targetTensionCurveSchema.parse(parse((await this.readProjectFile(novelId, change.path, 0, textLimit)).content));
+      const after = targetTensionCurveSchema.parse(parse(change.content));
+      const changed = lockedPointChanges(before, after);
+      if (changed.length && !change.overrideLockedNodes) throw new AppError("LOCKED_TENSION_NODES", `AI 提案不能修改作者锁定节点：${changed.join("、")}。如需整条替换，必须明确请求覆盖锁定节点并由作者批准。`, 409, true, undefined, "author_approval");
+    }
+  }
+
+  private async normalizeCurveBasis(novelId: string, raw: PatchProposal["changes"]): Promise<PatchProposal["changes"]> {
+    const state = await this.get(novelId);
+    const blueprint = raw.find((change) => change.path === "book/blueprint.md")?.content;
+    const rawBookCurve = raw.find((change) => change.path === "book/tension-curve.yaml")?.content;
+    let bookCurve = rawBookCurve;
+    if (rawBookCurve) {
+      try {
+        const parsed = bookTensionCurveSchema.parse(parse(rawBookCurve));
+        parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
+        bookCurve = stringify(parsed, { lineWidth: 0 });
+      } catch (error) { throw curveError(error); }
+    }
+    return raw.map((change) => {
+      if (!isTargetTensionCurvePath(change.path)) return change;
+      try {
+        if (change.path === "book/tension-curve.yaml" && bookCurve) return { ...change, content: bookCurve };
+        const parsed = targetTensionCurveSchema.parse(parse(change.content)) as TargetTensionCurve;
+        if (parsed.kind === "volume") {
+          const planPath = `volumes/volume-${String(parsed.volume).padStart(3, "0")}.md`;
+          const plan = raw.find((item) => item.path === planPath)?.content;
+          parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
+          parsed.basis.bookCurveSha256 = bookCurve ? sha256(bookCurve) : state.files["book/tension-curve.yaml"]?.sha256 ?? parsed.basis.bookCurveSha256;
+          parsed.basis.volumePlanSha256 = plan ? sha256(plan) : state.files[planPath]?.sha256 ?? parsed.basis.volumePlanSha256;
+        } else parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
+        return { ...change, content: stringify(parsed, { lineWidth: 0 }) };
+      } catch (error) { throw curveError(error); }
+    });
   }
 
   private async writeState(state: NovelState) { await atomicWrite(this.statePath(state.novelId), stringify(novelStateSchema.parse(state), { lineWidth: 0 })); }
@@ -261,3 +345,8 @@ function normalizePath(value: string) {
   catch { throw new AppError("INVALID_NOVEL_PATH", "作品文件路径无效。", 400, false); }
 }
 function safeFileName(value: string) { return value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim().slice(0, 80) || "novel"; }
+function normalizedForEvidence(value: string) { return value.toLocaleLowerCase("zh-CN").replace(/[^\p{L}\p{N}]+/gu, ""); }
+function curveError(error: unknown) {
+  const detail = error instanceof ZodError ? error.issues.slice(0, 6).map((issue) => `${issue.path.join(".") || "根节点"}: ${issue.message}`).join("；") : error instanceof Error ? error.message : "YAML 无法解析";
+  return new AppError("TENSION_CURVE_INVALID", `张力曲线不符合结构化合同：${detail}`, 400, true, undefined, "retry");
+}

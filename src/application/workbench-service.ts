@@ -44,7 +44,7 @@ export async function jobView(novelId: string, jobId: string): Promise<Productio
   const now = new Date().toISOString();
   return productionJobSchema.parse({
     id: jobId, novelId, goal: payload.goal ?? "write_chapters", scope: payload.scope ?? {}, brief: payload.brief, status: status(state.status),
-    cursor: typeof suspended?.chapter === "number" ? suspended.chapter : undefined, baseStateHash: payload.baseStateHash ?? novelStateHash(await novelRepository.get(novelId)),
+    cursor: typeof suspended?.chapter === "number" ? suspended.chapter : undefined, checkpoint: suspended?.checkpoint === "curve_confirmation" ? "curve_confirmation" : suspended ? "chapter_review" : undefined, baseStateHash: payload.baseStateHash ?? novelStateHash(await novelRepository.get(novelId)),
     resultPath: typeof result.reportPath === "string" ? result.reportPath : typeof result.exportPath === "string" ? result.exportPath : undefined,
     error: state.status === "failed" ? { code: "JOB_FAILED", message: sanitizeProviderError(state.error?.message ?? "生产任务失败"), recoverable: true } : undefined,
     createdAt: typeof state.createdAt === "string" ? state.createdAt : now, updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : now,
@@ -70,6 +70,7 @@ export async function startProductionJob(novelId: string, input: ProductionJobRe
       await novelRepository.setActiveJob(novelId, undefined);
     }
     if (input.goal === "write_chapters" && (state.phase !== "writing" || !state.files["book/blueprint.md"] || !state.files["book/ledger.yaml"])) throw new AppError("BLUEPRINT_INCOMPLETE", "作品蓝图或连续性账本尚未准备完整，请让 Agent 补齐后再开始写作。", 409, true, undefined, "author_approval");
+    if (input.goal === "write_chapters" && !state.files["book/tension-curve.yaml"]) throw new AppError("TENSION_CURVE_REQUIRED", "这部旧作品还没有全书张力曲线。请先让 Agent 生成曲线并确认，再开始下一次卷规划或章节生产。", 409, true, undefined, "author_approval");
     const run = await novelProductionWorkflow.createRun({ resourceId: novelId });
     const skillVersions = Object.fromEntries((await Promise.all([
       skillRegistry.resolveForAgent(novelId, "novel-agent"), skillRegistry.resolveForAgent(novelId, "novel-critic"),
@@ -77,7 +78,7 @@ export async function startProductionJob(novelId: string, input: ProductionJobRe
     const createdAt = new Date().toISOString();
     const activeState = await novelRepository.setActiveJob(novelId, run.runId);
     const baseStateHash = novelStateHash(activeState);
-    void run.start({ inputData: { novelId, jobId: run.runId, goal: input.goal, scope: input.scope, brief: input.brief, baseStateHash, skillVersions } })
+    void run.start({ inputData: { novelId, jobId: run.runId, goal: input.goal, scope: input.scope, brief: input.brief, baseStateHash, skillVersions, tensionCurveRequired: true } })
       .catch((error) => { console.warn("小说生产任务失败", { runId: run.runId, message: sanitizeProviderError(error) }); });
     return productionJobSchema.parse({ id: run.runId, novelId, goal: input.goal, scope: input.scope, brief: input.brief, status: "running", baseStateHash, createdAt, updatedAt: createdAt });
   } finally { starting.delete(novelId); }

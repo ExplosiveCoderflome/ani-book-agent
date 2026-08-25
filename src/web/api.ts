@@ -1,4 +1,4 @@
-import type { DeconstructionFocus, DeconstructionMode, FileContent, ModelProfileName, NovelFileView, NovelSummary, PatchProposal, ProductionJob, ProductionJobRequest, ProjectSnapshot, ProviderCatalogItem, ReferenceAnalysisView, ReferenceDetailView, ReferenceJob, ReferenceState, SkillBindingsView, SkillDraftView, SkillRecordView, SkillSandboxView, SkillValidationView, SkillVersionView, TokenEstimate } from "../shared/contracts";
+import type { ChapterParserConfig, ChapterPatternSuggestion, ChapterRange, DeconstructionFocus, DeconstructionMode, FileContent, ModelProfileName, NovelFileView, NovelSummary, PatchProposal, ProductionJob, ProductionJobRequest, ProjectSnapshot, ProviderCatalogItem, ReferenceAnalysisPreset, ReferenceAnalysisView, ReferenceCharacterProfile, ReferenceDetailView, ReferenceJob, ReferenceSection, ReferenceState, SkillBindingsView, SkillDraftView, SkillRecordView, SkillSandboxView, SkillValidationView, SkillVersionView, TokenEstimate } from "../shared/contracts";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...(init?.headers ?? {}) } });
@@ -21,14 +21,21 @@ export const api = {
   createNovel: (title: string) => request<{ novelId: string }>("/workbench-api/novels", json({ title })),
   references: () => request<{ references: ReferenceState[] }>("/workbench-api/references"),
   reference: (id: string) => request<ReferenceDetailView>(`/workbench-api/references/${id}`),
-  importReference: (file: File, title: string, rightsConfirmed: boolean) => { const form = new FormData(); form.set("file", file); form.set("title", title); form.set("rightsConfirmed", String(rightsConfirmed)); return request<{ state: ReferenceState; manifest: ReferenceDetailView["manifest"]; duplicate: boolean }>("/workbench-api/references/import", { method: "POST", body: form }); },
+  importReference: (file: File, title: string) => { const form = new FormData(); form.set("file", file); form.set("title", title); return request<{ state: ReferenceState; manifest: ReferenceDetailView["manifest"]; duplicate: boolean }>("/workbench-api/references/import", { method: "POST", body: form }); },
+  rebuildReferenceManifest: (id: string) => request<Pick<ReferenceDetailView, "state" | "manifest">>(`/workbench-api/references/${id}/manifest/rebuild`, { method: "POST" }),
+  saveReferenceParser: (id: string, parser: ChapterParserConfig) => request<Pick<ReferenceDetailView, "state" | "manifest" | "parser">>(`/workbench-api/references/${id}/parser`, { method: "PUT", body: JSON.stringify(parser) }),
+  suggestReferencePattern: (id: string, sample: string) => request<ChapterPatternSuggestion>(`/workbench-api/references/${id}/parser/suggest`, json({ sample })),
   confirmReference: (id: string, manifestHash: string) => request<ReferenceDetailView>(`/workbench-api/references/${id}/manifest`, { method: "PUT", body: JSON.stringify({ manifestHash }) }),
   deleteReference: (id: string) => request<{ deleted: true }>(`/workbench-api/references/${id}`, { method: "DELETE" }),
-  estimateReference: (id: string, mode: DeconstructionMode, focuses: DeconstructionFocus[]) => request<TokenEstimate>(`/workbench-api/references/${id}/estimate`, json({ mode, focuses })),
-  startReferenceJob: (id: string, value: { mode: DeconstructionMode; focuses: DeconstructionFocus[]; manifestHash: string; tokenBudget: number }) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs`, json(value)),
+  clearReferenceAnalyses: (id: string) => request<{ state: ReferenceState }>(`/workbench-api/references/${id}/analyses`, { method: "DELETE" }),
+  estimateReference: (id: string, mode: DeconstructionMode, focuses: DeconstructionFocus[], chapterRange?: ChapterRange, preset: ReferenceAnalysisPreset = "standard") => request<TokenEstimate>(`/workbench-api/references/${id}/estimate`, json({ preset, mode, focuses, chapterRange })),
+  startReferenceJob: (id: string, value: { preset: ReferenceAnalysisPreset; mode?: DeconstructionMode; focuses?: DeconstructionFocus[]; chapterRange?: ChapterRange; manifestHash: string; tokenBudget: number }) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs`, json(value)),
   referenceJob: (id: string, jobId: string) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs/${jobId}`),
   referenceJobAction: (id: string, jobId: string, value: { action: "continue" | "add_budget" | "cancel"; additionalTokens?: number }) => request<ReferenceJob>(`/workbench-api/references/${id}/jobs/${jobId}/actions`, json(value)),
   referenceAnalysis: (id: string, analysisId: string) => request<ReferenceAnalysisView>(`/workbench-api/references/${id}/analyses/${analysisId}`),
+  referenceSection: (id: string, analysisId: string, key: string) => request<ReferenceSection>(`/workbench-api/references/${id}/analyses/${analysisId}/sections/${key}`),
+  referenceCharacter: (id: string, analysisId: string, name: string) => request<ReferenceCharacterProfile>(`/workbench-api/references/${id}/analyses/${analysisId}/characters/${encodeURIComponent(name)}`),
+  startReferenceCharacter: (id: string, analysisId: string, name: string) => request<{ id: string; name: string; status: "generating" }>(`/workbench-api/references/${id}/analyses/${analysisId}/characters`, json({ name })),
   referenceSegment: (id: string, analysisId: string, segmentId: string) => request<{ content: string }>(`/workbench-api/references/${id}/analyses/${analysisId}/segments/${segmentId}`),
   referenceChapter: (id: string, analysisId: string, chapterId: string) => request<{ content: string }>(`/workbench-api/references/${id}/analyses/${analysisId}/chapters/${chapterId}`),
   referenceSource: (id: string, start: number, end: number) => request<{ start: number; end: number; content: string }>(`/workbench-api/references/${id}/source?start=${start}&end=${end}`),

@@ -1,6 +1,6 @@
 import type { MastraDBMessage } from "@mastra/core/agent";
 import { MessageFactory } from "@mastra/react/ui";
-import type { DynamicToolPart, MessageRenderers, TextPart, ToolInvocationPart } from "@mastra/react/ui";
+import type { DynamicToolPart, MessageRenderers, ReasoningPart, TextPart, ToolInvocationPart } from "@mastra/react/ui";
 import { Check, ChevronDown, CircleAlert, LoaderCircle, Wrench } from "lucide-react";
 import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
@@ -24,6 +24,7 @@ export const errorText = (value: unknown): string => {
 };
 
 function TextView({ part }: { part: TextPart }) { return <div className="message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{part.text}</ReactMarkdown></div>; }
+function ReasoningView({ part }: { part: ReasoningPart }) { const streaming = part.state === "streaming"; return <details className={`reasoning ${streaming ? "streaming" : ""}`} open><summary><LoaderCircle className={streaming ? "spin" : ""} size={13} />{streaming ? "思考中" : "思考过程"}</summary><pre>{part.reasoning}</pre></details>; }
 function ToolCard({ name, input, output, state }: { name: string; input: unknown; output: unknown; state?: string }) {
   if (name === "present_choices" || name === "presentChoicesTool") return null;
   const error = record(output) && output.ok === false && record(output.error) ? output.error : undefined;
@@ -48,7 +49,7 @@ export function hasRenderableMessage(message: MastraDBMessage) { return message.
 export function StudioMessage({ message }: { message: MastraDBMessage }) {
   const renderers = useMemo<MessageRenderers>(() => ({
     Text: (part) => <TextView part={part} />,
-    Reasoning: (part) => <details className="reasoning"><summary><LoaderCircle size={13} />思考过程</summary><p>{text("text" in part ? part.text : "reasoning" in part ? part.reasoning : "")}</p></details>,
+    Reasoning: (part) => <ReasoningView part={part} />,
     ToolInvocation: (part) => <ToolInvocation part={part} />,
     DynamicTool: (part) => <DynamicTool part={part} />,
     File: (part) => <div className="file-part">{text("filename" in part ? part.filename : "附件")}</div>,
