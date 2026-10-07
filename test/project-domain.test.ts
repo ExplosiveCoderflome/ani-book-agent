@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { availableOperations, ledgerSchema, mergeLedger, newNovelState, normalizeNovelPath, patchApproval } from "../src/domain";
+import { availableOperations, characterProfileContentSchema, hasDefinedCharacterAppearance, isAutonomousOpeningBundle, ledgerSchema, mergeLedger, newNovelState, normalizeNovelPath, patchApproval } from "../src/domain";
 
 test("schema v2 accepts only whitelisted novel files", () => {
   assert.equal(normalizeNovelPath("chapters/chapter-001.md"), "chapters/chapter-001.md");
@@ -18,6 +18,27 @@ test("domain protects blueprint and author-owned files", () => {
   assert.equal(patchApproval(state, [{ operation: "replace", path: "chapters/chapter-001.md", baseSha256: "a".repeat(64), content: "修订" }]), "author");
 });
 
+test("autonomous opening only auto-approves one complete create-only bundle", () => {
+  const state = newNovelState("全自动测试", randomUUID(), new Date().toISOString(), "autonomous_opening");
+  const bundle = [
+    { operation: "create" as const, path: "book/blueprint.md", content: "蓝图" },
+    { operation: "create" as const, path: "book/ledger.yaml", content: "账本" },
+    { operation: "create" as const, path: "book/tension-curve.yaml", content: "曲线" },
+    { operation: "create" as const, path: "book/characters/hero.md", content: "角色" },
+  ];
+  assert.equal(isAutonomousOpeningBundle(state, bundle), true);
+  assert.equal(patchApproval(state, bundle), "auto");
+  assert.equal(patchApproval(state, bundle.slice(0, 3)), "author");
+  assert.equal(patchApproval(state, [...bundle, { operation: "create", path: "workspace/notes.md", content: "越界" }]), "author");
+});
+
+test("new character profiles require a concrete appearance field", () => {
+  const prefix = "# 沈知微\n\n> 角色 ID：hero\n\n- 叙事功能：替嫁新娘，负责推动信息差博弈。\n";
+  assert.equal(hasDefinedCharacterAppearance(`${prefix}- 外貌与辨识特征：眉尾有一道浅痕，常穿素青窄袖衣，观察时会轻捻袖口。\n`), true);
+  assert.equal(characterProfileContentSchema.safeParse(`${prefix}- 外貌与辨识特征：待确认\n`).success, false);
+  assert.equal(characterProfileContentSchema.safeParse(`${prefix}- 行为与声音：表面温顺，实则冷静。\n`).success, false);
+});
+
 test("availability is phase-based and one active job blocks production", () => {
   const state = newNovelState("测试书", randomUUID());
   assert.deepEqual(availableOperations(state).allowedOperations, ["propose_blueprint", "review_project"]);
@@ -25,7 +46,7 @@ test("availability is phase-based and one active job blocks production", () => {
   assert.ok(availableOperations(state).allowedOperations.includes("write_chapters"));
   assert.ok(availableOperations(state).allowedOperations.includes("review_project"));
   const now = new Date().toISOString();
-  const active = { id: "job-1", novelId: state.novelId, goal: "write_chapters" as const, scope: {}, status: "running" as const, baseStateHash: "b".repeat(64), createdAt: now, updatedAt: now };
+  const active = { id: "job-1", novelId: state.novelId, goal: "write_chapters" as const, scope: {}, status: "running" as const, interactionMode: "standard" as const, attempt: 1, baseStateHash: "b".repeat(64), createdAt: now, updatedAt: now };
   assert.deepEqual(availableOperations(state, active).allowedOperations, []);
   assert.equal(availableOperations(state, active).blockers[0]?.code, "ACTIVE_JOB");
 });

@@ -10,33 +10,50 @@ import {
   deconstructionFocusSchema,
   deconstructionModeSchema,
   evidenceSchema,
+  buildReferenceStructureRadar,
   REFERENCE_ANALYSIS_SECTIONS,
   referenceAnalysisPresetSchema,
   referenceAnalysisPresetSections,
   referenceAnalysisSchema,
   referenceAnalysisSectionKeySchema,
   referenceSectionSchema,
+  referenceDimensionObservationSchema,
   segmentAnalysisSchema,
   type BatchAnalysis,
   type ChapterAnalysis,
   type ReferenceAnalysis,
   type SegmentAnalysis,
 } from "../../domain";
-import { modelSettings } from "../../infrastructure/model-settings";
-import {
-  estimateDeconstruction,
-  referenceChaptersInRange,
-  ReferenceRepository,
-} from "../../infrastructure/reference-repository";
-import { deconstructionAgent } from "../agents/deconstruction-agent";
+import type { CreativeAgentPort, ModelSettingsPort, ReferenceEstimatorPort, ReferenceLibraryStore } from "../../application/ports";
 import { generateWithGuard } from "../generation-guard";
 import {
   requireStructuredOutput,
   structuredOutputOptions,
 } from "../structured-output";
+import {
+  batchDescriptorSchema,
+  bindSegmentIdentity,
+  dimensionsForSection,
+  groupReferenceSegments,
+  makeReferenceBatches,
+  mergeChapters,
+  modelEvidenceSchema,
+  modelSegmentSchema,
+  rangeSchema,
+  validateEvidence,
+  validateSegmentOutput,
+} from "./reference-deconstruction-support";
+export { bindSegmentIdentity, groupReferenceSegments, makeReferenceBatches, validateEvidence } from "./reference-deconstruction-support";
 
-export const DECONSTRUCTION_PROMPT_VERSION = "4";
-const repository = new ReferenceRepository();
+export const DECONSTRUCTION_PROMPT_VERSION = "5";
+type WorkflowDependencies = { references: ReferenceLibraryStore; models: ModelSettingsPort; deconstructionAgent: CreativeAgentPort; estimator: ReferenceEstimatorPort };
+let workflowDependencies: WorkflowDependencies | undefined;
+const dependency = () => { if (!workflowDependencies) throw new Error("拆书工作流尚未完成组合根绑定"); return workflowDependencies; };
+const repository = new Proxy({} as ReferenceLibraryStore, { get: (_target, property) => (...args: unknown[]) => (dependency().references as any)[property](...args) });
+const modelSettings = new Proxy({} as ModelSettingsPort, { get: (_target, property) => (...args: unknown[]) => (dependency().models as any)[property](...args) });
+const deconstructionAgent = new Proxy({} as CreativeAgentPort, { get: (_target, property) => (...args: unknown[]) => (dependency().deconstructionAgent as any)[property](...args) });
+const estimateDeconstruction: ReferenceEstimatorPort["estimate"] = (...args) => dependency().estimator.estimate(...args);
+const referenceChaptersInRange: ReferenceEstimatorPort["chapters"] = (...args) => dependency().estimator.chapters(...args);
 const providerOptions = {
   deepseek: { thinking: { type: "disabled" as const } },
 };
@@ -44,20 +61,6 @@ const usageSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
   estimated: z.boolean(),
-});
-const rangeSchema = z.object({
-  chapterId: z.string(),
-  title: z.string(),
-  start: z.number().int().nonnegative(),
-  end: z.number().int().positive(),
-});
-const batchDescriptorSchema = z.object({
-  referenceId: z.string().uuid(),
-  analysisId: z.string(),
-  batchId: z.string(),
-  sourceHash: z.string().length(64),
-  manifestHash: z.string().length(64),
-  ranges: z.array(rangeSchema).min(1),
 });
 const segmentDescriptorSchema = z.object({
   referenceId: z.string().uuid(),
@@ -121,10 +124,6 @@ const budgetSuspendSchema = z.object({
 });
 const budgetResumeSchema = z.object({ action: z.enum(["continue", "cancel"]) });
 
-const modelEvidenceSchema = z.object({
-  chapterId: z.string().default("__unmatched__"),
-  excerpt: z.string().min(1).max(240).default("未提供可定位证据"),
-});
 const modelSceneSchema = z.object({
   goal: z.string().default("本片段未明确场景目标"),
   resistance: z.string().default("本片段未明确场景阻力"),
@@ -162,7 +161,9 @@ const focusModelSchema = z.object({
 });
 const modelInsightSchema = z.object({ id: z.string().min(1).max(80), title: z.string().min(1).max(160), mechanism: z.string().min(1), fitFor: z.array(z.string()).min(1).max(6), doNotCopy: z.array(z.string()).min(1).max(6), adaptationHint: z.string().min(1), evidence: z.array(modelEvidenceSchema).max(4).default([]) });
 const modelCandidateSchema = z.object({ name: z.string().min(1), role: z.string().min(1), importance: z.enum(["main", "major", "supporting"]), summary: z.string().min(1), chapterIds: z.array(z.string()).max(60).default([]) });
-const modelSectionSchema = z.object({ summary: z.string().min(1), content: z.string().min(1), structuredData: z.record(z.string(), z.unknown()).default({}), insights: z.array(modelInsightSchema).max(12).default([]), characterCandidates: z.array(modelCandidateSchema).max(30).default([]), evidence: z.array(modelEvidenceSchema).max(20).default([]) });
+const modelDimensionObservationSchema = referenceDimensionObservationSchema.omit({ evidence: true }).extend({ evidence: z.array(modelEvidenceSchema).min(1).max(4) });
+const modelSectionSchema = z.object({ summary: z.string().min(1), content: z.string().min(1), structuredData: z.record(z.string(), z.unknown()).default({}), insights: z.array(modelInsightSchema).max(12).default([]), dimensions: z.array(modelDimensionObservationSchema).max(30).default([]), characterCandidates: z.array(modelCandidateSchema).max(30).default([]), evidence: z.array(modelEvidenceSchema).max(20).default([]) });
+
 
 async function prompt(name: string) {
   const source = await readFile(
@@ -215,99 +216,6 @@ function addUsage(values: Array<z.infer<typeof usageSchema>>) {
   });
 }
 
-export function makeReferenceBatches(
-  referenceId: string,
-  analysisId: string,
-  sourceHash: string,
-  manifestHash: string,
-  chapters: Array<{ id: string; title: string; start: number; end: number }>,
-  maxChars = 18_000,
-  source?: string,
-) {
-  const ranges = chapters.flatMap((chapter) => {
-    const items = [];
-    for (let start = chapter.start; start < chapter.end; ) {
-      let end = Math.min(chapter.end, start + maxChars);
-      if (source && end < chapter.end) {
-        const minimum = start + Math.floor(maxChars * 0.6);
-        const paragraph = source.lastIndexOf("\n\n", end);
-        const line = source.lastIndexOf("\n", end);
-        const boundary =
-          paragraph >= minimum
-            ? paragraph + 2
-            : line >= minimum
-              ? line + 1
-              : end;
-        end = Math.min(chapter.end, boundary);
-      }
-      items.push({
-        chapterId: chapter.id,
-        title: chapter.title,
-        start,
-        end,
-      });
-      start = end;
-    }
-    return items;
-  });
-  const batches: z.infer<typeof batchDescriptorSchema>[] = [];
-  let current: typeof ranges = [];
-  let size = 0;
-  for (const range of ranges) {
-    const length = range.end - range.start;
-    if (current.length && size + length > maxChars) {
-      batches.push(
-        batchDescriptorSchema.parse({
-          referenceId,
-          analysisId,
-          batchId: `batch-${String(batches.length + 1).padStart(4, "0")}`,
-          sourceHash,
-          manifestHash,
-          ranges: current,
-        }),
-      );
-      current = [];
-      size = 0;
-    }
-    current.push(range);
-    size += length;
-  }
-  if (current.length)
-    batches.push(
-      batchDescriptorSchema.parse({
-        referenceId,
-        analysisId,
-        batchId: `batch-${String(batches.length + 1).padStart(4, "0")}`,
-        sourceHash,
-        manifestHash,
-        ranges: current,
-      }),
-    );
-  return batches;
-}
-
-export function validateEvidence(
-  raw: z.infer<typeof modelEvidenceSchema>[],
-  ranges: z.infer<typeof rangeSchema>[],
-  source: string,
-) {
-  return raw.flatMap((item) => {
-    for (const range of ranges) {
-      if (range.chapterId !== item.chapterId) continue;
-      const local = source.slice(range.start, range.end).indexOf(item.excerpt);
-      if (local >= 0)
-        return [
-          {
-            chapterId: item.chapterId,
-            excerpt: item.excerpt,
-            start: range.start + local,
-            end: range.start + local + item.excerpt.length,
-          },
-        ];
-    }
-    return [];
-  });
-}
 
 const prepareBatches = createStep({
   id: "prepare-reference-batches",
@@ -461,52 +369,6 @@ const analyzeBatch = createStep({
   },
 });
 
-function mergeChapters(values: ChapterAnalysis[]) {
-  const result = new Map<string, ChapterAnalysis>();
-  for (const item of values) {
-    const prior = result.get(item.chapterId);
-    if (!prior) result.set(item.chapterId, item);
-    else
-      result.set(
-        item.chapterId,
-        chapterAnalysisSchema.parse({
-          ...prior,
-          summary: `${prior.summary}\n${item.summary}`,
-          scenes: [...prior.scenes, ...item.scenes],
-          characterChanges: [
-            ...prior.characterChanges,
-            ...item.characterChanges,
-          ],
-          causalEvents: [...prior.causalEvents, ...item.causalEvents],
-          worldRules: [...prior.worldRules, ...item.worldRules],
-          threads: [...prior.threads, ...item.threads],
-          rewards: [...prior.rewards, ...item.rewards],
-          endingHook: item.endingHook || prior.endingHook,
-          evidence: [...prior.evidence, ...item.evidence].slice(0, 8),
-        }),
-      );
-  }
-  return [...result.values()];
-}
-
-export function groupReferenceSegments(
-  chapters: ChapterAnalysis[],
-  volumes: Map<string, string | undefined>,
-) {
-  const groups: ChapterAnalysis[][] = [];
-  for (let index = 0; index < chapters.length; ) {
-    const volume = volumes.get(chapters[index]!.chapterId);
-    let end = Math.min(chapters.length, index + 25);
-    const boundary = chapters.findIndex(
-      (item, candidate) =>
-        candidate > index && volumes.get(item.chapterId) !== volume,
-    );
-    if (boundary >= 0) end = Math.min(end, boundary);
-    groups.push(chapters.slice(index, end));
-    index = end;
-  }
-  return groups;
-}
 
 const prepareSegments = createStep({
   id: "prepare-reference-segments",
@@ -573,17 +435,19 @@ const analyzeSegment = createStep({
       (abortSignal) =>
         deconstructionAgent.generate(request, {
           abortSignal,
-          ...structuredOutputOptions(segmentAnalysisSchema),
+          ...structuredOutputOptions(modelSegmentSchema),
           providerOptions,
           modelSettings: settings,
         }),
     );
     const generatedSegment = requireStructuredOutput(
-      segmentAnalysisSchema,
+      modelSegmentSchema,
       result.object,
       "阶段拆解",
     );
-    const segment = bindSegmentIdentity(generatedSegment, inputData);
+    const [manifest, source] = await Promise.all([repository.manifest(inputData.referenceId), repository.source(inputData.referenceId)]);
+    const ranges = manifest.chapters.filter((chapter) => inputData.chapterIds.includes(chapter.id)).map((chapter) => ({ chapterId: chapter.id, title: chapter.title, start: chapter.start, end: chapter.end }));
+    const segment = bindSegmentIdentity(validateSegmentOutput(generatedSegment, ranges, source), inputData);
     await repository.writeAnalysisFile(
       inputData.referenceId,
       inputData.analysisId,
@@ -597,18 +461,6 @@ const analyzeSegment = createStep({
     };
   },
 });
-
-export function bindSegmentIdentity(
-  segment: SegmentAnalysis,
-  descriptor: { segmentId: string; title: string; chapterIds: string[] },
-) {
-  return segmentAnalysisSchema.parse({
-    ...segment,
-    id: descriptor.segmentId,
-    title: descriptor.title,
-    chapterIds: descriptor.chapterIds,
-  });
-}
 
 const prepareMacros = createStep({
   id: "prepare-reference-macros",
@@ -660,19 +512,23 @@ const analyzeMacro = createStep({
       (abortSignal) =>
         deconstructionAgent.generate(request, {
           abortSignal,
-          ...structuredOutputOptions(segmentAnalysisSchema),
+          ...structuredOutputOptions(modelSegmentSchema),
           providerOptions,
           modelSettings: settings,
         }),
     );
     const segment = requireStructuredOutput(
-      segmentAnalysisSchema,
+      modelSegmentSchema,
       generated.object,
       "宏观结构拆解",
     );
+    const chapterIds = [...new Set(segments.flatMap((text) => segmentAnalysisSchema.parse(parse(text)).chapterIds))];
+    const [manifest, source] = await Promise.all([repository.manifest(inputData.referenceId), repository.source(inputData.referenceId)]);
+    const ranges = manifest.chapters.filter((chapter) => chapterIds.includes(chapter.id)).map((chapter) => ({ chapterId: chapter.id, title: chapter.title, start: chapter.start, end: chapter.end }));
     const value = segmentAnalysisSchema.parse({
-      ...segment,
+      ...validateSegmentOutput(segment, ranges, source),
       id: inputData.macroId,
+      chapterIds,
     });
     await repository.writeAnalysisFile(
       inputData.referenceId,
@@ -863,19 +719,32 @@ const finalize = createStep({
     const source = await repository.source(init.referenceId);
     const context = `参考书：${state.title}\n分析范围：${init.chapterRange ? `第 ${init.chapterRange.fromChapter}–${init.chapterRange.toChapter} 章` : "全书"}\n\n阶段事实：\n${segments.join("\n\n")}${inputData.length ? `\n\n专项扫描：\n${JSON.stringify(inputData)}` : ""}`;
     const makeSection = async (key: z.infer<typeof referenceAnalysisSectionKeySchema>, overview?: unknown) => {
-      const request = `${await prompt("section")}\n\n当前小节：${key}\n${context}${overview ? `\n\n拆书总览：\n${JSON.stringify(overview)}` : ""}`;
+      const dimensions = dimensionsForSection(key);
+      const request = `${await prompt("section")}\n\n当前小节：${key}${dimensions.length ? `\n\n本小节可观察维度（只返回有明确证据的维度；未观察到的维度不要补零）：\n${JSON.stringify(dimensions)}` : "\n\n当前小节不生成维度观察。"}\n${context}${overview ? `\n\n拆书总览：\n${JSON.stringify(overview)}` : ""}`;
       const generated = await generateWithGuard(`生成拆书小节 ${key}`, (abortSignal) => deconstructionAgent.generate(request, { abortSignal, ...structuredOutputOptions(modelSectionSchema), providerOptions, modelSettings: settings }));
       const draft = requireStructuredOutput(modelSectionSchema, generated.object, `拆书小节 ${key}`);
       const evidence = validateEvidence(draft.evidence, ranges, source);
       const insights = draft.insights.map((item) => ({ ...item, evidence: validateEvidence(item.evidence, ranges, source) }));
       const title = REFERENCE_ANALYSIS_SECTIONS.find((item) => item.key === key)?.title ?? key;
-      return { section: referenceSectionSchema.parse({ version: 1, key, title, summary: draft.summary, content: draft.content, structuredData: draft.structuredData, evidence, insights, characterCandidates: key === "character_system" ? draft.characterCandidates : [], createdAt: new Date().toISOString() }), usage: usage(generated, request, draft) };
+      const observations = draft.dimensions.flatMap((item) => {
+        const dimensionEvidence = validateEvidence(item.evidence, ranges, source);
+        return dimensionEvidence.length ? [referenceDimensionObservationSchema.parse({ ...item, evidence: dimensionEvidence })] : [];
+      });
+      return { section: referenceSectionSchema.parse({ version: 1, key, title, summary: draft.summary, content: draft.content, structuredData: draft.structuredData, evidence, insights, characterCandidates: key === "character_system" ? draft.characterCandidates : [], createdAt: new Date().toISOString() }), observations, usage: usage(generated, request, draft) };
     };
     const overviewResult = await makeSection("overview");
     const remaining = current.sectionKeys.filter((key) => key !== "overview");
     const generatedSections = await Promise.all(remaining.map((key) => makeSection(key, overviewResult.section.structuredData)));
-    const allSections = [overviewResult.section, ...generatedSections.map((item) => item.section)];
+    const rawSections = [overviewResult.section, ...generatedSections.map((item) => item.section)];
+    const observations = [overviewResult, ...generatedSections].flatMap((item) => item.observations);
+    const insightConfidence = new Map(observations.filter((item) => item.insightId).map((item) => [item.insightId!, item.confidence]));
+    const recommendedInsightIds = [...new Map(rawSections.flatMap((section) => section.insights).map((insight) => [insight.id, insight])).values()]
+      .sort((left, right) => (insightConfidence.get(right.id) ?? 0) - (insightConfidence.get(left.id) ?? 0))
+      .slice(0, 3).map((item) => item.id);
+    const allSections = rawSections.map((section) => referenceSectionSchema.parse({ ...section, insights: section.insights.filter((insight) => recommendedInsightIds.includes(insight.id)) }));
+    const radar = buildReferenceStructureRadar(observations, recommendedInsightIds);
     await Promise.all(allSections.map((section) => repository.writeAnalysisFile(init.referenceId, init.analysisId, `sections/${section.key}.yaml`, stringify(section, { lineWidth: 0 }))));
+    await repository.writeAnalysisFile(init.referenceId, init.analysisId, "radar.yaml", stringify(radar, { lineWidth: 0 }));
     const finalUsage = addUsage([focusUsage, overviewResult.usage, ...generatedSections.map((item) => item.usage)]);
     const inputTokens = current.inputTokens + finalUsage.inputTokens;
     const outputTokens = current.outputTokens + finalUsage.outputTokens;
@@ -897,6 +766,7 @@ const finalize = createStep({
           inputTokens,
           outputTokens,
           usageEstimated: current.usageEstimated || finalUsage.estimated,
+          radarPath: "radar.yaml",
         },
         { lineWidth: 0 },
       ),
@@ -908,6 +778,7 @@ const finalize = createStep({
       outputTokens,
       usageEstimated: current.usageEstimated || finalUsage.estimated,
       reportPath,
+      radarPath: "radar.yaml",
       updatedAt: new Date().toISOString(),
     });
     await repository.setActive();
@@ -923,7 +794,7 @@ const finalize = createStep({
   },
 });
 
-export const referenceDeconstructionWorkflow = createWorkflow({
+const referenceDeconstructionWorkflow = createWorkflow({
   id: "reference-deconstruction",
   description: "可恢复的全局长篇拆书 Map/Reduce 流程。",
   inputSchema: referenceWorkflowInputSchema,
@@ -939,3 +810,9 @@ export const referenceDeconstructionWorkflow = createWorkflow({
   .foreach(analyzeFocus, { concurrency: 2 })
   .then(finalize)
   .commit();
+
+export function createReferenceDeconstructionWorkflow(deps: WorkflowDependencies) {
+  if (workflowDependencies && workflowDependencies !== deps) throw new Error("拆书工作流已经绑定");
+  workflowDependencies = deps;
+  return referenceDeconstructionWorkflow;
+}

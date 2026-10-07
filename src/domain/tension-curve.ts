@@ -52,7 +52,7 @@ export const bookTensionCurveSchema = z.object({
 export const volumeTensionCurveSchema = z.object({
   schemaVersion: z.literal(TENSION_CURVE_SCHEMA_VERSION), kind: z.literal("volume"), volume: z.number().int().positive(), title: z.string().trim().min(1).max(120),
   chapterRange: z.object({ from: z.number().int().positive(), to: z.number().int().positive() }),
-  basis: z.object({ blueprintSha256: shaSchema, bookCurveSha256: shaSchema, volumePlanSha256: shaSchema, generatedAt: z.string() }), calibration: calibrationSchema,
+  basis: z.object({ blueprintSha256: shaSchema, bookCurveSha256: shaSchema, volumePlanSha256: shaSchema, adaptationsSha256: shaSchema.optional(), generatedAt: z.string() }), calibration: calibrationSchema,
   points: z.array(volumeTensionPointSchema).min(1).max(500),
 }).superRefine((curve, context) => {
   if (curve.chapterRange.to < curve.chapterRange.from) context.addIssue({ code: "custom", path: ["chapterRange"], message: "章节范围无效" });

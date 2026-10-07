@@ -33,6 +33,8 @@ import {
   type ReferenceJob,
 } from "../shared/contracts";
 import { api } from "./api";
+import { AdaptationComposer } from "./references/AdaptationComposer";
+import { StructureRadar } from "./references/StructureRadar";
 
 const formatted = (value: number) =>
   new Intl.NumberFormat("zh-CN").format(value);
@@ -620,6 +622,7 @@ export function ReferenceWorkspace() {
             <SectionResults
               sections={analysis.data!.sections}
               analysis={analysis.data!.analysis}
+              radar={analysis.data!.radar}
               source={sourceExcerpt?.content}
               showEvidence={(item: { start: number; end: number }) => evidence.mutate(item)}
               novels={bootstrap.data?.novels ?? []}
@@ -1027,7 +1030,7 @@ function AnalysisDocument({ content, loading }: { content?: string; loading?: bo
   }
 }
 
-function SectionResults({ sections, analysis, source, showEvidence, novels, referenceId, analysisId, navigate }: any) {
+function SectionResults({ sections, analysis, radar, source, showEvidence, novels, referenceId, analysisId, navigate }: any) {
   const client = useQueryClient();
   const [view, setView] = useState<"sections" | "characters">("sections");
   const [sectionKey, setSectionKey] = useState("overview");
@@ -1040,7 +1043,7 @@ function SectionResults({ sections, analysis, source, showEvidence, novels, refe
   const candidates = characterSection?.characterCandidates ?? [];
   const profile = useQuery({ queryKey: ["reference-character", referenceId, analysisId, characterName], queryFn: () => api.referenceCharacter(referenceId, analysisId, characterName), enabled: Boolean(characterName && analysis.characterProfiles.some((item: any) => item.name === characterName && item.status === "generated")) });
   const generateCharacter = useMutation({ mutationFn: (name: string) => api.startReferenceCharacter(referenceId, analysisId, name), onSuccess: async () => { await client.invalidateQueries({ queryKey: ["reference-analysis", referenceId, analysisId] }); } });
-  const chooseSection = (key: string) => { setSectionKey(key); setInsightIds([]); };
+  const chooseSection = (key: string) => setSectionKey(key);
   const toggleInsight = (id: string) => setInsightIds((current) => current.includes(id) ? current.filter((item) => item !== id) : current.length < 3 ? [...current, id] : current);
   return (
     <section className="section-results">
@@ -1056,6 +1059,7 @@ function SectionResults({ sections, analysis, source, showEvidence, novels, refe
           <article>
             <header className="section-article-head"><div><small>结构化关键结论</small><h2>{section?.title}</h2></div><span>{section?.evidence.length ?? 0} 条证据</span></header>
             {section && <>
+              {radar && section.key === "overview" && <StructureRadar radar={radar} />}
               <p className="section-summary">{section.summary}</p>
               <AnalysisValue value={section.structuredData} />
               {section.insights.length > 0 && <section className="transferable-insights"><header><div><small>可迁移写法</small><h3>选择最多 3 条，带回自己的作品讨论</h3></div><span>{insightIds.length}/3</span></header>{section.insights.map((item: any) => <label className={insightIds.includes(item.id) ? "selected" : ""} key={item.id}><input type="checkbox" checked={insightIds.includes(item.id)} onChange={() => toggleInsight(item.id)} /><div><strong>{item.title}</strong><p>{item.mechanism}</p><dl><div><dt>适用场景</dt><dd>{item.fitFor.join("、")}</dd></div><div><dt>不可照搬</dt><dd>{item.doNotCopy.join("、")}</dd></div><div><dt>适配提示</dt><dd>{item.adaptationHint}</dd></div></dl></div></label>)}</section>}
@@ -1071,7 +1075,11 @@ function SectionResults({ sections, analysis, source, showEvidence, novels, refe
           <article>{characterName ? <>{profile.data ? <><header className="section-article-head"><div><small>角色档案</small><h2>{profile.data.name}</h2></div><span>{profile.data.role}</span></header><p className="section-summary">{profile.data.summary}</p><AnalysisValue value={profile.data} />{profile.data.evidence.length > 0 && <div className="evidence-list"><h3>原文证据</h3>{profile.data.evidence.map((item: any, index: number) => <button key={index} onClick={() => showEvidence(item)}>“{item.excerpt}”</button>)}</div>}</> : <div className="character-empty"><h2>{characterName}</h2><p>先生成角色档案，系统会围绕欲望、压力、关系、变化轨迹和可借鉴的人物设计研究原文。</p><button disabled={generateCharacter.isPending || analysis.characterProfiles.some((item: any) => item.name === characterName && item.status === "generating")} onClick={() => generateCharacter.mutate(characterName)}>{generateCharacter.isPending ? "正在启动…" : "生成角色档案"}</button>{generateCharacter.error && <ErrorLine error={generateCharacter.error} />}</div>}</> : <p className="analysis-state">从左侧选择一个角色候选。</p>}</article>
         </div>
       )}
-      {view === "sections" && <footer className="section-apply"><input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="想解决什么问题？例如：强化第一卷的升级节奏" /><select value={targetNovel} onChange={(event) => setTargetNovel(event.target.value)}><option value="">选择要应用的作品</option>{novels.map((novel: any) => <option value={novel.novelId} key={novel.novelId}>{novel.title}</option>)}</select><button disabled={!targetNovel || !goal.trim() || !insightIds.length} onClick={() => navigate(`/novels/${targetNovel}?applyReference=${referenceId}&analysis=${analysisId}&section=${section.key}&insights=${encodeURIComponent(insightIds.join(","))}&goal=${encodeURIComponent(goal)}`)}>带入作品讨论</button></footer>}
+      {view === "sections" && (radar ? (
+        <AdaptationComposer referenceId={referenceId} analysisId={analysisId} novels={novels} selectedInsightIds={insightIds} />
+      ) : (
+        <footer className="section-apply"><input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="想解决什么问题？例如：强化第一卷的升级节奏" /><select value={targetNovel} onChange={(event) => setTargetNovel(event.target.value)}><option value="">选择要应用的作品</option>{novels.map((novel: any) => <option value={novel.novelId} key={novel.novelId}>{novel.title}</option>)}</select><button disabled={!targetNovel || !goal.trim() || !insightIds.length} onClick={() => navigate(`/novels/${targetNovel}?applyReference=${referenceId}&analysis=${analysisId}&section=${section.key}&insights=${encodeURIComponent(insightIds.join(","))}&goal=${encodeURIComponent(goal)}`)}>带入作品讨论</button></footer>
+      ))}
     </section>
   );
 }

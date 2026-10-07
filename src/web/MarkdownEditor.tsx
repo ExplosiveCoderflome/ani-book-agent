@@ -64,6 +64,6 @@ const labels: Record<string, string> = {
 };
 const translate: Translation = (_key, fallback, interpolations) => Object.entries(interpolations ?? {}).reduce((value, [key, replacement]) => value.replaceAll(`{{${key}}}`, String(replacement)), labels[fallback] ?? fallback);
 
-export function MarkdownEditor({ markdown, fileKey, onChange }: { markdown: string; fileKey: string; onChange: (markdown: string, initialMarkdownNormalize: boolean) => void }) {
-  return <MDXEditor key={fileKey} className="novel-markdown-editor mdxeditor-full-height" contentEditableClassName="novel-markdown-content" markdown={markdown} onChange={onChange} plugins={plugins} translation={translate} />;
+export function MarkdownEditor({ markdown, fileKey, readOnly, onChange }: { markdown: string; fileKey: string; readOnly: boolean; onChange: (markdown: string, initialMarkdownNormalize: boolean) => void }) {
+  return <MDXEditor key={fileKey} className={`novel-markdown-editor mdxeditor-full-height${readOnly ? " readonly" : ""}`} contentEditableClassName="novel-markdown-content" markdown={markdown} readOnly={readOnly} onChange={onChange} plugins={plugins} translation={translate} />;
 }

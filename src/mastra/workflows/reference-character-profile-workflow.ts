@@ -4,13 +4,16 @@ import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { parse, stringify } from "yaml";
 import { z } from "zod";
 import { referenceCharacterProfileSchema } from "../../domain";
-import { modelSettings } from "../../infrastructure/model-settings";
-import { ReferenceRepository } from "../../infrastructure/reference-repository";
-import { deconstructionAgent } from "../agents/deconstruction-agent";
+import type { CreativeAgentPort, ModelSettingsPort, ReferenceLibraryStore } from "../../application/ports";
 import { generateWithGuard } from "../generation-guard";
 import { requireStructuredOutput, structuredOutputOptions } from "../structured-output";
 
-const repository = new ReferenceRepository();
+type WorkflowDependencies = { references: ReferenceLibraryStore; models: ModelSettingsPort; deconstructionAgent: CreativeAgentPort };
+let workflowDependencies: WorkflowDependencies | undefined;
+const dependency = () => { if (!workflowDependencies) throw new Error("角色档案工作流尚未完成组合根绑定"); return workflowDependencies; };
+const repository = new Proxy({} as ReferenceLibraryStore, { get: (_target, property) => (...args: unknown[]) => (dependency().references as any)[property](...args) });
+const modelSettings = new Proxy({} as ModelSettingsPort, { get: (_target, property) => (...args: unknown[]) => (dependency().models as any)[property](...args) });
+const deconstructionAgent = new Proxy({} as CreativeAgentPort, { get: (_target, property) => (...args: unknown[]) => (dependency().deconstructionAgent as any)[property](...args) });
 const inputSchema = z.object({ referenceId: z.string().uuid(), analysisId: z.string(), name: z.string().min(1).max(120) });
 const outputSchema = z.object({ referenceId: z.string().uuid(), analysisId: z.string(), name: z.string(), status: z.literal("completed") });
 const modelEvidenceSchema = z.object({ chapterId: z.string(), excerpt: z.string().min(1).max(240) });
@@ -45,4 +48,9 @@ const generate = createStep({
   },
 });
 
-export const referenceCharacterProfileWorkflow = createWorkflow({ id: "reference-character-profile", description: "按需生成参考书角色档案。", inputSchema, outputSchema }).then(generate).commit();
+const referenceCharacterProfileWorkflow = createWorkflow({ id: "reference-character-profile", description: "按需生成参考书角色档案。", inputSchema, outputSchema }).then(generate).commit();
+export function createReferenceCharacterProfileWorkflow(deps: WorkflowDependencies) {
+  if (workflowDependencies && workflowDependencies !== deps) throw new Error("角色档案工作流已经绑定");
+  workflowDependencies = deps;
+  return referenceCharacterProfileWorkflow;
+}

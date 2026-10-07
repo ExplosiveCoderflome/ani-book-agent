@@ -1,4 +1,5 @@
 import type { ProviderCatalogItem } from "../shared/contracts";
+import { CUSTOM_API_KEY, CUSTOM_PROVIDER_ID } from "../shared/contracts";
 import { AppError } from "../application/errors";
 
 const featuredProviders = ["openai", "anthropic", "google", "deepseek", "openrouter", "groq"];
@@ -47,7 +48,10 @@ export async function loadProviderCatalog(configuredProviders: Set<string>): Pro
     const port = process.env.MASTRA_PORT ?? "4111";
     const response = await fetch(`http://127.0.0.1:${port}/api/agents/providers`, { signal: AbortSignal.timeout(8_000) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return normalizeProviderCatalog(await response.json(), configuredProviders);
+    return [...normalizeProviderCatalog(await response.json(), configuredProviders), {
+      id: CUSTOM_PROVIDER_ID, name: "Custom", label: "第三方（OpenAI 兼容）", envVar: [CUSTOM_API_KEY],
+      connected: configuredProviders.has(CUSTOM_PROVIDER_ID), models: [],
+    }];
   } catch {
     throw new AppError("PROVIDER_CATALOG_UNAVAILABLE", "暂时无法读取 Mastra 模型目录，请确认 Studio 已启动。", 503, true);
   }

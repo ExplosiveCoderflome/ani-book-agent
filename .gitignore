@@ -6,6 +6,7 @@ coverage/
 playwright-report/
 test-results/
 .runtime/
+.pnpm-store/
 .env
 *.log
 *.sqlite3
@@ -15,3 +16,5 @@ novels/*
 !novels/.gitkeep
 reference-library/*
 !reference-library/.gitkeep
+profiles/
+market-radar/

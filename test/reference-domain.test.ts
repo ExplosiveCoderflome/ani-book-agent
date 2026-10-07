@@ -3,6 +3,9 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { estimateTokenCount } from "tokenx";
+import { stringify } from "yaml";
+import { REFERENCE_SEGMENT_INPUT_TOKENS, modelSegmentSchema, validateSegmentOutput } from "../src/mastra/workflows/reference-deconstruction-support";
 import {
   MIN_REFERENCE_TOKEN_BUDGET,
   chapterParserConfigSchema,
@@ -80,6 +83,21 @@ test("stage aggregation cannot replace the deterministic segment identity", () =
   });
   assert.equal(bound.id, "segment-001");
   assert.deepEqual(bound.chapterIds, ["chapter-0001", "chapter-0002"]);
+});
+
+test("stage and macro evidence offsets come from verified source text", () => {
+  const source = "序言。第一章真实证据。第二章真实证据。";
+  const ranges = [{ chapterId: "chapter-1", title: "第一章", start: 3, end: 11 }];
+  const raw = { id: "stage", title: "阶段", chapterIds: ["chapter-1"], summary: "摘要", objective: "目标", escalation: [], characterArcs: [], promises: [], payoffs: [], pacing: "递进", evidence: [
+    { chapterId: "chapter-1", excerpt: "真实证据", start: 0, end: 0 },
+    { chapterId: "chapter-1", excerpt: "不存在的引用", start: 1, end: 99 },
+    { chapterId: "chapter-2", excerpt: "真实证据", start: 14, end: 18 },
+  ] };
+  assert.equal(modelSegmentSchema.safeParse(raw).success, true);
+  const result = validateSegmentOutput(raw, ranges, source);
+  assert.deepEqual(result.evidence, [{ chapterId: "chapter-1", excerpt: "真实证据", start: 6, end: 10 }]);
+  assert.equal(segmentAnalysisSchema.safeParse(result).success, true);
+  assert.throws(() => validateSegmentOutput({ ...raw, objective: undefined }, ranges, source));
 });
 
 test("reference parser detects headings and covers every character exactly once", () => {
@@ -369,6 +387,19 @@ test("stage grouping respects volume boundaries before the 25 chapter cap", () =
     groupReferenceSegments(chapters, volumes).map((group) => group.length),
     [12, 18],
   );
+});
+
+test("stage grouping bounds serialized analysis tokens without losing chapters", () => {
+  const chapters = Array.from({ length: 30 }, (_, index) => ({ chapterId: `chapter-${index}`, title: `第${index}章`, summary: "这是角色变化以及关键事件的分析。".repeat(300) })) as any;
+  const groups = groupReferenceSegments(chapters, new Map());
+  assert.ok(groups.length > 2);
+  assert.deepEqual(groups.flat(), chapters);
+  for (const group of groups) {
+    assert.ok(group.length <= 25);
+    assert.ok(estimateTokenCount(group.map((chapter) => stringify(chapter, { lineWidth: 0 })).join("\n\n")) <= REFERENCE_SEGMENT_INPUT_TOKENS);
+  }
+  assert.throws(() => groupReferenceSegments([{ ...chapters[0], summary: "这是角色变化以及关键事件的分析。".repeat(10_000) }], new Map()), /章节分析超过阶段聚合输入预算/);
+  assert.deepEqual(groupReferenceSegments([], new Map()), []);
 });
 
 test("synthetic 10MiB novel is covered exactly once without an unbounded model batch", () => {

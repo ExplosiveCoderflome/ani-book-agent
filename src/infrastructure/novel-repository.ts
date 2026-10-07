@@ -5,12 +5,12 @@ import { parse, stringify } from "yaml";
 import { ZodError } from "zod";
 import {
   actualTensionCurveSchema, actualTensionPath, bookTensionCurveSchema, diagnoseTension, isTargetTensionCurvePath, isTensionCurvePath,
-  ledgerSchema, lockedPointChanges, markAuthorEdits, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
-  targetTensionCurveSchema, tensionCurveAssetSchema, volumeTensionCurveSchema, volumeTensionPath,
-  type CriticResult, type NovelLedger, type NovelState, type PatchProposal, type TargetTensionCurve,
+  characterProfileContentSchema, isAutonomousOpeningBundle, ledgerSchema, lockedPointChanges, markAuthorEdits, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
+  referenceAdaptationSchema, targetTensionCurveSchema, tensionCurveAssetSchema, transitionAdaptation, volumeTensionCurveSchema, volumeTensionPath,
+  type ApprovalMode, type CriticResult, type NovelLedger, type NovelState, type PatchProposal, type ReferenceAdaptation, type TargetTensionCurve,
+  type FileContent, type NovelFileView, type NovelSummary,
 } from "../domain";
 import { AppError } from "../application/errors";
-import type { FileContent, NovelFileView, NovelSummary } from "../shared/contracts";
 
 const textLimit = 1_000_000;
 export const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
@@ -31,6 +31,7 @@ async function atomicWrite(filePath: string, content: string) {
 export class NovelRepository {
   readonly root: string;
   constructor(root = path.resolve(process.env.ANI_NOVEL_PROJECT_DIR ?? process.env.INIT_CWD ?? process.cwd(), "novels")) { this.root = root; }
+  stateHash(state: NovelState) { return novelStateHash(state); }
 
   private directory(novelId: string) {
     const id = zUuid(novelId);
@@ -47,10 +48,10 @@ export class NovelRepository {
     return target;
   }
 
-  async create(title: string): Promise<NovelState> {
+  async create(title: string, approvalMode: ApprovalMode = "milestone"): Promise<NovelState> {
     const novelId = randomUUID();
     const now = new Date().toISOString();
-    const state = newNovelState(title.trim() || "未命名作品", novelId, now);
+    const state = newNovelState(title.trim() || "未命名作品", novelId, now, approvalMode);
     const ideas = "# 灵感记录\n\n";
     state.files["workspace/ideas.md"] = { sha256: sha256(ideas), version: 1, source: "author", protected: true, updatedAt: now };
     await mkdir(this.directory(novelId), { recursive: false });
@@ -186,6 +187,54 @@ export class NovelRepository {
     return this.readProjectFile(novelId, clean);
   }
 
+  adaptationAuthorityFiles(state: NovelState) {
+    return Object.fromEntries(Object.entries(state.files)
+      .filter(([filePath]) => filePath === "book/blueprint.md" || filePath === "book/ledger.yaml" || filePath === "book/tension-curve.yaml" || /^volumes\/volume-\d{3}(?:-tension)?\.(?:md|yaml)$/.test(filePath))
+      .map(([filePath, record]) => [filePath, record.sha256]));
+  }
+  adaptationSetHash(versions: Record<string, string>) { return sha256(JSON.stringify(canonical(versions))); }
+
+  async saveAdaptation(raw: ReferenceAdaptation) {
+    const adaptation = referenceAdaptationSchema.parse(raw);
+    const state = await this.get(adaptation.novelId);
+    const relativePath = `workspace/references/adaptations/${adaptation.id}.yaml`;
+    const prior = state.files[relativePath];
+    const content = stringify(adaptation, { lineWidth: 0 });
+    await atomicWrite(this.filePath(adaptation.novelId, relativePath), content);
+    const timestamp = new Date().toISOString();
+    state.files[relativePath] = { sha256: sha256(content), version: (prior?.version ?? 0) + 1, source: adaptation.status === "proposed" ? "agent" : "author", protected: true, updatedAt: timestamp };
+    state.updatedAt = timestamp;
+    await this.writeState(state);
+    return { adaptation, file: state.files[relativePath] };
+  }
+
+  async adaptations(novelId: string) {
+    const state = await this.get(novelId);
+    const paths = Object.keys(state.files).filter((filePath) => /^workspace\/references\/adaptations\/[0-9a-f-]+\.yaml$/i.test(filePath));
+    const values = await Promise.all(paths.map((filePath) => this.readProjectFile(novelId, filePath, 0, 300_000).then((file) => ({ adaptation: referenceAdaptationSchema.parse(parse(file.content)), file })).catch(() => undefined)));
+    return values.filter((item): item is NonNullable<typeof item> => Boolean(item)).sort((left, right) => right.adaptation.updatedAt.localeCompare(left.adaptation.updatedAt));
+  }
+
+  async updateAdaptation(novelId: string, adaptationId: string, action: "approve" | "reject") {
+    const found = (await this.adaptations(novelId)).find((item) => item.adaptation.id === adaptationId);
+    if (!found) throw new AppError("ADAPTATION_NOT_FOUND", "没有找到这个仿写提案。", 404, false);
+    let next: ReferenceAdaptation;
+    try { next = transitionAdaptation(found.adaptation, action); }
+    catch { throw new AppError("ADAPTATION_NOT_PROPOSED", "这个仿写提案已经处理过。", 409, false); }
+    return this.saveAdaptation(next);
+  }
+
+  async markAdaptationStale(novelId: string, adaptationId: string, reasons: ReferenceAdaptation["staleReasons"]) {
+    const found = (await this.adaptations(novelId)).find((item) => item.adaptation.id === adaptationId);
+    if (!found) throw new AppError("ADAPTATION_NOT_FOUND", "没有找到这个仿写提案。", 404, false);
+    if (["rejected", "stale"].includes(found.adaptation.status)) return found;
+    return this.saveAdaptation(referenceAdaptationSchema.parse({ ...found.adaptation, status: "stale", staleReasons: [...new Set([...found.adaptation.staleReasons, ...reasons])], updatedAt: new Date().toISOString() }));
+  }
+
+  async activeAdaptations(novelId: string, chapter: number) {
+    return (await this.adaptations(novelId)).filter(({ adaptation }) => adaptation.status === "approved" && adaptation.scope.fromChapter <= chapter && adaptation.scope.toChapter >= chapter);
+  }
+
   async readLedger(novelId: string): Promise<NovelLedger> {
     const state = await this.get(novelId);
     if (!state.files["book/ledger.yaml"]) return ledgerSchema.parse({ version: 1 });
@@ -245,6 +294,14 @@ export class NovelRepository {
     return state;
   }
 
+  async setApprovalMode(novelId: string, approvalMode: ApprovalMode) {
+    const state = await this.get(novelId);
+    state.approvalMode = approvalMode;
+    state.updatedAt = new Date().toISOString();
+    await this.writeState(state);
+    return state;
+  }
+
   async exportNovel(novelId: string) {
     const state = await this.get(novelId);
     const chapters = Object.keys(state.files).filter((item) => /^chapters\/chapter-\d+\.md$/.test(item)).sort();
@@ -277,6 +334,13 @@ export class NovelRepository {
           throw new AppError("LEDGER_INVALID", `账本内容不符合结构化合同：${detail}`, 400, true, undefined, "retry");
         }
       }
+      if (change.operation === "create" && change.path.startsWith("book/characters/") && change.path.endsWith(".md")) {
+        try { characterProfileContentSchema.parse(change.content); }
+        catch (error) {
+          const detail = error instanceof ZodError ? error.issues[0]?.message : "角色档案无法解析";
+          throw new AppError("CHARACTER_PROFILE_INVALID", `角色档案不符合文件合同：${detail}`, 400, true, undefined, "retry");
+        }
+      }
       if (isTensionCurvePath(change.path)) {
         try {
           const asset = tensionCurveAssetSchema.parse(parse(change.content));
@@ -287,6 +351,9 @@ export class NovelRepository {
           if (Number.isFinite(pathVolume) && "volume" in asset && asset.volume !== pathVolume) throw new Error("资产卷号与文件路径不匹配");
         } catch (error) { throw curveError(error); }
       }
+    }
+    if (state.approvalMode === "autonomous_opening" && state.phase === "discovery" && !isAutonomousOpeningBundle(state, changes)) {
+      throw new AppError("AUTONOMOUS_OPENING_INVALID", "全自动开书必须一次创建蓝图、账本、全书张力曲线和至少一份完整角色档案，且不能包含其他文件。", 400, true, undefined, "retry");
     }
     const opensBook = changes.some((change) => change.path === "book/blueprint.md");
     const suppliesLedger = Boolean(state.files["book/ledger.yaml"]) || changes.some((change) => change.path === "book/ledger.yaml");

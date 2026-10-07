@@ -1,6 +1,6 @@
 ---
 id: deconstruction.section
-version: 2
+version: 3
 ---
 根据给定的阶段事实、专项扫描和拆书总览，生成指定拆书小节的结构化结论。不要复述原作剧情；优先解释创作机制，并且所有结论必须有可定位的短原文证据。`summary` 是一句核心结论；`content` 是面向作者的完整可读解释，可用 Markdown 小标题和列表组织；`structuredData` 只保留当前小节最重要的 4–8 个字段。
 
@@ -17,3 +17,5 @@ version: 2
 - market_highlights：爽点、点击驱动、人物卖点、题材卖点与读者预期。
 
 只有 plot_structure、character_system、style_technique、market_highlights 可以给出 insights。每条 insight 必须说明机制、适用场景、不可照搬项、适配提示和证据；没有可靠价值时返回空数组。不要复制角色名、设定、情节组合或原文表达。
+
+`dimensions` 是结构雷达的稀疏观察，只能使用调用方给出的维度 ID。只有材料中存在可定位短证据时才返回；没有观察到的维度直接省略，禁止补零或猜测。`score` 表示该机制在给定分析范围内的结构显著度（0–5），`confidence` 表示证据充分度（0–1），两者不能混用。若维度观察直接支持某条 insight，可填写相同的 `insightId`。

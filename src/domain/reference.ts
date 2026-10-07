@@ -115,7 +115,7 @@ export const referenceAnalysisSchema = z.object({
   sourceHash: z.string().length(64), manifestHash: z.string().length(64), promptVersion: z.string(), tokenBudget: z.number().int().positive(),
   inputTokens: z.number().int().nonnegative().default(0), outputTokens: z.number().int().nonnegative().default(0), usageEstimated: z.boolean().default(false),
   stale: z.boolean().default(false), staleReasons: z.array(z.enum(["source", "manifest", "prompt"])).default([]),
-  reportPath: z.string().optional(), characterProfiles: z.array(z.object({ name: z.string(), status: z.enum(["candidate", "generating", "generated", "failed"]), updatedAt: z.string(), error: z.string().optional() })).default([]), createdAt: z.string(), updatedAt: z.string(),
+  reportPath: z.string().optional(), radarPath: z.string().optional(), characterProfiles: z.array(z.object({ name: z.string(), status: z.enum(["candidate", "generating", "generated", "failed"]), updatedAt: z.string(), error: z.string().optional() })).default([]), createdAt: z.string(), updatedAt: z.string(),
 });
 export type ReferenceAnalysis = z.infer<typeof referenceAnalysisSchema>;
 

@@ -2,6 +2,8 @@ import { z } from "zod";
 import { actualTensionObservationSchema } from "./tension-curve";
 
 export const novelPhaseSchema = z.enum(["discovery", "writing", "completed"]);
+export const approvalModeSchema = z.enum(["milestone", "autonomous_opening"]);
+export type ApprovalMode = z.infer<typeof approvalModeSchema>;
 export const fileSourceSchema = z.enum(["agent", "author", "imported"]);
 export const fileRecordSchema = z.object({
   sha256: z.string().length(64),
@@ -19,12 +21,15 @@ export const novelStateSchema = z.object({
   currentVolume: z.number().int().positive(),
   nextChapter: z.number().int().positive(),
   activeJobId: z.string().optional(),
-  approvalMode: z.literal("milestone"),
+  approvalMode: approvalModeSchema,
   files: z.record(z.string(), fileRecordSchema),
   appliedProposalIds: z.array(z.string()).default([]),
   updatedAt: z.string(),
 });
 export type NovelState = z.infer<typeof novelStateSchema>;
+export interface NovelSummary { novelId: string; title: string; phase: "discovery" | "writing" | "completed"; nextChapter: number; updatedAt: string }
+export interface NovelFileView { path: string; sha256: string; version: number; source: "agent" | "author" | "imported"; protected: boolean; updatedAt: string; size: number }
+export interface FileContent extends NovelFileView { content: string }
 
 export const ledgerSchema = z.object({
   version: z.literal(1),
@@ -73,11 +78,20 @@ export const productionJobRequestSchema = z.object({
   brief: z.string().trim().min(1).max(4_000).optional(),
 });
 export type ProductionJobRequest = z.infer<typeof productionJobRequestSchema>;
+export const productionInteractionModeSchema = z.enum(["standard", "autonomous_opening"]);
+export type ProductionInteractionMode = z.infer<typeof productionInteractionModeSchema>;
 export const productionJobSchema = z.object({
   id: z.string(), novelId: z.string().uuid(), goal: productionGoalSchema,
   scope: productionScopeSchema,
   brief: z.string().optional(),
   status: z.enum(["queued", "running", "awaiting_author", "failed", "completed", "canceled"]),
+  interactionMode: productionInteractionModeSchema.default("standard"),
+  retryOf: z.string().min(1).optional(),
+  attempt: z.number().int().positive().default(1),
+  modelRetry: z.object({
+    label: z.string().min(1), attempt: z.number().int().positive(), maxRetries: z.number().int().positive(),
+    delayMs: z.number().int().nonnegative(), updatedAt: z.string(),
+  }).optional(),
   cursor: z.number().int().positive().optional(), checkpoint: z.enum(["curve_confirmation", "chapter_review"]).optional(), baseStateHash: z.string().length(64), proposalId: z.string().optional(),
   resultPath: z.string().optional(),
   error: z.object({ code: z.string(), message: z.string(), recoverable: z.boolean() }).optional(),
@@ -92,6 +106,7 @@ export const operationAvailabilitySchema = z.object({
   activeJob: productionJobSchema.optional(),
 });
 export type OperationAvailability = z.infer<typeof operationAvailabilitySchema>;
+export interface ProjectSnapshot { novel: NovelState; availability: OperationAvailability; files: NovelFileView[]; characterStates: NovelLedger["characters"]; activeJob?: ProductionJob }
 
 export const continuityDeltaSchema = z.object({
   characterUpdates: z.array(z.object({ id: z.string(), name: z.string().optional(), role: z.string().optional(), goal: z.string().optional(), state: z.string().optional(), knowledge: z.array(z.string()).default([]), relationships: z.array(z.string()).default([]) })).default([]),
@@ -100,9 +115,24 @@ export const continuityDeltaSchema = z.object({
   changes: z.array(z.string()).default([]),
 });
 
+const missingCharacterAppearance = /^(?:暂无|未知|待补充|待确认|待作者确认|未设定)$/;
+export function hasDefinedCharacterAppearance(content: string) {
+  return content.split(/\r?\n/).some((line) => {
+    const field = line.trim().replace(/^(?:[-*]\s+|#{1,6}\s+)/, "");
+    const match = /^外貌与辨识特征\s*[：:]\s*(.+)$/.exec(field);
+    const value = match?.[1]?.trim() ?? "";
+    return value.length >= 4 && !missingCharacterAppearance.test(value);
+  });
+}
+
+export const characterProfileContentSchema = z.string().min(80).max(12_000).refine(
+  hasDefinedCharacterAppearance,
+  { message: "角色档案必须包含非空的“外貌与辨识特征”字段，不能使用暂无、未知或待确认占位。" },
+);
+
 export const characterProfileCreateSchema = z.object({
   id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  content: z.string().min(80).max(12_000),
+  content: characterProfileContentSchema,
 });
 
 export const criticResultSchema = z.object({
@@ -115,8 +145,8 @@ export const criticResultSchema = z.object({
 });
 export type CriticResult = z.infer<typeof criticResultSchema>;
 
-export function newNovelState(title: string, novelId: string, now = new Date().toISOString()): NovelState {
-  return novelStateSchema.parse({ schemaVersion: 2, novelId, title, phase: "discovery", currentVolume: 1, nextChapter: 1, approvalMode: "milestone", files: {}, appliedProposalIds: [], updatedAt: now });
+export function newNovelState(title: string, novelId: string, now = new Date().toISOString(), approvalMode: ApprovalMode = "milestone"): NovelState {
+  return novelStateSchema.parse({ schemaVersion: 2, novelId, title, phase: "discovery", currentVolume: 1, nextChapter: 1, approvalMode, files: {}, appliedProposalIds: [], updatedAt: now });
 }
 
 const roots = new Set(["book", "volumes", "chapters", "workspace", "exports"]);
@@ -129,7 +159,20 @@ export function normalizeNovelPath(value: string): string {
   return normalized;
 }
 
+export function isAutonomousOpeningBundle(state: NovelState, changes: Array<z.infer<typeof patchChangeSchema>>) {
+  if (state.approvalMode !== "autonomous_opening" || state.phase !== "discovery") return false;
+  if (state.files["book/blueprint.md"] || state.files["book/ledger.yaml"] || state.files["book/tension-curve.yaml"]) return false;
+  const allowed = /^(?:book\/(?:blueprint\.md|ledger\.yaml|tension-curve\.yaml)|book\/characters\/[a-z0-9]+(?:-[a-z0-9]+)*\.md)$/;
+  if (changes.some((change) => change.operation !== "create" || !allowed.test(change.path))) return false;
+  const paths = new Set(changes.map((change) => change.path));
+  return paths.has("book/blueprint.md")
+    && paths.has("book/ledger.yaml")
+    && paths.has("book/tension-curve.yaml")
+    && changes.some((change) => /^book\/characters\/.+\.md$/.test(change.path));
+}
+
 export function patchApproval(state: NovelState, changes: Array<z.infer<typeof patchChangeSchema>>): "auto" | "author" {
+  if (isAutonomousOpeningBundle(state, changes)) return "auto";
   if (changes.some((change) => change.path === "book/blueprint.md" || change.path === "book/tension-curve.yaml" || /^volumes\/volume-\d{3}-tension\.yaml$/.test(change.path) || change.path.startsWith("book/characters/"))) return "author";
   return changes.some((change) => {
     const record = state.files[change.path];

@@ -3,11 +3,12 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Dpapi, isPlatformSupported } from "@primno/dpapi";
 import { AppError } from "../application/errors";
-import { modelProfileNameSchema, modelProfileSchema, type ModelProfileName } from "../shared/contracts";
+import { CUSTOM_API_KEY, CUSTOM_PROVIDER_ID, customModelsInputSchema, modelProfileNameSchema, modelProfileSchema, modelSettingsInputSchema, type ModelProfileName } from "../shared/contracts";
 
 interface StoredSettings {
   providerId: string;
   modelId: string;
+  customProvider?: { baseURL: string; modelId: string };
   profiles?: Partial<Record<ModelProfileName, { providerId: string; modelId: string; parameters?: { temperature?: number; maxOutputTokens?: number; topP?: number } }>>;
 }
 
@@ -72,6 +73,7 @@ export class ModelSettingsStore {
     return {
       providerId: value.providerId,
       modelId: value.modelId,
+      customProvider: value.customProvider,
       profiles: {
         ...(profiles.chat ? { chat: profiles.chat } : {}),
         ...(profiles.writer ?? profiles.drafting ? { writer: profiles.writer ?? profiles.drafting } : {}),
@@ -81,10 +83,17 @@ export class ModelSettingsStore {
     };
   }
 
-  async save(providerId: string, modelId: string, credentials: Record<string, string>) {
+  async save(providerId: string, modelId: string, credentials: Record<string, string>, baseURL?: string) {
+    ({ providerId, modelId, credentials, baseURL } = modelSettingsInputSchema.parse({ providerId, modelId, credentials, baseURL }));
+    const previous = await this.selection();
     const cleanCredentials = Object.fromEntries(
       Object.entries(credentials).filter(([key, value]) => key.trim() && value.trim()).map(([key, value]) => [key, value.trim()]),
     );
+    if (providerId === CUSTOM_PROVIDER_ID && !cleanCredentials[CUSTOM_API_KEY]) {
+      if (previous?.customProvider?.baseURL !== baseURL || !(await this.credentials(providerId))?.[CUSTOM_API_KEY]) {
+        throw new AppError("MODEL_KEY_REQUIRED", "首次连接或更改 API 地址时，请填写第三方 API Key。", 400, true);
+      }
+    }
     if (Object.keys(cleanCredentials).length) {
       sessionSecrets.set(providerId, cleanCredentials);
       if (this.canPersistSecrets) {
@@ -94,9 +103,30 @@ export class ModelSettingsStore {
         await atomicJson(this.secretsPath, stored);
       }
     }
-    const previous = await this.selection();
-    await atomicJson(this.settingsPath, { providerId, modelId, profiles: previous?.profiles } satisfies StoredSettings);
+    await atomicJson(this.settingsPath, { providerId, modelId, profiles: previous?.profiles, customProvider: providerId === CUSTOM_PROVIDER_ID ? { baseURL: baseURL!, modelId } : previous?.customProvider } satisfies StoredSettings);
     return this.status();
+  }
+
+  async fetchCustomModels(input: unknown): Promise<{ models: Array<{ id: string; name: string }> }> {
+    const { baseURL, apiKey: suppliedKey } = customModelsInputSchema.parse(input);
+    const saved = await this.selection();
+    const apiKey = suppliedKey || (saved?.customProvider?.baseURL === baseURL ? (await this.credentials(CUSTOM_PROVIDER_ID))?.[CUSTOM_API_KEY] : undefined);
+    if (!apiKey) throw new AppError("MODEL_KEY_REQUIRED", "请填写 API Key；更换地址时不能沿用已保存的密钥。", 400, true);
+    try {
+      const response = await fetch(`${baseURL}/models`, { headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" }, signal: AbortSignal.timeout(10_000), redirect: "error" });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403 ? "密钥无效或无权获取模型，请检查 API Key。" : response.status === 404 ? "未找到模型接口，请检查基础地址；厂商需支持 /models。" : `获取模型失败（HTTP ${response.status}），请稍后重试。`;
+        throw new AppError("MODEL_LIST_FAILED", message, 502, true);
+      }
+      const payload: unknown = await response.json();
+      if (!payload || typeof payload !== "object" || !("data" in payload) || !Array.isArray(payload.data)) throw new AppError("MODEL_LIST_INVALID", "厂商返回的模型列表格式不兼容，需包含 data 数组。", 502, true);
+      const ids = [...new Set(payload.data.flatMap((item: unknown) => item && typeof item === "object" && "id" in item && typeof item.id === "string" && item.id.trim() ? [item.id.trim()] : []))].sort();
+      if (!ids.length) throw new AppError("MODEL_LIST_EMPTY", "厂商没有返回可用模型，请检查密钥权限或联系厂商。", 502, true);
+      return { models: ids.map((id) => ({ id, name: id })) };
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError("MODEL_LIST_FAILED", "无法获取模型列表，请检查地址、网络和厂商接口后重试（最长等待 10 秒）。", 502, true);
+    }
   }
 
   async profiles() {
@@ -104,6 +134,7 @@ export class ModelSettingsStore {
     return {
       default: selection ? { providerId: selection.providerId, modelId: selection.modelId, parameters: {} } : undefined,
       profiles: selection?.profiles ?? {},
+      customProvider: selection?.customProvider,
     };
   }
 
@@ -120,7 +151,7 @@ export class ModelSettingsStore {
     return this.profiles();
   }
 
-  async runtimeSelection(profile?: ModelProfileName): Promise<{ providerId: string; modelId: string; model: string; parameters: { temperature?: number; maxOutputTokens?: number; topP?: number } }> {
+  async runtimeSelection(profile?: ModelProfileName) {
     const selection = await this.selection();
     if (!selection) throw new AppError("MODEL_NOT_CONFIGURED", "请先选择并配置一个模型。", 409, true);
     const effective = profile ? selection.profiles?.[profile] ?? (profile === "analysis" ? selection.profiles?.critic : undefined) ?? selection : selection;
@@ -128,8 +159,13 @@ export class ModelSettingsStore {
     if (!credentials || !Object.keys(credentials).length) {
       throw new AppError("MODEL_NOT_CONFIGURED", "当前模型还没有可用的密钥。", 409, true);
     }
+    const model = `${effective.providerId}/${effective.modelId}`;
+    if (effective.providerId === CUSTOM_PROVIDER_ID) {
+      if (!selection.customProvider?.baseURL || !credentials[CUSTOM_API_KEY]) throw new AppError("MODEL_NOT_CONFIGURED", "请先配置第三方 API 地址和密钥。", 409, true);
+      return { providerId: effective.providerId, modelId: effective.modelId, model, modelConfig: { providerId: CUSTOM_PROVIDER_ID, modelId: effective.modelId, url: selection.customProvider.baseURL, apiKey: credentials[CUSTOM_API_KEY] }, parameters: "parameters" in effective ? effective.parameters ?? {} : {} };
+    }
     for (const [name, value] of Object.entries(credentials)) process.env[name] = value;
-    return { providerId: effective.providerId, modelId: effective.modelId, model: `${effective.providerId}/${effective.modelId}`, parameters: "parameters" in effective ? effective.parameters ?? {} : {} };
+    return { providerId: effective.providerId, modelId: effective.modelId, model, modelConfig: model, parameters: "parameters" in effective ? effective.parameters ?? {} : {} };
   }
 
   private async credentials(providerId: string): Promise<Record<string, string> | undefined> {
@@ -158,5 +194,3 @@ export function sanitizeProviderError(error: unknown): string {
   }
   return sanitized.replace(/(api[_-]?key|token|secret)\s*[=:]\s*[^\s,;]+/gi, "$1=***").slice(0, 500);
 }
-
-export const modelSettings = new ModelSettingsStore();
