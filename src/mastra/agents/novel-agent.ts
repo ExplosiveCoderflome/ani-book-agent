@@ -8,7 +8,7 @@ const processors = [new UnicodeNormalizer({ stripControlChars: true, preserveEmo
 
 export function createNovelAgents(deps: {
   models: ModelSettingsPort;
-  novels: NovelProjectStore;
+  novels: Pick<NovelProjectStore, "get">;
   preferences: PreferencesStore;
   projectTools: Record<string, any>;
   loadCorePrompt(): Promise<string>;

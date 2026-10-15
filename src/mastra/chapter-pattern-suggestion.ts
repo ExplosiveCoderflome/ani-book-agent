@@ -1,7 +1,9 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { normalizeChapterPatternSuggestion, type ChapterPatternMatcher } from "../domain";
 import type { ChapterPatternAdvisorPort, CreativeAgentPort, ModelSettingsPort } from "../application/ports";
+import { AppError } from "../application/errors";
 import { generateWithGuard } from "./generation-guard";
 import { requireStructuredOutput, structuredOutputOptions } from "./structured-output";
 
@@ -12,7 +14,7 @@ const modelSuggestionSchema = z.object({
   explanation: z.string().trim().min(1).max(800).default("根据所给章节标题样例生成。"),
 });
 
-export function createChapterPatternAdvisor(modelSettings: ModelSettingsPort, deconstructionAgent: CreativeAgentPort): ChapterPatternAdvisorPort {
+export function createChapterPatternAdvisor(modelSettings: ModelSettingsPort, deconstructionAgent: CreativeAgentPort, matchPatterns: ChapterPatternMatcher): ChapterPatternAdvisorPort {
   return { async suggest(rawSample: unknown) {
     const sample = sampleSchema.parse(rawSample);
     const instructions = await readFile(path.resolve(process.env.INIT_CWD ?? process.cwd(), "src", "mastra", "prompts", "deconstruction", "chapter-regex.md"), "utf8");
@@ -22,6 +24,8 @@ export function createChapterPatternAdvisor(modelSettings: ModelSettingsPort, de
       abortSignal, ...structuredOutputOptions(modelSuggestionSchema), providerOptions: { deepseek: { thinking: { type: "disabled" as const } } },
       modelSettings: { ...selected.parameters, maxOutputTokens: Math.min(selected.parameters.maxOutputTokens ?? 1_200, 1_200) },
     }));
-    return requireStructuredOutput(modelSuggestionSchema, generated.object, "章节正则建议");
+    const suggestion = await normalizeChapterPatternSuggestion(requireStructuredOutput(modelSuggestionSchema, generated.object, "章节正则建议"), sample, matchPatterns);
+    if (!suggestion) throw new AppError("REFERENCE_PATTERN_NO_MATCH", "模型生成的正则格式无法应用。请保留真实章节标题并重试，系统不会保存这条无效规则。", 422, true);
+    return suggestion;
   } };
 }

@@ -38,8 +38,8 @@ test("an unreadable persisted active job blocks snapshots and new production ins
   const service = createNovelService({
     novels: {
       get: async () => state, listFiles: async () => [], readLedger: async () => ({ version: 1, decisions: [], characters: [], worldRules: [], openThreads: [], continuity: [] }),
-      stateHash: () => "b".repeat(64), setActiveJob: async (_id: string, jobId?: string) => { state.activeJobId = jobId; return state; },
-      clearActiveJob: async () => { clearCalls += 1; state.activeJobId = undefined; return state; },
+      stateHash: () => "b".repeat(64),
+      finishProductionJob: async () => { clearCalls += 1; state.activeJobId = undefined; return state; },
     },
     skills: { resolveForAgent: async () => [] }, preferences: { get: async () => ({ version: 1 }) }, adaptations: { list: async () => [] },
     production: { getWorkflowRunById: async () => { throw new Error("workflow storage temporarily unavailable"); }, createRun: async () => { createCalls += 1; throw new Error("must not run"); } },
@@ -65,13 +65,13 @@ test("failed chapter jobs retry from authoritative nextChapter and preserve thei
   let started: any;
   let workflowStatus = "failed";
   let workflowSteps: Record<string, unknown> | undefined;
+  let claimed: any;
   const deps: any = {
     novels: {
       get: async () => state,
       stateHash: () => "b".repeat(64),
-      clearActiveJob: async (_id: string, jobId: string) => { if (state.activeJobId === jobId) state.activeJobId = undefined; return state; },
-      setActiveJob: async (_id: string, jobId?: string) => { state.activeJobId = jobId; return state; },
-      setApprovalMode: async (_id: string, mode: "milestone" | "autonomous_opening") => { state.approvalMode = mode; return state; },
+      claimProductionJob: async (_id: string, jobId: string, request: any, mode: string, options: any) => { claimed = { request, mode, options }; state.activeJobId = jobId; return state; },
+      finishProductionJob: async (_id: string, jobId: string) => { if (state.activeJobId === jobId) state.activeJobId = undefined; return state; },
       adaptationSetHash: () => "c".repeat(64),
     },
     skills: { resolveForAgent: async () => [] },
@@ -109,6 +109,8 @@ test("failed chapter jobs retry from authoritative nextChapter and preserve thei
   assert.equal(started.scope.fromChapter, 2);
   assert.equal(started.scope.toChapter, 3);
   assert.equal(started.interactionMode, "autonomous_opening");
+  assert.deepEqual(claimed.options, { expectedStateHash: "b".repeat(64), previousJob: { id: "old-job", status: "failed" } });
+  assert.deepEqual(claimed.request.scope, { fromChapter: 2, toChapter: 3 });
 });
 
 test("automatic opening keeps its one-time mode when no production run could be created", async () => {
@@ -116,11 +118,82 @@ test("automatic opening keeps its one-time mode when no production run could be 
   const state = newNovelState("启动恢复", novelId, now, "autonomous_opening"); state.phase = "writing";
   for (const filePath of ["book/blueprint.md", "book/ledger.yaml", "book/tension-curve.yaml"]) state.files[filePath] = { sha256: "a".repeat(64), version: 1, source: "agent", protected: false, updatedAt: now };
   const service = createNovelService({
-    novels: { get: async () => state, stateHash: () => "b".repeat(64), setApprovalMode: async (_id: string, mode: "milestone" | "autonomous_opening") => { state.approvalMode = mode; return state; } },
+    novels: { get: async () => state, stateHash: () => "b".repeat(64) },
     skills: { resolveForAgent: async () => [] }, preferences: { get: async () => ({ version: 1 }) }, adaptations: { list: async () => [] },
     production: { createRun: async () => { throw new Error("storage temporarily unavailable"); } }, sanitizeError: String,
   } as any);
   await assert.rejects(service.startProductionJob(novelId, { goal: "write_chapters", scope: { fromChapter: 1, toChapter: 3 } }), /storage temporarily unavailable/);
   assert.equal(state.approvalMode, "autonomous_opening");
   assert.equal(state.activeJobId, undefined);
+});
+
+test("resuming author confirmation commits the current plan before resuming the workflow", async () => {
+  const novelId = randomUUID(); const now = "2026-08-31T00:00:00.000Z";
+  const state = newNovelState("确认边界", novelId, now);
+  state.activeJobId = "current-job";
+  const calls: string[] = [];
+  let checkpoint = "curve_confirmation";
+  let confirmationError: Error | undefined;
+  const service = createNovelService({
+    novels: {
+      get: async () => state, stateHash: () => "b".repeat(64),
+      confirmProductionPlan: async (_id: string, jobId: string) => {
+        assert.equal(jobId, "current-job"); calls.push("confirm");
+        if (confirmationError) throw confirmationError;
+        return state;
+      },
+    },
+    production: {
+      getWorkflowRunById: async () => ({ status: "suspended", resourceId: novelId, payload: { novelId, goal: "write_chapters", scope: { fromChapter: 1, toChapter: 3 } }, steps: { "run-production": { suspendPayload: { checkpoint, chapter: 1 } } } }),
+      createRun: async () => ({ runId: "current-job", resume: async () => { calls.push("resume"); return { status: "suspended" }; } }),
+    },
+    sanitizeError: String,
+  } as any);
+  confirmationError = new Error("当前计划已失效");
+  await assert.rejects(service.resumeJob(novelId, "current-job", { action: "continue" }), /当前计划已失效/);
+  assert.deepEqual(calls, ["confirm"]);
+  confirmationError = undefined; calls.length = 0;
+  await service.resumeJob(novelId, "current-job", { action: "continue" });
+  assert.deepEqual(calls, ["confirm", "resume"]);
+  checkpoint = "chapter_review"; calls.length = 0;
+  await assert.rejects(service.resumeJob(novelId, "current-job", { action: "continue" }), (error: any) => error.code === "JOB_RESTART_REQUIRED");
+  assert.deepEqual(calls, []);
+});
+
+test("canceling revokes the domain grant before asking the runtime to abort", async () => {
+  const novelId = randomUUID(); const state = newNovelState("取消边界", novelId);
+  state.activeJobId = "current-job";
+  const calls: string[] = [];
+  const service = createNovelService({
+    novels: {
+      get: async () => state, stateHash: () => "b".repeat(64),
+      finishProductionJob: async (_id: string, jobId: string, outcome: string) => {
+        assert.equal(jobId, "current-job"); assert.equal(outcome, "canceled");
+        calls.push("finish"); state.activeJobId = undefined; return state;
+      },
+    },
+    production: {
+      getWorkflowRunById: async () => ({ status: "running", resourceId: novelId, payload: { novelId } }),
+      createRun: async () => ({ runId: "current-job", cancel: async () => { assert.equal(state.activeJobId, undefined); calls.push("cancel"); } }),
+    },
+    sanitizeError: String,
+  } as any);
+  assert.equal((await service.resumeJob(novelId, "current-job", { action: "cancel" })).status, "canceled");
+  assert.deepEqual(calls, ["finish", "cancel"]);
+});
+
+test("proposal author decisions use persisted domain commands", async () => {
+  const novelId = randomUUID(); const state = newNovelState("作者决策", novelId);
+  const proposal = { id: randomUUID(), novelId, intent: "修订设定", summary: "更新人物档案", changes: [{ operation: "create", path: "book/characters/hero.md", content: "角色档案" }], approval: "author", status: "pending", createdAt: new Date().toISOString() };
+  const calls: string[] = [];
+  const service = createNovelService({
+    novels: {
+      approveProposal: async (value: any) => { assert.equal(value.id, proposal.id); calls.push("approve"); return { proposal: { ...value, status: "applied" }, state, duplicate: value.status === "applied" }; },
+      rejectProposal: async (value: any) => { assert.deepEqual(value, proposal); calls.push("reject"); return { ...value, status: "rejected" }; },
+    },
+  } as any);
+  assert.equal((await service.approveProposal(novelId, proposal)).proposal.status, "applied");
+  assert.equal((await service.approveProposal(novelId, { ...proposal, status: "applied" })).proposal.status, "applied");
+  assert.equal((await service.rejectProposal(novelId, proposal)).status, "rejected");
+  assert.deepEqual(calls, ["approve", "approve", "reject"]);
 });

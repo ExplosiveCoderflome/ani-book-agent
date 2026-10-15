@@ -216,6 +216,12 @@ function addUsage(values: Array<z.infer<typeof usageSchema>>) {
   });
 }
 
+async function assertRunning(referenceId: string, jobId: string, abortSignal: AbortSignal) {
+  abortSignal.throwIfAborted();
+  await repository.assertActiveJob(referenceId, jobId);
+  abortSignal.throwIfAborted();
+}
+
 
 const prepareBatches = createStep({
   id: "prepare-reference-batches",
@@ -223,7 +229,9 @@ const prepareBatches = createStep({
   outputSchema: z.array(batchDescriptorSchema),
   suspendSchema: budgetSuspendSchema,
   resumeSchema: budgetResumeSchema,
-  execute: async ({ inputData, suspend }) => {
+  execute: async ({ inputData, suspend, runId, abortSignal }) => {
+    if (inputData.jobId !== runId) throw new Error("拆书任务标识与运行不一致");
+    await assertRunning(inputData.referenceId, runId, abortSignal);
     const [state, manifest, source] = await Promise.all([
       repository.get(inputData.referenceId),
       repository.manifest(inputData.referenceId),
@@ -272,7 +280,8 @@ const analyzeBatch = createStep({
   inputSchema: batchDescriptorSchema,
   outputSchema: batchAnalysisSchema,
   retries: 2,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId, abortSignal }) => {
+    await assertRunning(inputData.referenceId, runId, abortSignal);
     const cached = await repository
       .readAnalysisFile(
         inputData.referenceId,
@@ -320,6 +329,7 @@ const analyzeBatch = createStep({
         inputData.analysisId,
         `batches/${inputData.batchId}.yaml`,
         stringify(reused, { lineWidth: 0 }),
+        runId,
       );
       return reused;
     }
@@ -341,6 +351,8 @@ const analyzeBatch = createStep({
           providerOptions,
           modelSettings: settings,
         }),
+      undefined,
+      { abortSignal },
     );
     const parsed = requireStructuredOutput(
       modelBatchSchema,
@@ -364,6 +376,7 @@ const analyzeBatch = createStep({
       inputData.analysisId,
       `batches/${inputData.batchId}.yaml`,
       stringify(value, { lineWidth: 0 }),
+      runId,
     );
     return value;
   },
@@ -374,9 +387,10 @@ const prepareSegments = createStep({
   id: "prepare-reference-segments",
   inputSchema: z.array(batchAnalysisSchema),
   outputSchema: z.array(segmentDescriptorSchema),
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId, abortSignal }) => {
     if (!inputData.length) throw new Error("没有完成任何章节拆解");
     const first = inputData[0]!;
+    await assertRunning(first.referenceId, runId, abortSignal);
     const chapters = mergeChapters(inputData.flatMap((item) => item.chapters));
     await Promise.all(
       chapters.map((chapter) =>
@@ -385,6 +399,7 @@ const prepareSegments = createStep({
           first.analysisId,
           `chapters/${chapter.chapterId}.yaml`,
           stringify(chapter, { lineWidth: 0 }),
+          runId,
         ),
       ),
     );
@@ -417,7 +432,8 @@ const analyzeSegment = createStep({
   inputSchema: segmentDescriptorSchema,
   outputSchema: segmentResultSchema,
   retries: 2,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId, abortSignal }) => {
+    await assertRunning(inputData.referenceId, runId, abortSignal);
     const chapters = await Promise.all(
       inputData.chapterIds.map((id) =>
         repository.readAnalysisFile(
@@ -439,6 +455,8 @@ const analyzeSegment = createStep({
           providerOptions,
           modelSettings: settings,
         }),
+      undefined,
+      { abortSignal },
     );
     const generatedSegment = requireStructuredOutput(
       modelSegmentSchema,
@@ -453,6 +471,7 @@ const analyzeSegment = createStep({
       inputData.analysisId,
       `segments/${inputData.segmentId}.yaml`,
       stringify(segment, { lineWidth: 0 }),
+      runId,
     );
     return {
       segment,
@@ -466,8 +485,9 @@ const prepareMacros = createStep({
   id: "prepare-reference-macros",
   inputSchema: z.array(segmentResultSchema),
   outputSchema: z.array(macroDescriptorSchema),
-  execute: async ({ inputData, getInitData }) => {
+  execute: async ({ inputData, getInitData, runId, abortSignal }) => {
     const init = referenceWorkflowInputSchema.parse(getInitData());
+    await assertRunning(init.referenceId, runId, abortSignal);
     const totalUsage = addUsage(
       inputData.flatMap((item) => [item.usage, item.carryUsage]),
     );
@@ -494,7 +514,8 @@ const analyzeMacro = createStep({
   inputSchema: macroDescriptorSchema,
   outputSchema: segmentResultSchema,
   retries: 2,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId, abortSignal }) => {
+    await assertRunning(inputData.referenceId, runId, abortSignal);
     const segments = await Promise.all(
       inputData.segmentIds.map((id) =>
         repository.readAnalysisFile(
@@ -516,6 +537,8 @@ const analyzeMacro = createStep({
           providerOptions,
           modelSettings: settings,
         }),
+      undefined,
+      { abortSignal },
     );
     const segment = requireStructuredOutput(
       modelSegmentSchema,
@@ -535,6 +558,7 @@ const analyzeMacro = createStep({
       inputData.analysisId,
       `segments/${inputData.macroId}.yaml`,
       stringify(value, { lineWidth: 0 }),
+      runId,
     );
     return {
       segment: value,
@@ -550,8 +574,9 @@ const prepareFocus = createStep({
   outputSchema: z.array(focusDescriptorSchema),
   suspendSchema: budgetSuspendSchema,
   resumeSchema: budgetResumeSchema,
-  execute: async ({ inputData, getInitData, resumeData, suspend }) => {
+  execute: async ({ inputData, getInitData, resumeData, suspend, runId, abortSignal }) => {
     const init = referenceWorkflowInputSchema.parse(getInitData());
+    await assertRunning(init.referenceId, runId, abortSignal);
     if (resumeData?.action === "cancel") return [];
     const used = addUsage(
       inputData.flatMap((item) => [item.usage, item.carryUsage]),
@@ -564,7 +589,7 @@ const prepareFocus = createStep({
       outputTokens: used.outputTokens,
       usageEstimated: used.estimated,
       updatedAt: new Date().toISOString(),
-    });
+    }, runId);
     const latest = (await repository.get(init.referenceId)).analyses.find(
       (item) => item.id === init.analysisId,
     )!;
@@ -604,7 +629,8 @@ const analyzeFocus = createStep({
   inputSchema: focusDescriptorSchema,
   outputSchema: focusResultSchema,
   retries: 2,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId, abortSignal }) => {
+    await assertRunning(inputData.referenceId, runId, abortSignal);
     const source = await repository.source(inputData.referenceId);
     const sections = inputData.ranges
       .map(
@@ -629,6 +655,8 @@ const analyzeFocus = createStep({
           providerOptions,
           modelSettings: settings,
         }),
+      undefined,
+      { abortSignal },
     );
     const parsed = requireStructuredOutput(
       focusModelSchema,
@@ -648,6 +676,7 @@ const analyzeFocus = createStep({
       inputData.analysisId,
       `focus/${inputData.focus}-${inputData.batchId}.yaml`,
       stringify(value, { lineWidth: 0 }),
+      runId,
     );
     return value;
   },
@@ -660,17 +689,13 @@ const finalize = createStep({
   suspendSchema: budgetSuspendSchema,
   resumeSchema: budgetResumeSchema,
   retries: 1,
-  execute: async ({ inputData, getInitData, resumeData, suspend }) => {
+  execute: async ({ inputData, getInitData, resumeData, suspend, runId, abortSignal }) => {
     const init = referenceWorkflowInputSchema.parse(getInitData());
+    await assertRunning(init.referenceId, runId, abortSignal);
     const state = await repository.get(init.referenceId);
     const current = state.analyses.find((item) => item.id === init.analysisId)!;
     if (resumeData?.action === "cancel") {
-      await repository.updateAnalysis(init.referenceId, {
-        ...current,
-        status: "canceled",
-        updatedAt: new Date().toISOString(),
-      });
-      await repository.setActive();
+      await repository.finishJob(init.referenceId, runId, init.analysisId, { status: "canceled" });
       return {
         status: "canceled" as const,
         referenceId: init.referenceId,
@@ -721,7 +746,7 @@ const finalize = createStep({
     const makeSection = async (key: z.infer<typeof referenceAnalysisSectionKeySchema>, overview?: unknown) => {
       const dimensions = dimensionsForSection(key);
       const request = `${await prompt("section")}\n\n当前小节：${key}${dimensions.length ? `\n\n本小节可观察维度（只返回有明确证据的维度；未观察到的维度不要补零）：\n${JSON.stringify(dimensions)}` : "\n\n当前小节不生成维度观察。"}\n${context}${overview ? `\n\n拆书总览：\n${JSON.stringify(overview)}` : ""}`;
-      const generated = await generateWithGuard(`生成拆书小节 ${key}`, (abortSignal) => deconstructionAgent.generate(request, { abortSignal, ...structuredOutputOptions(modelSectionSchema), providerOptions, modelSettings: settings }));
+      const generated = await generateWithGuard(`生成拆书小节 ${key}`, (signal) => deconstructionAgent.generate(request, { abortSignal: signal, ...structuredOutputOptions(modelSectionSchema), providerOptions, modelSettings: settings }), undefined, { abortSignal });
       const draft = requireStructuredOutput(modelSectionSchema, generated.object, `拆书小节 ${key}`);
       const evidence = validateEvidence(draft.evidence, ranges, source);
       const insights = draft.insights.map((item) => ({ ...item, evidence: validateEvidence(item.evidence, ranges, source) }));
@@ -743,8 +768,9 @@ const finalize = createStep({
       .slice(0, 3).map((item) => item.id);
     const allSections = rawSections.map((section) => referenceSectionSchema.parse({ ...section, insights: section.insights.filter((insight) => recommendedInsightIds.includes(insight.id)) }));
     const radar = buildReferenceStructureRadar(observations, recommendedInsightIds);
-    await Promise.all(allSections.map((section) => repository.writeAnalysisFile(init.referenceId, init.analysisId, `sections/${section.key}.yaml`, stringify(section, { lineWidth: 0 }))));
-    await repository.writeAnalysisFile(init.referenceId, init.analysisId, "radar.yaml", stringify(radar, { lineWidth: 0 }));
+    abortSignal.throwIfAborted();
+    await Promise.all(allSections.map((section) => repository.writeAnalysisFile(init.referenceId, init.analysisId, `sections/${section.key}.yaml`, stringify(section, { lineWidth: 0 }), runId)));
+    await repository.writeAnalysisFile(init.referenceId, init.analysisId, "radar.yaml", stringify(radar, { lineWidth: 0 }), runId);
     const finalUsage = addUsage([focusUsage, overviewResult.usage, ...generatedSections.map((item) => item.usage)]);
     const inputTokens = current.inputTokens + finalUsage.inputTokens;
     const outputTokens = current.outputTokens + finalUsage.outputTokens;
@@ -770,18 +796,17 @@ const finalize = createStep({
         },
         { lineWidth: 0 },
       ),
+      runId,
     );
-    await repository.updateAnalysis(init.referenceId, {
-      ...current,
+    const completed = await repository.finishJob(init.referenceId, runId, init.analysisId, {
       status: "completed",
       inputTokens,
       outputTokens,
       usageEstimated: current.usageEstimated || finalUsage.estimated,
       reportPath,
       radarPath: "radar.yaml",
-      updatedAt: new Date().toISOString(),
     });
-    await repository.setActive();
+    if (!completed) throw new Error("拆书任务已经停止，不能提交完成状态");
     return {
       status: "completed" as const,
       referenceId: init.referenceId,

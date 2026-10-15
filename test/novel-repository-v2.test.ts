@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { stringify } from "yaml";
 import { AppError } from "../src/application/errors";
 import { NovelRepository, novelStateHash } from "../src/infrastructure/novel-repository";
+import { acceptedReview, prepareWriting } from "./novel-test-fixture";
 
 const ledger = "version: 1\ndecisions: []\ncharacters: []\nworldRules: []\nopenThreads: []\ncontinuity: []\n";
 const heroProfile = "# 林默\n\n> 角色 ID：hero\n\n- 叙事功能：主动推动主线并承担关键选择。\n- 外在目标：查清城中异变并保护同伴。\n- 内在需要：学会相信他人。\n- 核心矛盾：必须合作，却习惯独自承担风险。\n- 外貌与辨识特征：眉骨有一道旧伤，常穿深灰短衣，思考时会轻敲刀鞘。\n- 行为与声音：说话直接，先行动再解释。\n";
@@ -41,7 +42,7 @@ test("repository auto-applies only a complete autonomous opening bundle", async 
     assert.equal(applied.state.phase, "writing");
     assert.equal(applied.state.files["book/characters/hero.md"]?.source, "agent");
     assert.equal((await repository.applyProposal(proposal)).duplicate, true);
-    assert.equal((await repository.setApprovalMode(created.novelId, "milestone")).approvalMode, "milestone");
+    assert.equal((await repository.cancelAutonomousOpening(created.novelId)).approvalMode, "milestone");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -53,7 +54,7 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
     const repository = new NovelRepository(root);
     const created = await repository.create("边界测试");
     assert.equal(novelStateHash(created), novelStateHash(Object.fromEntries(Object.entries(created).reverse()) as typeof created));
-    await stat(path.join(root, created.novelId, "workspace", "references"));
+    assert.equal((await repository.readProjectFile(created.novelId, "workspace/ideas.md")).protected, true);
     await assert.rejects(() => repository.prepareProposal(created.novelId, { intent: "越权", summary: "越权", changes: [{ operation: "create", path: "../outside.md", content: "x" }] }), isCode("INVALID_NOVEL_PATH"));
     await assert.rejects(
       () => repository.prepareProposal(created.novelId, { intent: "错误账本", summary: "错误账本", changes: [{ operation: "create", path: "book/ledger.yaml", content: "version: 1\ndecisions:\n  - id: d1\n    topic: 错误字段\n" }] }),
@@ -76,16 +77,17 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
     });
     assert.equal(opening.approval, "author");
     await assert.rejects(() => repository.applyProposal(opening), isCode("AUTHOR_APPROVAL_REQUIRED"));
-    const applied = await repository.applyProposal(opening, true);
+    const applied = await repository.approveProposal(opening);
     assert.equal(applied.state.phase, "writing");
-    assert.equal((await repository.applyProposal(opening, true)).duplicate, true);
+    assert.equal((await repository.approveProposal(opening)).duplicate, true);
 
     const blueprint = await repository.readProjectFile(created.novelId, "book/blueprint.md");
     await assert.rejects(() => repository.prepareProposal(created.novelId, { intent: "无哈希", summary: "无哈希", changes: [{ operation: "replace", path: blueprint.path, content: "新蓝图" }] }), isCode("BASE_HASH_REQUIRED"));
     await assert.rejects(() => repository.prepareProposal(created.novelId, { intent: "旧哈希", summary: "旧哈希", changes: [{ operation: "replace", path: blueprint.path, baseSha256: "0".repeat(64), content: "新蓝图" }] }), isCode("FILE_STALE"));
 
-    await assert.rejects(() => repository.commitChapter(created.novelId, 2, "# 第二章", { characterUpdates: [], worldRules: [], threads: [], changes: [] }), isCode("CHAPTER_SEQUENCE"));
-    await repository.commitChapter(created.novelId, 1, "# 第一章\n正文", { characterUpdates: [{ id: "guide", name: "阿宁", role: "向导", goal: "带主角过河", state: "已经同行", knowledge: [], relationships: ["主角：临时同伴"] }], worldRules: [], threads: [{ id: "promise", kind: "promise", text: "找到故乡", status: "open" }], changes: ["主角离村"] }, [{ id: "guide", content: "# 阿宁\n\n> 角色 ID：guide\n\n- 叙事功能：带领主角进入陌生地域，并持续制造信任压力。\n- 外在目标：完成过河交易。\n- 内在需要：重新学会信任同行者。\n- 核心矛盾：需要主角合作，却不愿暴露真实来历。\n- 外貌与辨识特征：身形清瘦，常戴旧斗笠，右手虎口留有一道渡河绳磨出的白痕。\n- 行为与声音：说话简短，先谈条件再提供帮助。\n- 人物弧检查点：近期决定是否履行约定。\n" }]);
+    const { jobId, basis } = await prepareWriting(repository, created.novelId);
+    await assert.rejects(() => repository.commitChapter(created.novelId, { jobId, chapter: 2, text: "# 第二章", review: acceptedReview(), basis }), isCode("CHAPTER_SEQUENCE"));
+    await repository.commitChapter(created.novelId, { jobId, chapter: 1, text: "# 第一章\n正文", basis, review: acceptedReview({ continuityDelta: { characterUpdates: [{ id: "guide", name: "阿宁", role: "向导", goal: "带主角过河", state: "已经同行", knowledge: [], relationships: ["主角：临时同伴"] }], worldRules: [], threads: [{ id: "promise", kind: "promise", text: "找到故乡", status: "open" }], changes: ["主角离村"] }, newCharacterProfiles: [{ id: "guide", content: "# 阿宁\n\n> 角色 ID：guide\n\n- 叙事功能：带领主角进入陌生地域，并持续制造信任压力。\n- 外在目标：完成过河交易。\n- 内在需要：重新学会信任同行者。\n- 核心矛盾：需要主角合作，却不愿暴露真实来历。\n- 外貌与辨识特征：身形清瘦，常戴旧斗笠，右手虎口留有一道渡河绳磨出的白痕。\n- 行为与声音：说话简短，先谈条件再提供帮助。\n- 人物弧检查点：近期决定是否履行约定。\n" }] }) });
     assert.match((await repository.readProjectFile(created.novelId, "book/characters/guide.md")).content, /角色 ID：guide/);
     const chapter = await repository.readProjectFile(created.novelId, "chapters/chapter-001.md");
     const saved = await repository.saveAuthorFile(created.novelId, chapter.path, `${chapter.content}\n作者修改`, chapter.sha256);
@@ -95,12 +97,12 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
     assert.equal(protectedPatch.approval, "author");
     await assert.rejects(() => repository.applyProposal(protectedPatch), isCode("AUTHOR_APPROVAL_REQUIRED"));
 
-    await repository.setActiveJob(created.novelId, "job-1");
-    await assert.rejects(() => repository.setActiveJob(created.novelId, "job-2"), isCode("ACTIVE_JOB"));
-    assert.equal((await repository.clearActiveJob(created.novelId, "other-job")).activeJobId, "job-1");
-    await repository.clearActiveJob(created.novelId, "job-1");
+    await assert.rejects(() => repository.claimProductionJob(created.novelId, "job-2", { goal: "review_project", scope: {} }, "standard"), isCode("ACTIVE_JOB"));
+    assert.equal((await repository.finishProductionJob(created.novelId, "other-job", "completed")).activeJobId, jobId);
+    await repository.finishProductionJob(created.novelId, jobId, "completed");
 
-    const exported = await repository.exportNovel(created.novelId);
+    await repository.claimProductionJob(created.novelId, "export-job", { goal: "export", scope: {} }, "standard");
+    const exported = await repository.exportNovel(created.novelId, "export-job");
     assert.equal(exported.chapterCount, 1);
     assert.match(exported.content, /第一章/);
     assert.equal((await repository.readProjectFile(created.novelId, exported.path)).content, exported.content);
@@ -108,7 +110,7 @@ test("repository enforces hashes, approval, protection, serial chapters and expo
     const beforeExternalEdit = await repository.prepareProposal(created.novelId, { intent: "修改蓝图", summary: "修改蓝图", changes: [{ operation: "replace", path: blueprint.path, baseSha256: blueprint.sha256, content: "# Agent 新蓝图\n" }] });
     const blueprintPath = path.join(root, created.novelId, "book", "blueprint.md");
     await writeFile(blueprintPath, "# 作者在本地改过的蓝图\n", "utf8");
-    await assert.rejects(() => repository.applyProposal(beforeExternalEdit, true), isCode("FILE_STALE"));
+    await assert.rejects(() => repository.approveProposal(beforeExternalEdit), isCode("FILE_STALE"));
     const reconciled = await repository.readProjectFile(created.novelId, "book/blueprint.md");
     assert.equal(reconciled.source, "author");
     assert.equal(reconciled.protected, true);

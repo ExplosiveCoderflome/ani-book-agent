@@ -1,14 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parse, stringify } from "yaml";
 import { AppError } from "../application/errors";
+import { matchChapterPatterns } from "./chapter-pattern-matcher";
+import type { ReferenceJobCompletion } from "../application/ports";
 import { chapterManifestSchema, chapterParserConfigSchema, chapterRangeSchema, libraryStateSchema, MAX_REFERENCE_TOKEN_BUDGET, MIN_REFERENCE_TOKEN_BUDGET, referenceAnalysisPresetSections, referenceAnalysisSchema, referenceCharacterProfileSchema, referenceSectionSchema, referenceStateSchema, referenceStructureRadarSchema, tokenEstimateSchema, type ChapterManifest, type ChapterManifestItem, type ChapterParserConfig, type ChapterRange, type DeconstructionFocus, type DeconstructionMode, type ReferenceAnalysis, type ReferenceAnalysisPreset, type ReferenceCharacterProfile, type ReferenceSection, type ReferenceState } from "../domain";
 
 const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
 const TARGET_CHARS = 8_000;
 export const referenceSha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const now = () => new Date().toISOString();
+// ponytail: one process owns a library; use a cross-process lock if multiple servers share it.
+const libraryMutations = new Map<string, Promise<void>>();
 
 async function atomicWrite(filePath: string, content: string) {
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -44,15 +48,16 @@ function conciseHeading(value: string) {
   const title = sentenceEnd >= 0 ? clean.slice(0, sentenceEnd) : clean;
   return title.length > 80 ? `${title.slice(0, 80).trimEnd()}…` : title;
 }
-function headingBoundaries(content: string, parser: ChapterParserConfig) {
-  const chapterPatterns = parser.patterns.filter((item) => item.enabled).map((item) => new RegExp(item.pattern, "iu"));
+async function headingBoundaries(content: string, parser: ChapterParserConfig) {
+  const lines = content.split(/(?<=\n)/);
+  const matches = await matchChapterPatterns(parser.patterns.filter((item) => item.enabled).map((item) => item.pattern), lines.map((line) => line.trim().replace(/^#{1,6}\s+/, "")));
   const result: Boundary[] = []; let offset = 0; let volume: string | undefined; let pendingVolumeStart: number | undefined;
-  for (const line of content.split(/(?<=\n)/)) {
+  for (const [index, line] of lines.entries()) {
     const text = line.replace(/\n$/, "").trim();
     const markdown = text.match(/^#{1,6}\s+(.+)$/)?.[1]?.trim();
     const candidate = markdown ?? text;
     const volumeHeading = volumePrefix.test(candidate);
-    const chapterHeading = chapterPatterns.some((pattern) => pattern.test(candidate.slice(0, 160))) || Boolean(markdown && !volumeHeading);
+    const chapterHeading = matches[index]! >= 0 || Boolean(markdown && !volumeHeading);
     if (volumeHeading) { volume = conciseHeading(candidate); pendingVolumeStart = offset; }
     else if (chapterHeading) { result.push({ start: pendingVolumeStart ?? offset, title: conciseHeading(candidate), ...(volume ? { volume } : {}) }); pendingVolumeStart = undefined; }
     offset += line.length;
@@ -72,8 +77,8 @@ function fixedRanges(content: string, target = TARGET_CHARS) {
   return ranges;
 }
 
-export function buildChapterManifest(content: string, sourceHash: string, targetChars = TARGET_CHARS, parser = DEFAULT_CHAPTER_PARSER): ChapterManifest {
-  const boundaries = headingBoundaries(content, chapterParserConfigSchema.parse(parser));
+export async function buildChapterManifest(content: string, sourceHash: string, targetChars = TARGET_CHARS, parser = DEFAULT_CHAPTER_PARSER): Promise<ChapterManifest> {
+  const boundaries = await headingBoundaries(content, chapterParserConfigSchema.parse(parser));
   const chapters: ChapterManifestItem[] = [];
   if (boundaries.length >= 3) {
     const frontmatter = content.slice(0, boundaries[0]!.start).trim();
@@ -111,15 +116,77 @@ export class ReferenceRepository {
   private parserPath(id: string) { return path.join(this.dir(id), "source", "parser.yaml"); }
   private statePath(id: string) { return path.join(this.dir(id), "reference-state.yaml"); }
   private libraryPath() { return path.join(this.root, "library-state.yaml"); }
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const absolute = path.resolve(this.root);
+    const key = process.platform === "win32" ? absolute.toLowerCase() : absolute;
+    const result = (libraryMutations.get(key) ?? Promise.resolve()).then(operation);
+    const settled = result.then(() => undefined, () => undefined);
+    libraryMutations.set(key, settled);
+    void settled.then(() => { if (libraryMutations.get(key) === settled) libraryMutations.delete(key); });
+    return result;
+  }
   analysisDir(id: string, analysisId: string) { if (!/^[a-zA-Z0-9-]+$/.test(analysisId)) throw new AppError("REFERENCE_PATH_INVALID", "分析路径无效。", 400, false); return path.join(this.dir(id), "analyses", analysisId); }
-  async init() { await mkdir(this.root, { recursive: true }); if (!(await stat(this.libraryPath()).catch(() => undefined))) await atomicWrite(this.libraryPath(), stringify({ version: 1, updatedAt: now() })); }
-  async libraryState() { await this.init(); return libraryStateSchema.parse(parse(await readFile(this.libraryPath(), "utf8"))); }
-  async setActive(jobId?: string, referenceId?: string) { const state = await this.libraryState(); const next = libraryStateSchema.parse({ ...state, activeJobId: jobId, activeReferenceId: referenceId, updatedAt: now() }); await atomicWrite(this.libraryPath(), stringify(next)); return next; }
+  async init() { await mkdir(this.root, { recursive: true }); }
+  async libraryState() {
+    await this.init();
+    const source = await readFile(this.libraryPath(), "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return stringify({ version: 1, updatedAt: now() });
+      throw error;
+    });
+    return libraryStateSchema.parse(parse(source));
+  }
+  async assertActiveJob(referenceId: string, jobId: string) {
+    const state = await this.libraryState();
+    if (state.activeJobId !== jobId || state.activeReferenceId !== referenceId) throw new AppError("REFERENCE_JOB_INACTIVE", "拆书任务已经停止或被替换，不能继续写入。", 409, false);
+  }
+  private async assertReferenceIdle(referenceId: string) {
+    if ((await this.libraryState()).activeReferenceId === referenceId) throw new AppError("REFERENCE_ACTIVE", "这本参考书正在拆解，请先取消任务再修改章节切分。", 409, true);
+  }
+  async setActive(jobId: string, referenceId: string) {
+    return this.mutate(async () => {
+      const state = await this.libraryState();
+      if (state.activeJobId && (state.activeJobId !== jobId || state.activeReferenceId !== referenceId)) throw new AppError("REFERENCE_JOB_ACTIVE", "当前已有一本参考书正在拆解。", 409, true);
+      const next = libraryStateSchema.parse({ ...state, activeJobId: jobId, activeReferenceId: referenceId, updatedAt: now() });
+      await atomicWrite(this.libraryPath(), stringify(next));
+      return next;
+    });
+  }
+  async claimJob(referenceId: string, jobId: string, analysis: ReferenceAnalysis) {
+    return this.mutate(async () => {
+      const library = await this.libraryState();
+      if (library.activeJobId) throw new AppError("REFERENCE_JOB_ACTIVE", "当前已有一本参考书正在拆解。", 409, true);
+      const current = await this.get(referenceId);
+      if (!current.manifestConfirmed || current.manifestHash !== analysis.manifestHash || current.source.sha256 !== analysis.sourceHash) throw new AppError("REFERENCE_MANIFEST_STALE", "参考书来源或章节切分已经变化，请重新确认。", 409, true);
+      const state = await this.writeAnalysis(referenceId, analysis);
+      await atomicWrite(this.libraryPath(), stringify(libraryStateSchema.parse({ ...library, activeJobId: jobId, activeReferenceId: referenceId, updatedAt: now() })));
+      return state;
+    });
+  }
+  async clearActiveJob(referenceId: string, jobId: string) {
+    return this.mutate(() => this.releaseJob(referenceId, jobId));
+  }
+  private async releaseJob(referenceId: string, jobId: string) {
+    const library = await this.libraryState();
+    if (library.activeJobId !== jobId || library.activeReferenceId !== referenceId) return false;
+    await atomicWrite(this.libraryPath(), stringify({ version: 1, updatedAt: now() }));
+    return true;
+  }
+  async finishJob(referenceId: string, jobId: string, analysisId: string, result: ReferenceJobCompletion) {
+    return this.mutate(async () => {
+      const library = await this.libraryState();
+      if (library.activeJobId !== jobId || library.activeReferenceId !== referenceId) return false;
+      const state = await this.get(referenceId);
+      const current = state.analyses.find((item) => item.id === analysisId);
+      if (!current) throw new AppError("REFERENCE_ANALYSIS_NOT_FOUND", "没有找到拆书任务的分析记录。", 404, false);
+      await this.writeAnalysis(referenceId, { ...current, ...result, updatedAt: now() });
+      return this.releaseJob(referenceId, jobId);
+    });
+  }
   async import(input: { fileName: string; title?: string; bytes: Buffer }) {
     if (!/\.(?:txt|md|markdown)$/i.test(input.fileName)) throw new AppError("REFERENCE_TYPE_INVALID", "第一版只支持 TXT 和 Markdown。", 400, false);
     await this.init(); const { content, encoding } = decodeReferenceSource(input.bytes); const sourceHash = referenceSha256(content);
     for (const item of await this.list()) if (item.source.sha256 === sourceHash) return { state: await this.get(item.referenceId), manifest: await this.manifest(item.referenceId), duplicate: true };
-    const referenceId = randomUUID(); const manifest = buildChapterManifest(content, sourceHash); const timestamp = now();
+    const referenceId = randomUUID(); const manifest = await buildChapterManifest(content, sourceHash); const timestamp = now();
     const state = referenceStateSchema.parse({ version: 1, referenceId, title: input.title?.trim() || input.fileName.replace(/\.(?:txt|md|markdown)$/i, ""), source: { fileName: input.fileName, encoding, sizeBytes: input.bytes.length, chars: content.length, sha256: sourceHash, importedAt: timestamp }, manifestHash: manifest.sha256, manifestConfirmed: false, analyses: [], updatedAt: timestamp });
     await mkdir(this.dir(referenceId), { recursive: false }); await Promise.all([atomicWrite(this.sourcePath(referenceId), content), atomicWrite(this.manifestPath(referenceId), stringify(manifest, { lineWidth: 0 })), atomicWrite(this.parserPath(referenceId), stringify(DEFAULT_CHAPTER_PARSER, { lineWidth: 0 })), atomicWrite(this.statePath(referenceId), stringify(state, { lineWidth: 0 }))]);
     return { state, manifest, duplicate: false };
@@ -131,29 +198,62 @@ export class ReferenceRepository {
   async source(id: string) { await this.get(id); return readFile(this.sourcePath(id), "utf8"); }
   async sourceSlice(id: string, start: number, end: number) { const source = await this.source(id); if (start < 0 || end <= start || end > source.length) throw new AppError("REFERENCE_RANGE_INVALID", "原文读取范围无效。", 400, false); return { start, end, content: source.slice(start, end) }; }
   async rebuildManifest(id: string) {
-    const [state, source, parser] = await Promise.all([this.get(id), this.source(id), this.parser(id)]);
-    const manifest = buildChapterManifest(source, state.source.sha256, TARGET_CHARS, parser);
-    const changed = manifest.sha256 !== state.manifestHash;
-    const analyses = state.analyses.map((analysis) => changed ? referenceAnalysisSchema.parse({ ...analysis, stale: true, staleReasons: [...new Set([...analysis.staleReasons, "manifest" as const])] }) : analysis);
-    const next = referenceStateSchema.parse({ ...state, manifestHash: manifest.sha256, manifestConfirmed: changed ? false : state.manifestConfirmed, analyses, updatedAt: now() });
-    await Promise.all([atomicWrite(this.manifestPath(id), stringify(manifest, { lineWidth: 0 })), atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 }))]);
-    return { state: next, manifest, parser };
+    return this.mutate(async () => {
+      await this.assertReferenceIdle(id);
+      const [state, source, parser] = await Promise.all([this.get(id), this.source(id), this.parser(id)]);
+      const manifest = await buildChapterManifest(source, state.source.sha256, TARGET_CHARS, parser);
+      const changed = manifest.sha256 !== state.manifestHash;
+      const analyses = state.analyses.map((analysis) => changed ? referenceAnalysisSchema.parse({ ...analysis, stale: true, staleReasons: [...new Set([...analysis.staleReasons, "manifest" as const])] }) : analysis);
+      const next = referenceStateSchema.parse({ ...state, manifestHash: manifest.sha256, manifestConfirmed: changed ? false : state.manifestConfirmed, analyses, updatedAt: now() });
+      await Promise.all([atomicWrite(this.manifestPath(id), stringify(manifest, { lineWidth: 0 })), atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 }))]);
+      return { state: next, manifest, parser };
+    });
   }
-  async saveParser(id: string, input: unknown) { await this.get(id); const parser = chapterParserConfigSchema.parse(input); await atomicWrite(this.parserPath(id), stringify(parser, { lineWidth: 0 })); return parser; }
-  async confirmManifest(id: string, expectedHash: string) { const state = await this.get(id); const manifest = await this.manifest(id); if (manifest.sha256 !== expectedHash || state.manifestHash !== expectedHash) throw new AppError("REFERENCE_MANIFEST_STALE", "章节切分已经变化，请重新确认。", 409, true); const confirmed = chapterManifestSchema.parse({ ...manifest, confirmedAt: now() }); await atomicWrite(this.manifestPath(id), stringify(confirmed, { lineWidth: 0 })); const next = referenceStateSchema.parse({ ...state, manifestConfirmed: true, updatedAt: now() }); await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 })); return { state: next, manifest: confirmed }; }
-  async delete(id: string) { const library = await this.libraryState(); if (library.activeReferenceId === id) throw new AppError("REFERENCE_ACTIVE", "这本参考书正在拆解，不能删除。", 409, true); await this.get(id); await rm(this.dir(id), { recursive: true, force: false }); }
+  async saveParser(id: string, input: unknown) {
+    const parser = chapterParserConfigSchema.parse(input);
+    await headingBoundaries(await this.source(id), parser);
+    return this.mutate(async () => {
+      await this.assertReferenceIdle(id);
+      await this.get(id);
+      await atomicWrite(this.parserPath(id), stringify(parser, { lineWidth: 0 }));
+      return parser;
+    });
+  }
+  async confirmManifest(id: string, expectedHash: string) {
+    return this.mutate(async () => {
+      await this.assertReferenceIdle(id);
+      const state = await this.get(id);
+      const manifest = await this.manifest(id);
+      if (manifest.sha256 !== expectedHash || state.manifestHash !== expectedHash) throw new AppError("REFERENCE_MANIFEST_STALE", "章节切分已经变化，请重新确认。", 409, true);
+      const confirmed = chapterManifestSchema.parse({ ...manifest, confirmedAt: now() });
+      await atomicWrite(this.manifestPath(id), stringify(confirmed, { lineWidth: 0 }));
+      const next = referenceStateSchema.parse({ ...state, manifestConfirmed: true, updatedAt: now() });
+      await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 }));
+      return { state: next, manifest: confirmed };
+    });
+  }
+  async delete(id: string) { return this.mutate(async () => { const library = await this.libraryState(); if (library.activeReferenceId === id) throw new AppError("REFERENCE_ACTIVE", "这本参考书正在拆解，不能删除。", 409, true); await this.get(id); await rm(this.dir(id), { recursive: true, force: false }); }); }
   async clearAnalyses(id: string) {
-    const library = await this.libraryState();
-    if (library.activeJobId) throw new AppError("REFERENCE_ACTIVE", "存在运行中的拆书任务，不能清理分析结果。", 409, true);
-    const state = await this.get(id);
-    await rm(path.join(this.dir(id), "analyses"), { recursive: true, force: true });
-    const next = referenceStateSchema.parse({ ...state, analyses: [], latestAnalysisId: undefined, updatedAt: now() });
-    await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 }));
-    return next;
+    return this.mutate(async () => {
+      const library = await this.libraryState();
+      if (library.activeJobId) throw new AppError("REFERENCE_ACTIVE", "存在运行中的拆书任务，不能清理分析结果。", 409, true);
+      const state = await this.get(id);
+      await rm(path.join(this.dir(id), "analyses"), { recursive: true, force: true });
+      const next = referenceStateSchema.parse({ ...state, analyses: [], latestAnalysisId: undefined, updatedAt: now() });
+      await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 }));
+      return next;
+    });
   }
-  async updateAnalysis(id: string, analysis: ReferenceAnalysis) { const state = await this.get(id); const parsed = referenceAnalysisSchema.parse(analysis); const analyses = [...state.analyses.filter((item) => item.id !== parsed.id), parsed]; const next = referenceStateSchema.parse({ ...state, analyses, latestAnalysisId: parsed.status === "completed" ? parsed.id : state.latestAnalysisId, updatedAt: now() }); await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 })); return next; }
-  async propagateStale(id: string, sourceHash: string, manifestHash: string, promptVersion: string) { const state = await this.get(id); const analyses = state.analyses.map((analysis) => { const staleReasons = [...(analysis.sourceHash !== sourceHash ? ["source" as const] : []), ...(analysis.manifestHash !== manifestHash ? ["manifest" as const] : []), ...(analysis.promptVersion !== promptVersion ? ["prompt" as const] : [])]; return referenceAnalysisSchema.parse({ ...analysis, stale: staleReasons.length > 0, staleReasons }); }); const next = referenceStateSchema.parse({ ...state, analyses, updatedAt: now() }); await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 })); return next; }
-  async writeAnalysisFile(id: string, analysisId: string, relative: string, content: string) { if (!/^(?:batches|segments|chapters|focus|sections)\/[a-zA-Z0-9_-]+\.(?:ya?ml|md)$|^characters\/[a-zA-Z0-9%-]+\.yaml$|^(?:index\.yaml|radar\.yaml|report\.md)$/.test(relative)) throw new AppError("REFERENCE_PATH_INVALID", "分析文件路径无效。", 400, false); const target = path.join(this.analysisDir(id, analysisId), relative); await atomicWrite(target, content); return target; }
+  private async writeAnalysis(id: string, analysis: ReferenceAnalysis) { const state = await this.get(id); const parsed = referenceAnalysisSchema.parse(analysis); const analyses = [...state.analyses.filter((item) => item.id !== parsed.id), parsed]; const next = referenceStateSchema.parse({ ...state, analyses, latestAnalysisId: parsed.status === "completed" ? parsed.id : state.latestAnalysisId, updatedAt: now() }); await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 })); return next; }
+  async updateAnalysis(id: string, analysis: ReferenceAnalysis, jobId?: string) {
+    return this.mutate(async () => { if (jobId) await this.assertActiveJob(id, jobId); return this.writeAnalysis(id, analysis); });
+  }
+  async propagateStale(id: string, sourceHash: string, manifestHash: string, promptVersion: string) { return this.mutate(async () => { const state = await this.get(id); const analyses = state.analyses.map((analysis) => { const staleReasons = [...(analysis.sourceHash !== sourceHash ? ["source" as const] : []), ...(analysis.manifestHash !== manifestHash ? ["manifest" as const] : []), ...(analysis.promptVersion !== promptVersion ? ["prompt" as const] : [])]; return referenceAnalysisSchema.parse({ ...analysis, stale: staleReasons.length > 0, staleReasons }); }); const next = referenceStateSchema.parse({ ...state, analyses, updatedAt: now() }); await atomicWrite(this.statePath(id), stringify(next, { lineWidth: 0 })); return next; }); }
+  async writeAnalysisFile(id: string, analysisId: string, relative: string, content: string, jobId?: string) {
+    if (!/^(?:batches|segments|chapters|focus|sections)\/[a-zA-Z0-9_-]+\.(?:ya?ml|md)$|^characters\/[a-zA-Z0-9%-]+\.yaml$|^(?:index\.yaml|radar\.yaml|report\.md)$/.test(relative)) throw new AppError("REFERENCE_PATH_INVALID", "分析文件路径无效。", 400, false);
+    const target = path.join(this.analysisDir(id, analysisId), relative);
+    return this.mutate(async () => { if (jobId) await this.assertActiveJob(id, jobId); await atomicWrite(target, content); return target; });
+  }
   async readAnalysisFile(id: string, analysisId: string, relative: string, maxChars = 80_000) { const root = this.analysisDir(id, analysisId); const target = path.resolve(root, relative); if (!target.startsWith(`${root}${path.sep}`) || !/\.(?:md|ya?ml)$/.test(target)) throw new AppError("REFERENCE_PATH_INVALID", "分析文件路径无效。", 400, false); const content = await readFile(target, "utf8").catch(() => { throw new AppError("REFERENCE_ANALYSIS_NOT_FOUND", "没有找到这份拆书结果。", 404, false); }); return content.slice(0, maxChars); }
   async listAnalysisFiles(id: string, analysisId: string, directory: "batches" | "segments" | "chapters" | "focus") { const root = path.join(this.analysisDir(id, analysisId), directory); return (await readdir(root, { withFileTypes: true }).catch(() => [])).filter((item) => item.isFile()).map((item) => `${directory}/${item.name}`).sort(); }
   async section(id: string, analysisId: string, key: string): Promise<ReferenceSection> { return referenceSectionSchema.parse(parse(await this.readAnalysisFile(id, analysisId, `sections/${key}.yaml`, 200_000))); }

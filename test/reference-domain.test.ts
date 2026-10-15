@@ -17,6 +17,7 @@ import {
   segmentAnalysisSchema,
 } from "../src/domain";
 import { errorBody } from "../src/application/errors";
+import { matchChapterPatterns } from "../src/infrastructure/chapter-pattern-matcher";
 import {
   buildChapterManifest,
   decodeReferenceSource,
@@ -100,10 +101,10 @@ test("stage and macro evidence offsets come from verified source text", () => {
   assert.throws(() => validateSegmentOutput({ ...raw, objective: undefined }, ranges, source));
 });
 
-test("reference parser detects headings and covers every character exactly once", () => {
+test("reference parser detects headings and covers every character exactly once", async () => {
   const content =
     "前言\n说明\n第1卷 起航\n第1章 雨夜\n正文一\n第2章 来客\n正文二\n第3章 决定\n正文三\n";
-  const manifest = buildChapterManifest(content, "a".repeat(64));
+  const manifest = await buildChapterManifest(content, "a".repeat(64));
   assert.equal(manifest.method, "headings");
   assert.equal(manifest.chapters[0]?.kind, "frontmatter");
   assert.equal(manifest.chapters[1]?.volume, "第1卷 起航");
@@ -116,14 +117,14 @@ test("reference parser detects headings and covers every character exactly once"
     );
 });
 
-test("reference parser accepts common web-novel chapter labels without creating separator frontmatter", () => {
+test("reference parser accepts common web-novel chapter labels without creating separator frontmatter", async () => {
   const content = [
     "------------\n\n001章\n\n正文一。\n",
     "------------\n\n002章 新的局面\n\n正文二。\n",
     "【第叁回：夜归】\n\n正文三。\n",
     "Chapter 004 Return\n\n正文四。\n",
   ].join("");
-  const manifest = buildChapterManifest(content, "c".repeat(64));
+  const manifest = await buildChapterManifest(content, "c".repeat(64));
   assert.equal(manifest.method, "headings");
   assert.equal(manifest.chapters.length, 4);
   assert.equal(manifest.chapters[0]?.title, "001章");
@@ -133,55 +134,55 @@ test("reference parser accepts common web-novel chapter labels without creating 
   assert.equal(manifest.chapters.at(-1)?.end, content.length);
 });
 
-test("reference parser keeps a chapter boundary but shortens a title glued to prose", () => {
+test("reference parser keeps a chapter boundary but shortens a title glued to prose", async () => {
   const glued = `295章 ${"正文粘在标题后".repeat(30)}。后续正文`;
   const content = `001章\n正文\n002章\n正文\n${glued}\n正文\n`;
-  const manifest = buildChapterManifest(content, "f".repeat(64));
+  const manifest = await buildChapterManifest(content, "f".repeat(64));
   assert.equal(manifest.chapters.length, 3);
   assert.ok((manifest.chapters[2]?.title.length ?? 0) <= 81);
   assert.equal(manifest.chapters[2]?.start, content.indexOf("295章"));
 });
 
-test("reference parser applies an author-defined anchored regular expression", () => {
+test("reference parser applies an author-defined anchored regular expression", async () => {
   const parser = chapterParserConfigSchema.parse({ version: 1, patterns: [{ id: "author-scene", name: "场次标题", pattern: "^SCENE\\s+\\d+", enabled: true, source: "author" }] });
   const content = "SCENE 1\n正文\nSCENE 2\n正文\nSCENE 3\n正文\n";
-  const manifest = buildChapterManifest(content, "9".repeat(64), 8_000, parser);
+  const manifest = await buildChapterManifest(content, "9".repeat(64), 8_000, parser);
   assert.equal(manifest.method, "headings");
   assert.deepEqual(manifest.chapters.map((item) => item.title), ["SCENE 1", "SCENE 2", "SCENE 3"]);
   assert.equal(chapterParserConfigSchema.safeParse({ version: 1, patterns: [{ id: "broken", name: "错误", pattern: "[", enabled: true, source: "author" }] }).success, false);
 });
 
-test("AI chapter regex normalization repairs transport escaping and wrappers", () => {
+test("AI chapter regex normalization repairs transport escaping and wrappers", async () => {
   const base = { name: "三位数字章节", explanation: "匹配三位数字章节。" };
-  const escaped = normalizeChapterPatternSuggestion({ ...base, pattern: String.raw`^\\d{3}章$` }, "001章");
+  const escaped = await normalizeChapterPatternSuggestion({ ...base, pattern: String.raw`^\\d{3}章$` }, "001章", matchChapterPatterns);
   assert.equal(escaped?.pattern, String.raw`^\d{3}章$`);
-  const wrapped = normalizeChapterPatternSuggestion({ ...base, pattern: "```regex\n/^\\d{3}章$/u\n```" }, "001章");
+  const wrapped = await normalizeChapterPatternSuggestion({ ...base, pattern: "```regex\n/^\\d{3}章$/u\n```" }, "001章", matchChapterPatterns);
   assert.equal(wrapped?.pattern, String.raw`^\d{3}章$`);
 });
 
-test("reference parser falls back to paragraph ranges without losing text", () => {
+test("reference parser falls back to paragraph ranges without losing text", async () => {
   const content = Array.from(
     { length: 100 },
     (_, index) => `段落${index}。${"内容".repeat(100)}\n\n`,
   ).join("");
-  const manifest = buildChapterManifest(content, "b".repeat(64), 1_000);
+  const manifest = await buildChapterManifest(content, "b".repeat(64), 1_000);
   assert.equal(manifest.method, "fixed");
   assert.equal(manifest.chapters[0]?.start, 0);
   assert.equal(manifest.chapters.at(-1)?.end, content.length);
   assert.ok(manifest.chapters.length > 10);
 });
 
-test("small references still receive the minimum valid budget", () => {
-  const manifest = buildChapterManifest("很短的参考文本。", "d".repeat(64));
+test("small references still receive the minimum valid budget", async () => {
+  const manifest = await buildChapterManifest("很短的参考文本。", "d".repeat(64));
   assert.equal(
     estimateDeconstruction(manifest, "standard", []).recommendedBudget,
     MIN_REFERENCE_TOKEN_BUDGET,
   );
 });
 
-test("chapter range limits estimates and selected workflow chapters", () => {
+test("chapter range limits estimates and selected workflow chapters", async () => {
   const content = Array.from({ length: 8 }, (_, index) => `${String(index + 1).padStart(3, "0")}章\n${"正文".repeat(2_000)}\n`).join("");
-  const manifest = buildChapterManifest(content, "8".repeat(64));
+  const manifest = await buildChapterManifest(content, "8".repeat(64));
   const range = { fromChapter: 3, toChapter: 5 };
   const selected = referenceChaptersInRange(manifest, range);
   assert.deepEqual(selected.map((chapter) => chapter.title), ["003章", "004章", "005章"]);
@@ -402,12 +403,12 @@ test("stage grouping bounds serialized analysis tokens without losing chapters",
   assert.deepEqual(groupReferenceSegments([], new Map()), []);
 });
 
-test("synthetic 10MiB novel is covered exactly once without an unbounded model batch", () => {
+test("synthetic 10MiB novel is covered exactly once without an unbounded model batch", async () => {
   const paragraph = `${"a".repeat(7_998)}\n\n`;
   const source = paragraph
     .repeat(Math.ceil((10 * 1024 * 1024) / paragraph.length))
     .slice(0, 10 * 1024 * 1024);
-  const manifest = buildChapterManifest(source, "c".repeat(64));
+  const manifest = await buildChapterManifest(source, "c".repeat(64));
   const batches = makeReferenceBatches(
     "11111111-1111-4111-8111-111111111111",
     "analysis",

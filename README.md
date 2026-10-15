@@ -6,7 +6,7 @@
 
 把一句模糊想法收束为可执行蓝图，再沿一条可恢复、可审查、保护作者修改的生产链稳定写下去。
 
-![Version](https://img.shields.io/badge/version-0.2.0-6f4e37)
+[![Release](https://img.shields.io/badge/release-2026--10--15-6f4e37)](https://github.com/ExplosiveCoderflome/ani-book-agent/releases/tag/2026-10-15)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.18-43853d)
 ![Runtime](https://img.shields.io/badge/Agent_Runtime-Mastra-7c3aed)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -145,6 +145,8 @@ pnpm dev
 - 张力曲线支持锁定作者节点；除非作者明确要求整条替换，否则 Agent 必须保留锁定点。
 - 章节正文、连续性增量、新角色档案和实际张力在校验后一起提交，避免只更新一半。
 - 重复提案幂等处理；Agent 没有删除权威文件的能力。
+- 提案原文与批准、拒绝决定保存在本地；被拒绝或内容被篡改的提案不能继续应用。
+- 规划确认绑定当前文件版本；任务取消或失败后，旧运行的迟到结果不能继续提交。
 
 ### 单书目录
 
@@ -163,6 +165,7 @@ novels/<novel-id>/
 ├─ workspace/
 │  ├─ ideas.md                         # 灵感便笺
 │  ├─ skill-bindings.yaml              # 本书 Skill 绑定
+│  ├─ proposals/*.yaml                 # 补丁原文与作者审批决定
 │  ├─ reviews/*.md                     # 项目审查报告
 │  ├─ references/adaptations/*.yaml    # 作者审批的机制迁移提案
 │  └─ analysis/*-tension-actual.yaml   # 实际张力与异常诊断
@@ -276,7 +279,7 @@ scripts/            # Mastra 开发/构建保护脚本
 
 构建前请先停止仍在运行的 `pnpm dev`。预构建脚本会拒绝覆盖正在被 Mastra 开发进程使用的输出目录。
 
-本次文档更新已验证单元/集成测试、E2E、类型检查、Web 构建和 Mastra 构建全部通过。
+本次发布已验证 173 项单元/集成测试、16 项 E2E、类型检查、Web 与 Mastra 构建，以及构建后 API 审批流程全部通过。
 
 ### 可选环境变量
 
@@ -294,11 +297,13 @@ scripts/            # Mastra 开发/构建保护脚本
 
 ## 最新更新
 
-### 2026-10-07
+### 2026-10-15
 
-- 新增市场趋势、全自动开书、结构迁移提案和作者偏好恢复，支持从公开榜单信号进入前三章创作。
-- 优化章节质量重写、模型瞬时故障恢复与长篇拆书分组，保留已完成的稳定结果。
-- 本地作者偏好与市场缓存默认不纳入 Git，避免提交个人创作选择与运行时快照。
+- 优化：提案审批持久保存，规划确认绑定当前版本，章节通过独立验收后才能推进进度。
+- 修复：并发保存丢失、提交中断后文件与进度不一致、作者文件被覆盖，以及取消后旧任务继续写入的问题。
+- 修复：首次全自动开书的 Skill 初始化失败、拆书任务竞争和自定义章节规则阻塞服务的问题。
+
+升级前的活动任务需取消后重启，未登记的历史待审批提案需重新生成；已有正文无需迁移。
 
 完整更新历史见 [docs/releases/release-notes.md](docs/releases/release-notes.md)。
 

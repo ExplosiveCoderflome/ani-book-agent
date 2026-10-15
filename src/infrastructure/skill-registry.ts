@@ -403,18 +403,9 @@ export class SkillRegistryService {
   }
   async bindings(novelId: string): Promise<SkillBindings> {
     await this.ensureSeeded();
-    const state = await this.repository.get(novelId);
-    const fileRecord = state.files["workspace/skill-bindings.yaml"];
-    if (!fileRecord) {
-      const defaults = skillBindingsSchema.parse({ version: 1, skills: builtinIds.map((skillId) => ({ skillId, enabled: true, version: "latest", agents: ["novel-agent", "novel-critic"], tasks: [] })) });
-      const content = makeYaml(defaults);
-      const changes = [{ operation: "create" as const, path: "workspace/skill-bindings.yaml", content }];
-      const proposal = await this.repository.prepareProposal(novelId, { intent: "初始化 Skill 绑定", summary: "启用官方小说创作 Skill", changes });
-      const applied = await this.repository.applyProposal(proposal, true);
-      await this.repository.saveAuthorFile(novelId, "workspace/skill-bindings.yaml", content, applied.state.files["workspace/skill-bindings.yaml"]!.sha256);
-      return defaults;
-    }
-    try { return skillBindingsSchema.parse(parse((await this.repository.readProjectFile(novelId, "workspace/skill-bindings.yaml", 0, 100_000)).content)); }
+    const defaults = skillBindingsSchema.parse({ version: 1, skills: builtinIds.map((skillId) => ({ skillId, enabled: true, version: "latest", agents: ["novel-agent", "novel-critic"], tasks: [] })) });
+    const file = await this.repository.initializeSkillBindings(novelId, defaults);
+    try { return skillBindingsSchema.parse(parse(file.content)); }
     catch { throw new AppError("SKILL_BINDINGS_INVALID", "作品的 Skill 绑定文件无法解析，请修复后再继续。", 409, true, undefined, "reread"); }
   }
   async saveBindings(novelId: string, bindings: SkillBindings, expectedSha256: string) {

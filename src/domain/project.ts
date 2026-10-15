@@ -13,6 +13,16 @@ export const fileRecordSchema = z.object({
   updatedAt: z.string(),
 });
 
+export const productionAuthorizationSchema = z.object({
+  jobId: z.string().min(1),
+  goal: z.enum(["write_chapters", "review_project", "export"]),
+  scope: z.object({ fromChapter: z.number().int().positive().optional(), toChapter: z.number().int().positive().optional(), paths: z.array(z.string()).max(200).optional() }),
+  interactionMode: z.enum(["standard", "autonomous_opening"]),
+  revoked: z.boolean().default(false),
+  confirmedPlan: z.object({ volume: z.number().int().positive(), planSha256: z.string().length(64), curveSha256: z.string().length(64) }).optional(),
+});
+export type ProductionAuthorization = z.infer<typeof productionAuthorizationSchema>;
+
 export const novelStateSchema = z.object({
   schemaVersion: z.literal(2),
   novelId: z.string().uuid(),
@@ -21,6 +31,7 @@ export const novelStateSchema = z.object({
   currentVolume: z.number().int().positive(),
   nextChapter: z.number().int().positive(),
   activeJobId: z.string().optional(),
+  productionAuthorization: productionAuthorizationSchema.optional(),
   approvalMode: approvalModeSchema,
   files: z.record(z.string(), fileRecordSchema),
   appliedProposalIds: z.array(z.string()).default([]),
@@ -173,7 +184,8 @@ export function isAutonomousOpeningBundle(state: NovelState, changes: Array<z.in
 
 export function patchApproval(state: NovelState, changes: Array<z.infer<typeof patchChangeSchema>>): "auto" | "author" {
   if (isAutonomousOpeningBundle(state, changes)) return "auto";
-  if (changes.some((change) => change.path === "book/blueprint.md" || change.path === "book/tension-curve.yaml" || /^volumes\/volume-\d{3}-tension\.yaml$/.test(change.path) || change.path.startsWith("book/characters/"))) return "author";
+  if (state.phase !== "discovery" && changes.some((change) => change.path.toLowerCase() === "book/ledger.yaml")) return "author";
+  if (changes.some((change) => /^(?:book\/(?:blueprint\.md|tension-curve\.yaml)$|volumes\/volume-\d{3}-tension\.yaml$|book\/characters\/|chapters\/)/i.test(change.path))) return "author";
   return changes.some((change) => {
     const record = state.files[change.path];
     return record?.protected || record?.source === "author";

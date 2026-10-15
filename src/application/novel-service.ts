@@ -4,6 +4,7 @@ import {
 } from "../domain";
 import { AppError } from "./errors";
 import { productionModelRetry } from "./production-progress";
+import type { ProductionClaimOptions } from "./ports";
 import type { WorkbenchDependencies } from "./workbench-dependencies";
 
 type Dependencies = Pick<WorkbenchDependencies, "novels" | "skills" | "preferences" | "production" | "interactive" | "adaptations" | "sanitizeError">;
@@ -97,18 +98,15 @@ export function createNovelService(deps: Dependencies) {
     if (starting.has(novelId)) throw new AppError("ACTIVE_JOB", "当前作品已有生产任务。", 409, true);
     starting.add(novelId);
     let activatedJobId: string | undefined;
-    let replacedJobId: string | undefined;
-    let resetAutonomousOnFailure = false;
     try {
       const state = await deps.novels.get(novelId);
-      resetAutonomousOnFailure = state.approvalMode === "autonomous_opening";
+      let previousJob: ProductionClaimOptions["previousJob"];
       if (input.goal === "revise_files") throw new AppError("PATCH_REQUIRED", "文件修订请由 Agent 提交补丁；保护内容会在差异确认后应用。", 409, true, undefined, "author_approval");
       if (state.activeJobId) {
         const existing = await jobView(novelId, state.activeJobId);
         if (existing && ["queued", "running", "awaiting_author"].includes(existing.status)) throw new AppError("ACTIVE_JOB", "当前作品已有生产任务。", 409, true);
         if (existing?.status === "failed" && options.retryOf !== (existing.retryOf ?? existing.id)) throw new AppError("FAILED_JOB_REQUIRES_ACTION", "上一次生产任务尚未处理，请先选择“一键重试”或“不再重试”。", 409, true);
-        replacedJobId = state.activeJobId;
-        await deps.novels.setActiveJob(novelId, undefined);
+        previousJob = { id: state.activeJobId, status: existing.status as "failed" | "completed" | "canceled" };
       }
       if (input.goal === "write_chapters" && (state.phase !== "writing" || !state.files["book/blueprint.md"] || !state.files["book/ledger.yaml"])) throw new AppError("BLUEPRINT_INCOMPLETE", "作品蓝图或连续性账本尚未准备完整，请让 Agent 补齐后再开始写作。", 409, true, undefined, "author_approval");
       if (input.goal === "write_chapters" && !state.files["book/tension-curve.yaml"]) throw new AppError("TENSION_CURVE_REQUIRED", "这部旧作品还没有全书张力曲线。请先让 Agent 生成曲线并确认，再开始下一次卷规划或章节生产。", 409, true, undefined, "author_approval");
@@ -131,7 +129,8 @@ export function createNovelService(deps: Dependencies) {
         .map(({ adaptation, file }) => [adaptation.id, file.sha256]));
       const createdAt = new Date().toISOString();
       const attempt = options.attempt ?? 1;
-      const activeState = await deps.novels.setActiveJob(novelId, run.runId);
+      const expectedStateHash = deps.novels.stateHash(await deps.novels.get(novelId));
+      const activeState = await deps.novels.claimProductionJob(novelId, run.runId, effectiveInput, interactionMode, { expectedStateHash, previousJob });
       activatedJobId = run.runId;
       const baseStateHash = deps.novels.stateHash(activeState);
       const execution = executionEnvelopeSchema.parse({
@@ -143,17 +142,15 @@ export function createNovelService(deps: Dependencies) {
       void run.start({ inputData: { novelId, jobId: run.runId, goal: effectiveInput.goal, scope: effectiveInput.scope, brief: effectiveInput.brief, baseStateHash, skillVersions, execution, tensionCurveRequired: true, interactionMode, retryOf: options.retryOf, attempt } })
         .then(async (result: any) => {
           const outcome = result?.status ?? result?.result?.status;
-          if (interactionMode === "autonomous_opening" && ["success", "completed", "failed", "canceled"].includes(outcome)) await deps.novels.setApprovalMode(novelId, "milestone").catch(() => undefined);
+          if (["success", "completed", "failed", "canceled"].includes(outcome)) await deps.novels.finishProductionJob(novelId, run.runId, outcome === "success" ? "completed" : outcome).catch(() => undefined);
         })
         .catch(async (error) => {
-          if (interactionMode === "autonomous_opening") await deps.novels.setApprovalMode(novelId, "milestone").catch(() => undefined);
+          await deps.novels.finishProductionJob(novelId, run.runId, "failed").catch(() => undefined);
           console.warn("小说生产任务失败", { runId: run.runId, message: deps.sanitizeError(error) });
         });
       return productionJobSchema.parse({ id: run.runId, novelId, goal: effectiveInput.goal, scope: effectiveInput.scope, brief: effectiveInput.brief, interactionMode, retryOf: options.retryOf, attempt, status: "running", baseStateHash, createdAt, updatedAt: createdAt });
     } catch (error) {
-      if (activatedJobId) await deps.novels.clearActiveJob(novelId, activatedJobId).catch(() => undefined);
-      if (replacedJobId) await deps.novels.setActiveJob(novelId, replacedJobId).catch(() => undefined);
-      if (resetAutonomousOnFailure && activatedJobId) await deps.novels.setApprovalMode(novelId, "milestone").catch(() => undefined);
+      if (activatedJobId) await deps.novels.finishProductionJob(novelId, activatedJobId, "failed").catch(() => undefined);
       throw error;
     } finally {
       starting.delete(novelId);
@@ -162,16 +159,15 @@ export function createNovelService(deps: Dependencies) {
   async function approveProposal(novelId: string, raw: unknown) {
     const proposal = patchProposalSchema.parse(raw);
     if (proposal.novelId !== novelId) throw new AppError("PROPOSAL_NOVEL_MISMATCH", "提案不属于当前作品。", 400, false);
-    if (proposal.status !== "pending") throw new AppError("PROPOSAL_NOT_PENDING", "这个提案已经处理过。", 409, false);
-    const applied = await deps.novels.applyProposal(proposal, true);
+    const applied = await deps.novels.approveProposal(proposal);
     const opened = proposal.changes.some((change) => change.path === "book/blueprint.md");
     const job = opened && !applied.duplicate ? await startProductionJob(novelId, { goal: "write_chapters", scope: { fromChapter: applied.state.nextChapter, toChapter: applied.state.nextChapter + 2 } }) : undefined;
     return { proposal: applied.proposal, novel: applied.state, job };
   }
-  function rejectProposal(novelId: string, raw: unknown) {
+  async function rejectProposal(novelId: string, raw: unknown) {
     const proposal = patchProposalSchema.parse(raw);
     if (proposal.novelId !== novelId) throw new AppError("PROPOSAL_NOVEL_MISMATCH", "提案不属于当前作品。", 400, false);
-    return { ...proposal, status: "rejected" as const };
+    return deps.novels.rejectProposal(proposal);
   }
   async function resumeJob(novelId: string, jobId: string, input: JobAction) {
     const current = await jobView(novelId, jobId);
@@ -186,19 +182,19 @@ export function createNovelService(deps: Dependencies) {
     }
     const run = await deps.production.createRun({ runId: jobId, resourceId: novelId });
     if (input.action === "cancel") {
+      await deps.novels.finishProductionJob(novelId, jobId, "canceled");
       if (["queued", "running", "awaiting_author"].includes(current.status)) await run.cancel();
-      await deps.novels.clearActiveJob(novelId, jobId);
-      if (current.interactionMode === "autonomous_opening") await deps.novels.setApprovalMode(novelId, "milestone");
       return { ...current, status: "canceled" as const };
     }
     if (current.status !== "awaiting_author") throw new AppError("JOB_NOT_SUSPENDED", "当前任务不在等待作者处理状态。", 409, true);
+    if (current.checkpoint !== "curve_confirmation") throw new AppError("JOB_RESTART_REQUIRED", "此任务使用旧的确认流程，请取消后重新启动。", 409, true);
+    await deps.novels.confirmProductionPlan(novelId, jobId);
     void run.resume({ step: "run-production", resumeData: input })
       .then(async (result) => {
-        if (result.status === "canceled") await deps.novels.clearActiveJob(novelId, jobId).catch(() => undefined);
-        if (current.interactionMode === "autonomous_opening" && ["success", "failed", "canceled"].includes(result.status)) await deps.novels.setApprovalMode(novelId, "milestone").catch(() => undefined);
+        if (["success", "failed", "canceled"].includes(result.status)) await deps.novels.finishProductionJob(novelId, jobId, result.status === "success" ? "completed" : result.status as "failed" | "canceled").catch(() => undefined);
       })
       .catch(async (error) => {
-        if (current.interactionMode === "autonomous_opening") await deps.novels.setApprovalMode(novelId, "milestone").catch(() => undefined);
+        await deps.novels.finishProductionJob(novelId, jobId, "failed").catch(() => undefined);
         console.warn("恢复生产任务失败", { jobId, message: deps.sanitizeError(error) });
       });
     return { ...current, status: "running" as const, updatedAt: new Date().toISOString() };
@@ -207,7 +203,7 @@ export function createNovelService(deps: Dependencies) {
     const state = await deps.novels.get(novelId);
     if (state.approvalMode !== "autonomous_opening") return { novel: state };
     if (state.activeJobId) await resumeJob(novelId, state.activeJobId, { action: "cancel" });
-    return { novel: await deps.novels.setApprovalMode(novelId, "milestone") };
+    return { novel: await deps.novels.cancelAutonomousOpening(novelId) };
   }
   return { listNovels, createNovel, listFiles, readFile, saveAuthorFile, recordPreference, recallChatMessages, chatSession, jobView, projectSnapshot, startProductionJob, approveProposal, rejectProposal, resumeJob, cancelAutoOpening };
 }

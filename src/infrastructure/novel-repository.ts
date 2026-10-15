@@ -1,31 +1,43 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parse, stringify } from "yaml";
-import { ZodError } from "zod";
+import { z } from "zod";
 import {
-  actualTensionCurveSchema, actualTensionPath, bookTensionCurveSchema, diagnoseTension, isTargetTensionCurvePath, isTensionCurvePath,
-  characterProfileContentSchema, isAutonomousOpeningBundle, ledgerSchema, lockedPointChanges, markAuthorEdits, mergeLedger, newNovelState, normalizeNovelPath, novelStateSchema, patchApproval, patchProposalSchema,
-  referenceAdaptationSchema, targetTensionCurveSchema, tensionCurveAssetSchema, transitionAdaptation, volumeTensionCurveSchema, volumeTensionPath,
-  type ApprovalMode, type CriticResult, type NovelLedger, type NovelState, type PatchProposal, type ReferenceAdaptation, type TargetTensionCurve,
-  type FileContent, type NovelFileView, type NovelSummary,
+  criticResultSchema, ledgerSchema, normalizeNovelPath, novelStateSchema, patchProposalSchema, referenceAdaptationSchema,
+  type ApprovalMode, type NovelLedger, type NovelState, type PatchProposal, type ReferenceAdaptation,
+  type ProductionInteractionMode, type ProductionJobRequest, type SkillBindings, type FileContent, type NovelFileView, type NovelSummary,
 } from "../domain";
+import {
+  contentHash, stateHash, adaptationAuthorityHashes, decideNovelCommand, novelCommandPaths, NovelPolicyError,
+  type ChapterCommitInput, type ClaimOptions, type NovelCommand, type NovelDecision, type NovelFileChange,
+} from "../domain/novel-commands";
 import { AppError } from "../application/errors";
+import { withNovelLock } from "./novel-lock";
 
 const textLimit = 1_000_000;
-export const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([key, item]) => [key, canonical(item)]));
-  return value;
-}
-export const novelStateHash = (state: NovelState) => sha256(JSON.stringify(canonical(state)));
+export const sha256 = contentHash;
+export const novelStateHash = stateHash;
 
-async function atomicWrite(filePath: string, content: string) {
+async function atomicWrite(filePath: string, content: string, createOnly = false) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${randomUUID()}.tmp`;
-  await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
-  await rename(temporary, filePath);
+  try {
+    await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+    if (createOnly) await link(temporary, filePath);
+    else await rename(temporary, filePath);
+  } finally { await unlink(temporary).catch(() => undefined); }
+}
+
+const pendingCommitSchema = z.object({
+  phase: z.enum(["prepared", "rolling_back"]).default("prepared"),
+  beforeState: z.string().nullable(), afterStateSha256: z.string().length(64),
+  files: z.array(z.object({ path: z.string(), before: z.string().nullable(), afterSha256: z.string().length(64) })),
+});
+type PendingCommit = z.infer<typeof pendingCommitSchema>;
+async function readOptional(filePath: string) {
+  try { return await readFile(filePath, "utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
 }
 
 export class NovelRepository {
@@ -41,67 +53,85 @@ export class NovelRepository {
   }
   private statePath(novelId: string) { return path.join(this.directory(novelId), "novel-state.yaml"); }
   private filePath(novelId: string, relativePath: string) {
-    const clean = normalizePath(relativePath);
     const root = this.directory(novelId);
-    const target = path.resolve(root, clean);
+    const target = path.resolve(root, normalizePath(relativePath));
     if (!target.startsWith(`${root}${path.sep}`)) throw new AppError("INVALID_NOVEL_PATH", "作品文件路径无效。", 400, false);
     return target;
   }
 
+  // Every public mutation enters the same lock and applies one pure domain decision.
+  // Read reconciliation uses this same finalizer because external author edits change authority.
+  private async execute(novelId: string, command: NovelCommand): Promise<NovelDecision> {
+    return withNovelLock(this.directory(novelId), async () => {
+      try {
+        let state = command.type === "create" ? undefined : await this.get(novelId);
+        const contents: Record<string, string | undefined> = {};
+        const paths = command.type === "create" ? ["workspace/ideas.md"] : novelCommandPaths(state!, command);
+        for (const relativePath of paths) {
+          const content = await readOptional(this.filePath(novelId, relativePath));
+          contents[relativePath] = content ?? undefined;
+          if (state?.files[relativePath] && content !== null && state.files[relativePath]!.sha256 !== sha256(content)) {
+            const observed = decideNovelCommand(state, { type: "observe_external", path: relativePath, content }, { now: new Date().toISOString(), contents });
+            await this.finalize(observed);
+            state = observed.state;
+          }
+        }
+        const decision = decideNovelCommand(state, command, { now: new Date().toISOString(), contents });
+        await this.finalize(decision);
+        return decision;
+      } catch (error) {
+        if (error instanceof NovelPolicyError) throw new AppError(error.code, error.message, error.code.endsWith("NOT_FOUND") ? 404 : 409, error.recoverable, undefined, error.nextAction);
+        throw error;
+      }
+    });
+  }
+  private async finalize(decision: NovelDecision) {
+    if (!decision.duplicate) await this.commitFiles(decision.state, decision.changes);
+  }
+
   async create(title: string, approvalMode: ApprovalMode = "milestone"): Promise<NovelState> {
     const novelId = randomUUID();
-    const now = new Date().toISOString();
-    const state = newNovelState(title.trim() || "未命名作品", novelId, now, approvalMode);
-    const ideas = "# 灵感记录\n\n";
-    state.files["workspace/ideas.md"] = { sha256: sha256(ideas), version: 1, source: "author", protected: true, updatedAt: now };
-    await mkdir(this.directory(novelId), { recursive: false });
-    await Promise.all([
-      atomicWrite(this.filePath(novelId, "workspace/ideas.md"), ideas),
-      mkdir(path.join(this.directory(novelId), "workspace", "references"), { recursive: true }),
-    ]);
-    await this.writeState(state);
-    return state;
+    return (await this.execute(novelId, { type: "create", novelId, title, approvalMode })).state;
   }
 
   async get(novelId: string): Promise<NovelState> {
-    try { return novelStateSchema.parse(parse(await readFile(this.statePath(novelId), "utf8"))); }
-    catch (error) {
-      if (error instanceof AppError) throw error;
-      throw new AppError("NOVEL_NOT_FOUND", "没有找到这部作品。", 404, false);
-    }
+    return withNovelLock(this.directory(novelId), async () => {
+      await this.recoverPendingCommit(novelId);
+      try { return novelStateSchema.parse(parse(await readFile(this.statePath(novelId), "utf8"))); }
+      catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError("NOVEL_NOT_FOUND", "没有找到这部作品。", 404, false);
+      }
+    });
   }
-
   async list(): Promise<NovelSummary[]> {
     const entries = await readdir(this.root, { withFileTypes: true }).catch(() => []);
     const novels = await Promise.all(entries.filter((item) => item.isDirectory()).map(async (item) => this.get(item.name).catch(() => undefined)));
     return novels.filter((item): item is NovelState => Boolean(item)).map(({ novelId, title, phase, nextChapter, updatedAt }) => ({ novelId, title, phase, nextChapter, updatedAt })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
-
   async listFiles(novelId: string): Promise<NovelFileView[]> {
-    const state = await this.get(novelId);
-    return Promise.all(Object.entries(state.files).map(async ([filePath, record]) => ({ path: filePath, ...record, size: (await stat(this.filePath(novelId, filePath)).catch(() => ({ size: 0 }))).size })));
+    return withNovelLock(this.directory(novelId), async () => {
+      const state = await this.get(novelId);
+      return Promise.all(Object.entries(state.files).map(async ([filePath, record]) => ({ path: filePath, ...record, size: (await stat(this.filePath(novelId, filePath)).catch(() => ({ size: 0 }))).size })));
+    });
   }
-
   async readProjectFile(novelId: string, relativePath: string, offset = 0, maxChars = 40_000): Promise<FileContent> {
-    const state = await this.get(novelId);
-    const clean = normalizePath(relativePath);
-    let record = state.files[clean];
-    if (!record) throw new AppError("FILE_NOT_FOUND", "没有找到这个作品文件。", 404, true, undefined, "reread");
-    const target = this.filePath(novelId, clean);
-    const metadata = await stat(target);
-    if (metadata.size > textLimit) throw new AppError("FILE_TOO_LARGE", "文件过大，请缩小读取范围。", 413, true, undefined, "reread");
-    const full = await readFile(target, "utf8");
-    const actualSha256 = sha256(full);
-    if (actualSha256 !== record.sha256) {
-      const now = new Date().toISOString();
-      record = { sha256: actualSha256, version: record.version + 1, source: "author", protected: true, updatedAt: now };
-      state.files[clean] = record;
-      state.updatedAt = now;
-      await this.writeState(state);
-    }
-    return { path: clean, ...record, size: metadata.size, content: full.slice(offset, offset + maxChars) };
+    return withNovelLock(this.directory(novelId), async () => {
+      let state = await this.get(novelId);
+      const clean = normalizePath(relativePath);
+      if (!state.files[clean]) throw new AppError("FILE_NOT_FOUND", "没有找到这个作品文件。", 404, true, undefined, "reread");
+      const target = this.filePath(novelId, clean);
+      const metadata = await stat(target);
+      if (metadata.size > textLimit) throw new AppError("FILE_TOO_LARGE", "文件过大，请缩小读取范围。", 413, true, undefined, "reread");
+      const full = await readFile(target, "utf8");
+      if (sha256(full) !== state.files[clean]!.sha256) {
+        const decision = decideNovelCommand(state, { type: "observe_external", path: clean, content: full }, { now: new Date().toISOString(), contents: { [clean]: full } });
+        await this.finalize(decision);
+        state = decision.state;
+      }
+      return { path: clean, ...state.files[clean]!, size: metadata.size, content: full.slice(offset, offset + maxChars) };
+    });
   }
-
   async search(novelId: string, query: string, limit = 8) {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return [];
@@ -115,289 +145,172 @@ export class NovelRepository {
     }
     return matches;
   }
-
   async prepareProposal(novelId: string, input: { intent: string; summary: string; changes: PatchProposal["changes"] }): Promise<PatchProposal> {
-    const changes = await this.normalizeCurveBasis(novelId, input.changes.map((change) => ({ ...change, path: normalizePath(change.path) })));
-    await Promise.all(changes.filter((change) => change.operation === "replace").map((change) => this.readProjectFile(novelId, change.path, 0, 1)));
-    const state = await this.get(novelId);
-    this.validateChanges(state, changes);
-    await this.validateLockedCurveChanges(novelId, changes);
-    return patchProposalSchema.parse({ id: randomUUID(), novelId, intent: input.intent, summary: input.summary, changes, approval: patchApproval(state, changes), status: "pending", createdAt: new Date().toISOString() });
+    const proposal = patchProposalSchema.parse({ ...input, id: randomUUID(), novelId, approval: "auto", status: "pending", createdAt: new Date().toISOString() });
+    return (await this.execute(novelId, { type: "prepare_proposal", proposal })).proposal!;
   }
-
-  async applyProposal(raw: PatchProposal, authorApproved = false, updateState?: (state: NovelState) => void): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }> {
+  async applyProposal(raw: PatchProposal): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }> {
     const proposal = patchProposalSchema.parse(raw);
-    await Promise.all(proposal.changes.filter((change) => change.operation === "replace").map((change) => this.readProjectFile(proposal.novelId, change.path, 0, 1)));
-    let state = await this.get(proposal.novelId);
-    if (state.appliedProposalIds.includes(proposal.id)) return { proposal: { ...proposal, status: "applied" }, state, duplicate: true };
-    this.validateChanges(state, proposal.changes);
-    await this.validateLockedCurveChanges(proposal.novelId, proposal.changes);
-    const approval = patchApproval(state, proposal.changes);
-    if (approval === "author" && !authorApproved) throw new AppError("AUTHOR_APPROVAL_REQUIRED", "这次修改需要作者确认。", 409, true, undefined, "author_approval");
-    const backups = new Map<string, string | undefined>();
-    try {
-      for (const change of proposal.changes) {
-        const target = this.filePath(proposal.novelId, change.path);
-        backups.set(change.path, await readFile(target, "utf8").catch(() => undefined));
-        await atomicWrite(target, change.content);
-      }
-    } catch (error) {
-      for (const [filePath, content] of backups) {
-        const target = this.filePath(proposal.novelId, filePath);
-        if (content === undefined) await unlink(target).catch(() => undefined);
-        else await atomicWrite(target, content).catch(() => undefined);
-      }
-      throw error;
-    }
-    const now = new Date().toISOString();
-    for (const change of proposal.changes) {
-      const prior = state.files[change.path];
-      state.files[change.path] = { sha256: sha256(change.content), version: (prior?.version ?? 0) + 1, source: prior?.source === "author" ? "author" : "agent", protected: Boolean(prior?.protected), updatedAt: now };
-    }
-    if (state.files["book/blueprint.md"] && state.files["book/ledger.yaml"] && state.files["book/tension-curve.yaml"] && state.phase === "discovery") state.phase = "writing";
-    state.appliedProposalIds = [...state.appliedProposalIds.slice(-199), proposal.id];
-    updateState?.(state);
-    state.updatedAt = now;
-    await this.writeState(state);
-    return { proposal: { ...proposal, approval, status: "applied" }, state, duplicate: false };
+    const result = await this.execute(proposal.novelId, { type: "apply_proposal", proposal });
+    return { proposal: result.proposal!, state: result.state, duplicate: result.duplicate };
   }
-
-  async saveAuthorFile(novelId: string, relativePath: string, content: string, expectedSha256: string) {
-    await this.readProjectFile(novelId, relativePath, 0, 1);
-    const state = await this.get(novelId);
-    const clean = normalizePath(relativePath);
-    const current = state.files[clean];
-    if (!current) throw new AppError("FILE_NOT_FOUND", "没有找到这个作品文件。", 404, false);
-    if (current.sha256 !== expectedSha256) throw new AppError("FILE_STALE", "文件已变化，请重新读取后再保存。", 409, true, undefined, "reread");
-    let savedContent = content;
-    if (isTargetTensionCurvePath(clean)) {
-      try {
-        const before = targetTensionCurveSchema.parse(parse((await this.readProjectFile(novelId, clean, 0, textLimit)).content));
-        const after = targetTensionCurveSchema.parse(parse(content));
-        savedContent = stringify(markAuthorEdits(before, after), { lineWidth: 0 });
-      } catch (error) { throw curveError(error); }
-    } else if (isTensionCurvePath(clean)) {
-      throw new AppError("ACTUAL_CURVE_READ_ONLY", "实际张力曲线由 Critic 维护，不能手工编辑。", 409, false);
-    }
-    await atomicWrite(this.filePath(novelId, clean), savedContent);
-    const now = new Date().toISOString();
-    state.files[clean] = { sha256: sha256(savedContent), version: current.version + 1, source: "author", protected: true, updatedAt: now };
-    state.updatedAt = now;
-    await this.writeState(state);
-    return this.readProjectFile(novelId, clean);
+  async approveProposal(raw: PatchProposal): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }> {
+    const proposal = patchProposalSchema.parse(raw);
+    const result = await this.execute(proposal.novelId, { type: "approve_proposal", proposal });
+    return { proposal: result.proposal!, state: result.state, duplicate: result.duplicate };
   }
-
+  async rejectProposal(raw: PatchProposal): Promise<PatchProposal> {
+    const proposal = patchProposalSchema.parse(raw);
+    return (await this.execute(proposal.novelId, { type: "reject_proposal", proposal })).proposal!;
+  }
+  async saveAuthorFile(novelId: string, relativePath: string, content: string, expectedSha256: string): Promise<FileContent> {
+    return withNovelLock(this.directory(novelId), async () => {
+      const result = await this.execute(novelId, { type: "author_edit", path: relativePath, content, expectedSha256 });
+      return this.readProjectFile(novelId, result.path!);
+    });
+  }
+  async initializeSkillBindings(novelId: string, bindings: SkillBindings): Promise<FileContent> {
+    return withNovelLock(this.directory(novelId), async () => {
+      await this.execute(novelId, { type: "initialize_bindings", bindings });
+      return this.readProjectFile(novelId, "workspace/skill-bindings.yaml", 0, 100_000);
+    });
+  }
   adaptationAuthorityFiles(state: NovelState) {
-    return Object.fromEntries(Object.entries(state.files)
-      .filter(([filePath]) => filePath === "book/blueprint.md" || filePath === "book/ledger.yaml" || filePath === "book/tension-curve.yaml" || /^volumes\/volume-\d{3}(?:-tension)?\.(?:md|yaml)$/.test(filePath))
-      .map(([filePath, record]) => [filePath, record.sha256]));
+    return adaptationAuthorityHashes(state);
   }
-  adaptationSetHash(versions: Record<string, string>) { return sha256(JSON.stringify(canonical(versions))); }
-
+  adaptationSetHash(versions: Record<string, string>) { return sha256(JSON.stringify(Object.fromEntries(Object.entries(versions).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))); }
   async saveAdaptation(raw: ReferenceAdaptation) {
     const adaptation = referenceAdaptationSchema.parse(raw);
-    const state = await this.get(adaptation.novelId);
-    const relativePath = `workspace/references/adaptations/${adaptation.id}.yaml`;
-    const prior = state.files[relativePath];
-    const content = stringify(adaptation, { lineWidth: 0 });
-    await atomicWrite(this.filePath(adaptation.novelId, relativePath), content);
-    const timestamp = new Date().toISOString();
-    state.files[relativePath] = { sha256: sha256(content), version: (prior?.version ?? 0) + 1, source: adaptation.status === "proposed" ? "agent" : "author", protected: true, updatedAt: timestamp };
-    state.updatedAt = timestamp;
-    await this.writeState(state);
-    return { adaptation, file: state.files[relativePath] };
+    const result = await this.execute(adaptation.novelId, { type: "create_adaptation", adaptation });
+    return { adaptation: result.adaptation!, file: result.state.files[result.path!]! };
   }
-
   async adaptations(novelId: string) {
-    const state = await this.get(novelId);
-    const paths = Object.keys(state.files).filter((filePath) => /^workspace\/references\/adaptations\/[0-9a-f-]+\.yaml$/i.test(filePath));
-    const values = await Promise.all(paths.map((filePath) => this.readProjectFile(novelId, filePath, 0, 300_000).then((file) => ({ adaptation: referenceAdaptationSchema.parse(parse(file.content)), file })).catch(() => undefined)));
-    return values.filter((item): item is NonNullable<typeof item> => Boolean(item)).sort((left, right) => right.adaptation.updatedAt.localeCompare(left.adaptation.updatedAt));
+    return withNovelLock(this.directory(novelId), async () => {
+      const state = await this.get(novelId);
+      const paths = Object.keys(state.files).filter((filePath) => /^workspace\/references\/adaptations\/[0-9a-f-]+\.yaml$/i.test(filePath));
+      const values = [];
+      for (const filePath of paths) values.push(await this.readProjectFile(novelId, filePath, 0, 300_000).then((file) => ({ adaptation: referenceAdaptationSchema.parse(parse(file.content)), file })).catch(() => undefined));
+      return values.filter((item): item is NonNullable<typeof item> => Boolean(item)).sort((left, right) => right.adaptation.updatedAt.localeCompare(left.adaptation.updatedAt));
+    });
   }
-
   async updateAdaptation(novelId: string, adaptationId: string, action: "approve" | "reject") {
-    const found = (await this.adaptations(novelId)).find((item) => item.adaptation.id === adaptationId);
-    if (!found) throw new AppError("ADAPTATION_NOT_FOUND", "没有找到这个仿写提案。", 404, false);
-    let next: ReferenceAdaptation;
-    try { next = transitionAdaptation(found.adaptation, action); }
-    catch { throw new AppError("ADAPTATION_NOT_PROPOSED", "这个仿写提案已经处理过。", 409, false); }
-    return this.saveAdaptation(next);
+    const result = await this.execute(novelId, { type: "transition_adaptation", adaptationId, action });
+    return { adaptation: result.adaptation!, file: result.state.files[result.path!]! };
   }
-
   async markAdaptationStale(novelId: string, adaptationId: string, reasons: ReferenceAdaptation["staleReasons"]) {
-    const found = (await this.adaptations(novelId)).find((item) => item.adaptation.id === adaptationId);
-    if (!found) throw new AppError("ADAPTATION_NOT_FOUND", "没有找到这个仿写提案。", 404, false);
-    if (["rejected", "stale"].includes(found.adaptation.status)) return found;
-    return this.saveAdaptation(referenceAdaptationSchema.parse({ ...found.adaptation, status: "stale", staleReasons: [...new Set([...found.adaptation.staleReasons, ...reasons])], updatedAt: new Date().toISOString() }));
+    const result = await this.execute(novelId, { type: "stale_adaptation", adaptationId, reasons });
+    return { adaptation: result.adaptation!, file: result.state.files[result.path!]! };
   }
-
   async activeAdaptations(novelId: string, chapter: number) {
     return (await this.adaptations(novelId)).filter(({ adaptation }) => adaptation.status === "approved" && adaptation.scope.fromChapter <= chapter && adaptation.scope.toChapter >= chapter);
   }
-
   async readLedger(novelId: string): Promise<NovelLedger> {
-    const state = await this.get(novelId);
-    if (!state.files["book/ledger.yaml"]) return ledgerSchema.parse({ version: 1 });
-    return ledgerSchema.parse(parse((await this.readProjectFile(novelId, "book/ledger.yaml", 0, textLimit)).content));
-  }
-
-  async commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof mergeLedger>[2], newCharacterProfiles: CriticResult["newCharacterProfiles"] = [], actualTension?: CriticResult["actualTension"]) {
-    const state = await this.get(novelId);
-    if (state.nextChapter !== chapter) throw new AppError("CHAPTER_SEQUENCE", `当前应提交第 ${state.nextChapter} 章。`, 409, false);
-    const ledger = mergeLedger(await this.readLedger(novelId), chapter, delta);
-    const chapterPath = `chapters/chapter-${String(chapter).padStart(3, "0")}.md`;
-    const changes: PatchProposal["changes"] = [
-      { operation: state.files[chapterPath] ? "replace" : "create", path: chapterPath, ...(state.files[chapterPath] ? { baseSha256: state.files[chapterPath]!.sha256 } : {}), content: text },
-      { operation: state.files["book/ledger.yaml"] ? "replace" : "create", path: "book/ledger.yaml", ...(state.files["book/ledger.yaml"] ? { baseSha256: state.files["book/ledger.yaml"]!.sha256 } : {}), content: stringify(ledger, { lineWidth: 0 }) },
-      ...newCharacterProfiles.filter((profile) => !state.files[`book/characters/${profile.id}.md`]).map((profile) => ({ operation: "create" as const, path: `book/characters/${profile.id}.md`, content: profile.content })),
-    ];
-    const targetPath = volumeTensionPath(state.currentVolume);
-    const planPath = `volumes/volume-${String(state.currentVolume).padStart(3, "0")}.md`;
-    if (actualTension && state.files[targetPath] && state.files[planPath]) {
-      const [targetFile, existingActual] = await Promise.all([
-        this.readProjectFile(novelId, targetPath, 0, textLimit),
-        state.files[actualTensionPath(state.currentVolume)] ? this.readProjectFile(novelId, actualTensionPath(state.currentVolume), 0, textLimit) : undefined,
-      ]);
-      const target = volumeTensionCurveSchema.parse(parse(targetFile.content));
-      const matchedEvidence = actualTension.evidence.filter((excerpt) => normalizedForEvidence(text).includes(normalizedForEvidence(excerpt)));
-      const observation = matchedEvidence.length ? { ...actualTension, evidence: matchedEvidence } : { ...actualTension, evidence: ["正文证据未能精确定位；该观察仅供走势参考。"], confidence: Math.min(actualTension.confidence, .35) };
-      const prior = existingActual ? actualTensionCurveSchema.parse(parse(existingActual.content)) : undefined;
-      const points = [...(prior?.points.filter((point) => point.chapter !== chapter) ?? []), { id: `chapter-${String(chapter).padStart(3, "0")}`, chapter, ...observation }].sort((left, right) => left.chapter - right.chapter);
-      const actualPath = actualTensionPath(state.currentVolume);
-      const actual = actualTensionCurveSchema.parse({
-        schemaVersion: 1, kind: "actual", volume: state.currentVolume,
-        basis: { targetCurveSha256: targetFile.sha256, volumePlanSha256: state.files[planPath]!.sha256, chapterHashes: { ...(prior?.basis.chapterHashes ?? {}), [String(chapter)]: sha256(text) }, generatedAt: new Date().toISOString() },
-        points, diagnostics: diagnoseTension(points, target.points),
-      });
-      changes.push({ operation: state.files[actualPath] ? "replace" : "create", path: actualPath, ...(state.files[actualPath] ? { baseSha256: state.files[actualPath]!.sha256 } : {}), content: stringify(actual, { lineWidth: 0 }) });
-    }
-    const proposal = await this.prepareProposal(novelId, { intent: `提交第 ${chapter} 章`, summary: `稳定提交第 ${chapter} 章与连续性`, changes });
-    const result = await this.applyProposal({ ...proposal, approval: "auto" }, true, (next) => { next.nextChapter = chapter + 1; });
-    return { state: result.state, path: chapterPath, sha256: result.state.files[chapterPath]!.sha256 };
-  }
-
-  async setActiveJob(novelId: string, jobId?: string) {
-    const state = await this.get(novelId);
-    if (jobId && state.activeJobId && state.activeJobId !== jobId) throw new AppError("ACTIVE_JOB", "当前作品已有生产任务。", 409, true);
-    state.activeJobId = jobId;
-    state.updatedAt = new Date().toISOString();
-    await this.writeState(state);
-    return state;
-  }
-
-  async clearActiveJob(novelId: string, jobId: string) {
-    const state = await this.get(novelId);
-    if (state.activeJobId !== jobId) return state;
-    state.activeJobId = undefined;
-    state.updatedAt = new Date().toISOString();
-    await this.writeState(state);
-    return state;
-  }
-
-  async setApprovalMode(novelId: string, approvalMode: ApprovalMode) {
-    const state = await this.get(novelId);
-    state.approvalMode = approvalMode;
-    state.updatedAt = new Date().toISOString();
-    await this.writeState(state);
-    return state;
-  }
-
-  async exportNovel(novelId: string) {
-    const state = await this.get(novelId);
-    const chapters = Object.keys(state.files).filter((item) => /^chapters\/chapter-\d+\.md$/.test(item)).sort();
-    if (!chapters.length) throw new AppError("NO_CHAPTERS", "还没有可导出的稳定章节。", 409, true);
-    const content = (await Promise.all(chapters.map(async (item) => (await this.readProjectFile(novelId, item, 0, textLimit)).content))).join("\n\n");
-    const exportPath = `exports/${safeFileName(state.title)}.txt`;
-    const proposal = await this.prepareProposal(novelId, {
-      intent: "导出稳定章节",
-      summary: `导出 ${chapters.length} 章`,
-      changes: [{ operation: state.files[exportPath] ? "replace" : "create", path: exportPath, ...(state.files[exportPath] ? { baseSha256: state.files[exportPath]!.sha256 } : {}), content }],
+    return withNovelLock(this.directory(novelId), async () => {
+      const state = await this.get(novelId);
+      if (!state.files["book/ledger.yaml"]) return ledgerSchema.parse({ version: 1 });
+      return ledgerSchema.parse(parse((await this.readProjectFile(novelId, "book/ledger.yaml", 0, textLimit)).content));
     });
-    await this.applyProposal({ ...proposal, approval: "auto" }, true);
-    return { path: exportPath, chapterCount: chapters.length, sha256: sha256(content), content };
+  }
+  async claimProductionJob(novelId: string, jobId: string, request: ProductionJobRequest, interactionMode: ProductionInteractionMode, options?: ClaimOptions): Promise<NovelState> {
+    return (await this.execute(novelId, { type: "claim_job", jobId, request, interactionMode, options })).state;
+  }
+  async finishProductionJob(novelId: string, jobId: string, outcome: "completed" | "failed" | "canceled"): Promise<NovelState> {
+    return (await this.execute(novelId, { type: "finish_job", jobId, outcome })).state;
+  }
+  async cancelAutonomousOpening(novelId: string): Promise<NovelState> {
+    return (await this.execute(novelId, { type: "cancel_autonomous_opening" })).state;
+  }
+  async commitProductionPlan(novelId: string, jobId: string, changes: PatchProposal["changes"], basis: Record<string, string>): Promise<NovelState> {
+    return (await this.execute(novelId, { type: "commit_plan", jobId, changes, basis })).state;
+  }
+  async confirmProductionPlan(novelId: string, jobId: string): Promise<NovelState> {
+    return (await this.execute(novelId, { type: "confirm_plan", jobId })).state;
+  }
+  async commitChapter(novelId: string, input: ChapterCommitInput): Promise<{ state: NovelState; path: string; sha256: string }> {
+    const result = await this.execute(novelId, { type: "commit_chapter", input: { ...input, review: criticResultSchema.parse(input.review) } });
+    return { state: result.state, path: result.path!, sha256: result.state.files[result.path!]!.sha256 };
+  }
+  async commitReviewReport(novelId: string, jobId: string, report: string, basis: Record<string, string>): Promise<{ path: string }> {
+    return { path: (await this.execute(novelId, { type: "commit_report", jobId, report, basis })).path! };
+  }
+  async exportNovel(novelId: string, jobId: string) {
+    const result = await this.execute(novelId, { type: "export", jobId });
+    return { path: result.path!, chapterCount: result.chapterCount!, sha256: sha256(result.content!), content: result.content! };
   }
 
-  private validateChanges(state: NovelState, changes: PatchProposal["changes"]) {
-    const seen = new Set<string>();
+  private pendingCommitPath(novelId: string) { return path.join(this.directory(novelId), ".pending-commit.json"); }
+
+  private async commitFiles(state: NovelState, changes: NovelFileChange[]) {
+    const serialized = stringify(novelStateSchema.parse(state), { lineWidth: 0 });
+    const journal: PendingCommit = {
+      phase: "prepared",
+      beforeState: await readOptional(this.statePath(state.novelId)),
+      afterStateSha256: sha256(serialized),
+      files: [],
+    };
     for (const change of changes) {
-      if (seen.has(change.path)) throw new AppError("DUPLICATE_PATCH_PATH", "同一提案不能重复修改同一文件。", 400, false);
-      seen.add(change.path);
-      const current = state.files[change.path];
-      if (change.operation === "create" && current) throw new AppError("FILE_EXISTS", `${change.path} 已存在。`, 409, true, undefined, "reread");
-      if (change.operation === "replace" && !current) throw new AppError("FILE_NOT_FOUND", `${change.path} 不存在。`, 409, true, undefined, "reread");
-      if (change.operation === "replace" && !change.baseSha256) throw new AppError("BASE_HASH_REQUIRED", "替换文件必须提供基础哈希。", 400, false);
-      if (current && change.baseSha256 !== current.sha256) throw new AppError("FILE_STALE", `${change.path} 已变化。`, 409, true, undefined, "reread");
-      if (change.path === "book/ledger.yaml") {
-        try { ledgerSchema.parse(parse(change.content)); }
-        catch (error) {
-          const detail = error instanceof ZodError ? error.issues.slice(0, 4).map((issue) => `${issue.path.join(".") || "根节点"}: ${issue.message}`).join("；") : "YAML 无法解析";
-          throw new AppError("LEDGER_INVALID", `账本内容不符合结构化合同：${detail}`, 400, true, undefined, "retry");
-        }
-      }
-      if (change.operation === "create" && change.path.startsWith("book/characters/") && change.path.endsWith(".md")) {
-        try { characterProfileContentSchema.parse(change.content); }
-        catch (error) {
-          const detail = error instanceof ZodError ? error.issues[0]?.message : "角色档案无法解析";
-          throw new AppError("CHARACTER_PROFILE_INVALID", `角色档案不符合文件合同：${detail}`, 400, true, undefined, "retry");
-        }
-      }
-      if (isTensionCurvePath(change.path)) {
-        try {
-          const asset = tensionCurveAssetSchema.parse(parse(change.content));
-          if (change.path === "book/tension-curve.yaml" && asset.kind !== "book") throw new Error("资产类型与路径不匹配");
-          if (/^volumes\/volume-\d{3}-tension\.yaml$/.test(change.path) && asset.kind !== "volume") throw new Error("资产类型与路径不匹配");
-          if (/tension-actual\.yaml$/.test(change.path) && asset.kind !== "actual") throw new Error("资产类型与路径不匹配");
-          const pathVolume = Number(change.path.match(/volume-(\d{3})-tension/)?.[1]);
-          if (Number.isFinite(pathVolume) && "volume" in asset && asset.volume !== pathVolume) throw new Error("资产卷号与文件路径不匹配");
-        } catch (error) { throw curveError(error); }
-      }
+      const before = await readOptional(this.filePath(state.novelId, change.path));
+      if (change.operation === "create" && before !== null) throw new AppError("FILE_EXISTS", `${change.path} 已存在于磁盘，不能覆盖作者文件。`, 409, true, undefined, "reread");
+      if (change.operation === "replace" && (before === null || sha256(before) !== change.baseSha256)) throw new AppError("FILE_STALE", `${change.path} 已变化，请重新读取后再保存。`, 409, true, undefined, "reread");
+      journal.files.push({ path: normalizePath(change.path), before, afterSha256: sha256(change.content) });
     }
-    if (state.approvalMode === "autonomous_opening" && state.phase === "discovery" && !isAutonomousOpeningBundle(state, changes)) {
-      throw new AppError("AUTONOMOUS_OPENING_INVALID", "全自动开书必须一次创建蓝图、账本、全书张力曲线和至少一份完整角色档案，且不能包含其他文件。", 400, true, undefined, "retry");
+    await atomicWrite(this.pendingCommitPath(state.novelId), JSON.stringify(journal));
+    try {
+      for (const [index, change] of changes.entries()) {
+        const target = this.filePath(state.novelId, change.path);
+        const before = journal.files[index]!.before;
+        if (await readOptional(target) !== before) throw new AppError("FILE_STALE", `${change.path} 在提交过程中发生了外部修改，已停止写入。`, 409, true, undefined, "reread");
+        await atomicWrite(target, change.content, before === null);
+      }
+      await this.writeState(state);
+    } catch (error) {
+      try {
+        journal.phase = "rolling_back";
+        await atomicWrite(this.pendingCommitPath(state.novelId), JSON.stringify(journal));
+        await this.rollbackCommit(state.novelId, journal);
+      }
+      catch (recoveryError) { throw new AggregateError([error, recoveryError], "作品提交与回滚未完成，恢复日志已保留。请恢复文件访问后重试。"); }
+      throw error;
     }
-    const opensBook = changes.some((change) => change.path === "book/blueprint.md");
-    const suppliesLedger = Boolean(state.files["book/ledger.yaml"]) || changes.some((change) => change.path === "book/ledger.yaml");
-    if (opensBook && !suppliesLedger) throw new AppError("LEDGER_REQUIRED", "确认作品蓝图时必须在同一提案中提交连续性账本。", 400, true, undefined, "retry");
-    const suppliesCurve = Boolean(state.files["book/tension-curve.yaml"]) || changes.some((change) => change.path === "book/tension-curve.yaml");
-    if (opensBook && !suppliesCurve) throw new AppError("TENSION_CURVE_REQUIRED", "确认作品蓝图时必须在同一提案中提交全书张力曲线。", 400, true, undefined, "retry");
+    // The state rename commits the batch. A leftover journal is cleanup work, never a reason to roll it back.
+    await this.removePendingCommit(state.novelId).catch(() => undefined);
   }
 
-  private async validateLockedCurveChanges(novelId: string, changes: PatchProposal["changes"]) {
-    for (const change of changes.filter((item) => item.operation === "replace" && isTargetTensionCurvePath(item.path))) {
-      const before = targetTensionCurveSchema.parse(parse((await this.readProjectFile(novelId, change.path, 0, textLimit)).content));
-      const after = targetTensionCurveSchema.parse(parse(change.content));
-      const changed = lockedPointChanges(before, after);
-      if (changed.length && !change.overrideLockedNodes) throw new AppError("LOCKED_TENSION_NODES", `AI 提案不能修改作者锁定节点：${changed.join("、")}。如需整条替换，必须明确请求覆盖锁定节点并由作者批准。`, 409, true, undefined, "author_approval");
+  private async recoverPendingCommit(novelId: string) {
+    const content = await readOptional(this.pendingCommitPath(novelId));
+    if (content === null) return;
+    const journal = pendingCommitSchema.parse(JSON.parse(content));
+    if (journal.phase === "prepared" && sha256((await readOptional(this.statePath(novelId))) ?? "") === journal.afterStateSha256) {
+      await this.removePendingCommit(novelId);
+      return;
     }
+    await this.rollbackCommit(novelId, journal);
   }
 
-  private async normalizeCurveBasis(novelId: string, raw: PatchProposal["changes"]): Promise<PatchProposal["changes"]> {
-    const state = await this.get(novelId);
-    const blueprint = raw.find((change) => change.path === "book/blueprint.md")?.content;
-    const rawBookCurve = raw.find((change) => change.path === "book/tension-curve.yaml")?.content;
-    let bookCurve = rawBookCurve;
-    if (rawBookCurve) {
-      try {
-        const parsed = bookTensionCurveSchema.parse(parse(rawBookCurve));
-        parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
-        bookCurve = stringify(parsed, { lineWidth: 0 });
-      } catch (error) { throw curveError(error); }
+  private async removePendingCommit(novelId: string) { await unlink(this.pendingCommitPath(novelId)); }
+
+  private async rollbackCommit(novelId: string, journal: PendingCommit) {
+    const before = journal.beforeState === null ? undefined : novelStateSchema.parse(parse(journal.beforeState));
+    const currentState = await readOptional(this.statePath(novelId));
+    if ((before && before.novelId !== novelId) || (currentState !== journal.beforeState && sha256(currentState ?? "") !== journal.afterStateSha256)) throw new AppError("NOVEL_RECOVERY_CONFLICT", "未完成提交后作品状态发生了外部修改，已保留文件与恢复日志。", 409, false);
+    // Check the entire batch before restoring anything, so recovery never overwrites a later author edit.
+    const currentFiles = [];
+    for (const file of journal.files) {
+      const target = this.filePath(novelId, file.path);
+      const content = await readOptional(target);
+      if (content !== file.before && (content === null || sha256(content) !== file.afterSha256)) throw new AppError("NOVEL_RECOVERY_CONFLICT", `${file.path} 在未完成提交后发生了外部修改，已保留文件与恢复日志。`, 409, false);
+      currentFiles.push({ ...file, target, content });
     }
-    return raw.map((change) => {
-      if (!isTargetTensionCurvePath(change.path)) return change;
-      try {
-        if (change.path === "book/tension-curve.yaml" && bookCurve) return { ...change, content: bookCurve };
-        const parsed = targetTensionCurveSchema.parse(parse(change.content)) as TargetTensionCurve;
-        if (parsed.kind === "volume") {
-          const planPath = `volumes/volume-${String(parsed.volume).padStart(3, "0")}.md`;
-          const plan = raw.find((item) => item.path === planPath)?.content;
-          parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
-          parsed.basis.bookCurveSha256 = bookCurve ? sha256(bookCurve) : state.files["book/tension-curve.yaml"]?.sha256 ?? parsed.basis.bookCurveSha256;
-          parsed.basis.volumePlanSha256 = plan ? sha256(plan) : state.files[planPath]?.sha256 ?? parsed.basis.volumePlanSha256;
-        } else parsed.basis.blueprintSha256 = blueprint ? sha256(blueprint) : state.files["book/blueprint.md"]?.sha256 ?? parsed.basis.blueprintSha256;
-        return { ...change, content: stringify(parsed, { lineWidth: 0 }) };
-      } catch (error) { throw curveError(error); }
-    });
+    for (const file of currentFiles) {
+      if (file.content === file.before) continue;
+      if (file.before === null) await unlink(file.target);
+      else await atomicWrite(file.target, file.before);
+    }
+    if (currentState !== journal.beforeState) {
+      if (journal.beforeState === null) await unlink(this.statePath(novelId));
+      else await atomicWrite(this.statePath(novelId), journal.beforeState);
+    }
+    await this.removePendingCommit(novelId);
   }
 
   private async writeState(state: NovelState) { await atomicWrite(this.statePath(state.novelId), stringify(novelStateSchema.parse(state), { lineWidth: 0 })); }
@@ -410,10 +323,4 @@ function zUuid(value: string) {
 function normalizePath(value: string) {
   try { return normalizeNovelPath(value); }
   catch { throw new AppError("INVALID_NOVEL_PATH", "作品文件路径无效。", 400, false); }
-}
-function safeFileName(value: string) { return value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim().slice(0, 80) || "novel"; }
-function normalizedForEvidence(value: string) { return value.toLocaleLowerCase("zh-CN").replace(/[^\p{L}\p{N}]+/gu, ""); }
-function curveError(error: unknown) {
-  const detail = error instanceof ZodError ? error.issues.slice(0, 6).map((issue) => `${issue.path.join(".") || "根节点"}: ${issue.message}`).join("；") : error instanceof Error ? error.message : "YAML 无法解析";
-  return new AppError("TENSION_CURVE_INVALID", `张力曲线不符合结构化合同：${detail}`, 400, true, undefined, "retry");
 }

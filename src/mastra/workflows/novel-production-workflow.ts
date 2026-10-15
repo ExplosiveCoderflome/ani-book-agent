@@ -2,8 +2,8 @@ import { RequestContext } from "@mastra/core/request-context";
 import { createStep, createWorkflow } from "@mastra/core/workflows";
 import { z } from "zod";
 import { parse, stringify } from "yaml";
-import { characterProfileCreateSchema, continuityDeltaSchema, criticResultSchema, executionEnvelopeSchema, productionInteractionModeSchema, productionJobRequestSchema, volumeTensionCurveSchema, volumeTensionPath, volumeTensionPointSchema, type CriticResult, type ExecutionEnvelope, type ProductionJobRequest, type ReferenceAdaptation } from "../../domain";
-import type { CreativeAgentPort, ModelSettingsPort, NovelProjectStore } from "../../application/ports";
+import { criticResultSchema, executionEnvelopeSchema, productionInteractionModeSchema, productionJobRequestSchema, volumeTensionCurveSchema, volumeTensionPath, volumeTensionPointSchema, type CriticResult, type ExecutionEnvelope, type ProductionJobRequest, type ReferenceAdaptation } from "../../domain";
+import type { CreativeAgentPort, ModelSettingsPort, NovelWorkflowStore } from "../../application/ports";
 import { generateWithGuard } from "../generation-guard";
 import { readSkill } from "../skill-loader";
 import { generateStructuredOutput, structuredOutputOptions } from "../structured-output";
@@ -39,10 +39,10 @@ export const projectReviewResultSchema = z.object({
 });
 type ProjectReviewResult = z.infer<typeof projectReviewResultSchema>;
 type ReviewSource = { path: string; content: string };
-type WorkflowDependencies = { novels: NovelProjectStore; models: ModelSettingsPort; novelAgent: CreativeAgentPort; novelCritic: CreativeAgentPort };
+type WorkflowDependencies = { novels: NovelWorkflowStore; models: ModelSettingsPort; novelAgent: CreativeAgentPort; novelCritic: CreativeAgentPort };
 let workflowDependencies: WorkflowDependencies | undefined;
 const dependency = () => { if (!workflowDependencies) throw new Error("小说生产工作流尚未完成组合根绑定"); return workflowDependencies; };
-const repository = new Proxy({} as NovelProjectStore, { get: (_target, property) => (...args: unknown[]) => (dependency().novels as any)[property](...args) });
+const repository = new Proxy({} as NovelWorkflowStore, { get: (_target, property) => (...args: unknown[]) => (dependency().novels as any)[property](...args) });
 const modelSettings = new Proxy({} as ModelSettingsPort, { get: (_target, property) => (...args: unknown[]) => (dependency().models as any)[property](...args) });
 const novelAgent = new Proxy({} as CreativeAgentPort, { get: (_target, property) => (...args: unknown[]) => (dependency().novelAgent as any)[property](...args) });
 const novelCritic = new Proxy({} as CreativeAgentPort, { get: (_target, property) => (...args: unknown[]) => (dependency().novelCritic as any)[property](...args) });
@@ -57,9 +57,6 @@ function requestContext(execution: ExecutionEnvelope, profile: "writer" | "criti
     ["novelId", current.novelId], ["taskType", profile], ["modelProfile", profile], ["skillVersions", current.skillVersions], ["execution", current],
     ["runId", current.runId], ["stage", current.stage], ["traceId", current.traceId], ["preferenceVersion", current.preferenceVersion], ["novelStateHash", current.novelStateHash],
   ]);
-}
-function legacyExecution(input: z.infer<typeof productionWorkflowInputSchema>): ExecutionEnvelope {
-  return executionEnvelopeSchema.parse({ schemaVersion: 1, runId: input.jobId, traceId: input.jobId, novelId: input.novelId, taskType: input.goal, stage: input.goal === "review_project" ? "reviewing" : input.goal === "export" ? "exporting" : input.goal === "write_chapters" ? "planning" : "writing", novelStateHash: input.baseStateHash, preferenceVersion: 0, skillVersions: input.skillVersions, allowedTools: [], requiresApproval: false, contextBudget: 32_000 });
 }
 async function settings(profile: "writer" | "critic", outputCap: number) {
   const selected = await modelSettings.runtimeSelection(profile);
@@ -98,15 +95,17 @@ export function characterAssetPaths(paths: string[]) { return paths.filter((path
 
 async function readCharacterAssets(novelId: string, paths: string[], maxChars = 50_000) {
   const parts: string[] = [];
+  const basis: Record<string, string> = {};
   let remaining = maxChars;
   for (const path of characterAssetPaths(paths)) {
     if (remaining <= 0) break;
     const file = await repository.readProjectFile(novelId, path, 0, Math.min(12_000, remaining));
+    basis[file.path] = file.sha256;
     const section = `### ${path}\n${file.content}`;
     parts.push(section);
     remaining -= section.length;
   }
-  return parts.join("\n\n");
+  return { text: parts.join("\n\n"), basis };
 }
 
 function renderAdaptations(adaptations: ReferenceAdaptation[], stage: "planning" | "writing" | "review") {
@@ -120,7 +119,7 @@ function renderAdaptations(adaptations: ReferenceAdaptation[], stage: "planning"
 }
 
 async function adaptationsForRange(novelId: string, fromChapter: number, toChapter: number) {
-  return (await repository.adaptations(novelId)).map((item) => item.adaptation).filter((item) => item.status === "approved" && item.scope.fromChapter <= toChapter && item.scope.toChapter >= fromChapter);
+  return (await repository.adaptations(novelId)).filter(({ adaptation }) => adaptation.status === "approved" && adaptation.scope.fromChapter <= toChapter && adaptation.scope.toChapter >= fromChapter);
 }
 
 async function assertAdaptationVersions(execution: ExecutionEnvelope) {
@@ -136,8 +135,8 @@ async function ensureVolumePlan(execution: ExecutionEnvelope, fromChapter: numbe
   const volumePath = `volumes/volume-${String(state.currentVolume).padStart(3, "0")}.md`;
   const curvePath = volumeTensionPath(state.currentVolume);
   const [existingPlan, existingCurveFile] = await Promise.all([
-    state.files[volumePath] ? repository.readProjectFile(novelId, volumePath, 0, 100_000) : undefined,
-    state.files[curvePath] ? repository.readProjectFile(novelId, curvePath, 0, 50_000) : undefined,
+    state.files[volumePath] ? repository.readProjectFile(novelId, volumePath, 0, 500_000) : undefined,
+    state.files[curvePath] ? repository.readProjectFile(novelId, curvePath, 0, 500_000) : undefined,
   ]);
   const existingCurve = existingCurveFile ? volumeTensionCurveSchema.parse(parse(existingCurveFile.content)) : undefined;
   const { missingPlanChapters, missingCurveChapters } = volumePlanningGaps(existingPlan?.content, existingCurve?.points ?? [], fromChapter, toChapter);
@@ -147,7 +146,7 @@ async function ensureVolumePlan(execution: ExecutionEnvelope, fromChapter: numbe
   const generationFrom = Math.min(missingPlanChapters[0] ?? Number.POSITIVE_INFINITY, missingCurveChapters[0] ?? Number.POSITIVE_INFINITY);
   if (!Number.isFinite(generationFrom) || generationFrom > toChapter) throw new Error(`当前卷计划或张力曲线没有覆盖第 ${fromChapter}-${toChapter} 章，请重新生成当前卷规划`);
 
-  const [blueprint, bookCurve, ledger, characters, skill, adaptations] = await Promise.all([
+  const [blueprint, bookCurve, ledger, characters, skill, adaptationItems] = await Promise.all([
     repository.readProjectFile(novelId, "book/blueprint.md", 0, 80_000),
     repository.readProjectFile(novelId, "book/tension-curve.yaml", 0, 30_000),
     repository.readProjectFile(novelId, "book/ledger.yaml", 0, 50_000),
@@ -155,16 +154,20 @@ async function ensureVolumePlan(execution: ExecutionEnvelope, fromChapter: numbe
     readSkill("volume-planning", skillVersions["volume-planning"]),
     adaptationsForRange(novelId, fromChapter, toChapter),
   ]);
+  const adaptations = adaptationItems.map((item) => item.adaptation);
+  const basis = { ...characters.basis, ...Object.fromEntries([
+    blueprint, bookCurve, ledger, ...(existingPlan ? [existingPlan] : []), ...(existingCurveFile ? [existingCurveFile] : []), ...adaptationItems.map((item) => item.file),
+  ].map((file) => [file.path, file.sha256])) };
   const context = requestContext(execution, "writer", "planning");
   const selected = await settings("writer", 5_000);
-  const prompt = `${skill}\n\n作品蓝图：\n${blueprint.content}\n\n全书张力曲线：\n${bookCurve.content}${characters ? `\n\n角色档案（长期设计）：\n${characters}` : ""}\n\n连续性账本（当前事实）：\n${ledger.content}${existingPlan ? `\n\n已有卷计划（原文必须保持成立）：\n${existingPlan.content}` : ""}${existingCurve ? `\n\n已有本卷张力曲线（已有节点必须保持不变）：\n${existingCurveFile!.content}` : ""}${adaptations.length ? `\n\n${renderAdaptations(adaptations, "planning")}` : ""}\n\n补齐第 ${generationFrom}-${toChapter} 章。plan 输出这段范围内完整的 Markdown 章节卡，每章必须使用“## 第 N 章”标题并写明目标、阻力、转折、角色推进、回报和钩子；已有章卡只用于保持事实一致，系统只会追加缺失章卡。curve.points 必须严格按第 ${generationFrom} 到 ${toChapter} 章排列，source 固定 ai，locked 固定 false；系统会保留所有已有节点。张力只是创作方向，不要求正文机械达到分数。`;
+  const prompt = `${skill}\n\n作品蓝图：\n${blueprint.content}\n\n全书张力曲线：\n${bookCurve.content}${characters.text ? `\n\n角色档案（长期设计）：\n${characters.text}` : ""}\n\n连续性账本（当前事实）：\n${ledger.content}${existingPlan ? `\n\n已有卷计划（原文必须保持成立）：\n${existingPlan.content}` : ""}${existingCurve ? `\n\n已有本卷张力曲线（已有节点必须保持不变）：\n${existingCurveFile!.content}` : ""}${adaptations.length ? `\n\n${renderAdaptations(adaptations, "planning")}` : ""}\n\n补齐第 ${generationFrom}-${toChapter} 章。plan 输出这段范围内完整的 Markdown 章节卡，每章必须使用“## 第 N 章”标题并写明目标、阻力、转折、角色推进、回报和钩子；已有章卡只用于保持事实一致，系统只会追加缺失章卡。curve.points 必须严格按第 ${generationFrom} 到 ${toChapter} 章排列，source 固定 ai，locked 固定 false；系统会保留所有已有节点。张力只是创作方向，不要求正文机械达到分数。`;
   const generated = await generateValidatedStructure({ schema: generatedVolumePlanSchema, label: "卷计划与张力曲线", prompt, agent: novelAgent, context, selected, parentAbortSignal });
   if (!chapterPlanCoversRange(generated.plan, generationFrom, toChapter)) throw new Error(`模型返回的卷计划没有完整覆盖第 ${generationFrom}-${toChapter} 章`);
   const generatedCurve = volumeTensionCurveSchema.parse({ schemaVersion: 1, kind: "volume", volume: state.currentVolume, title: generated.curve.title, chapterRange: { from: generationFrom, to: toChapter }, basis: { blueprintSha256: blueprint.sha256, bookCurveSha256: bookCurve.sha256, volumePlanSha256: existingPlan?.sha256 ?? "0".repeat(64), adaptationsSha256: execution.adaptationsSha256, generatedAt: new Date().toISOString() }, calibration: { status: "aligned", reasons: [] }, points: generated.curve.points });
   const planChanged = missingPlanChapters.length > 0;
   const newPlanCards = missingPlanChapters.map((chapter) => extractChapterPlan(generated.plan, chapter)).join("\n\n");
   const plan = existingPlan
-    ? planChanged ? `${existingPlan.content.trimEnd()}\n\n${newPlanCards}\n` : existingPlan.content
+    ? planChanged ? `${existingPlan.content}\n\n${newPlanCards}\n` : existingPlan.content
     : `${newPlanCards}\n`;
   const curve = volumeTensionCurveSchema.parse({
     schemaVersion: 1,
@@ -180,24 +183,10 @@ async function ensureVolumePlan(execution: ExecutionEnvelope, fromChapter: numbe
     ...(planChanged || !existingPlan ? [{ operation: existingPlan ? "replace" as const : "create" as const, path: volumePath, ...(existingPlan ? { baseSha256: existingPlan.sha256 } : {}), content: plan }] : []),
     { operation: existingCurveFile ? "replace" as const : "create" as const, path: curvePath, ...(existingCurveFile ? { baseSha256: existingCurveFile.sha256 } : {}), content: stringify(curve, { lineWidth: 0 }) },
   ];
-  const proposal = await repository.prepareProposal(novelId, { intent: "建立或扩展当前卷计划与张力曲线", summary: `补齐第 ${generationFrom}-${toChapter} 章并等待作者确认曲线`, changes });
-  await repository.applyProposal({ ...proposal, approval: "auto" }, true);
+  parentAbortSignal?.throwIfAborted();
+  await repository.commitProductionPlan(novelId, execution.runId, changes, basis);
   return { volumePath, curvePath, created: true };
 }
-
-async function ensureLegacyVolumePlan(execution: ExecutionEnvelope, fromChapter: number, toChapter: number, parentAbortSignal?: AbortSignal) {
-  const { novelId, skillVersions } = execution;
-  const state = await repository.get(novelId); const volumePath = `volumes/volume-${String(state.currentVolume).padStart(3, "0")}.md`;
-  if (state.files[volumePath]) return volumePath;
-  const [blueprint, ledger, characters, skill, adaptations] = await Promise.all([repository.readProjectFile(novelId, "book/blueprint.md", 0, 80_000), repository.readProjectFile(novelId, "book/ledger.yaml", 0, 50_000), readCharacterAssets(novelId, Object.keys(state.files)), readSkill("volume-planning", skillVersions["volume-planning"]), adaptationsForRange(novelId, fromChapter, toChapter)]);
-  const context = requestContext(execution, "writer", "planning");
-  const result = await generateWithGuard("继续部署前已启动任务的卷规划", (abortSignal) => novelAgent.generate(`${skill}\n\n作品蓝图：\n${blueprint.content}${characters ? `\n\n角色档案：\n${characters}` : ""}\n\n连续性账本：\n${ledger.content}${adaptations.length ? `\n\n${renderAdaptations(adaptations, "planning")}` : ""}\n\n请规划第 ${fromChapter}-${toChapter} 章。直接输出完整 Markdown 卷计划。`, { requestContext: context, abortSignal, toolChoice: "none", providerOptions: productionProviderOptions, modelSettings: awaitSettings(3_000) }), undefined, { abortSignal: parentAbortSignal, progressId: execution.runId });
-  const plan = result.text?.trim(); if (!plan || plan.length < 200) throw new Error("模型没有返回可用的当前卷计划");
-  const proposal = await repository.prepareProposal(novelId, { intent: "继续已有任务的卷规划", summary: `规划第 ${fromChapter}-${toChapter} 章`, changes: [{ operation: "create", path: volumePath, content: plan }] });
-  await repository.applyProposal({ ...proposal, approval: "auto" }, true); return volumePath;
-}
-
-function awaitSettings(maxOutputTokens: number) { return { maxOutputTokens, temperature: 0.7 }; }
 
 export function selectReviewPaths(files: string[], scope: ProductionJobRequest["scope"]) {
   if (scope.paths?.length) return [...new Set(scope.paths)];
@@ -208,7 +197,7 @@ export function selectReviewPaths(files: string[], scope: ProductionJobRequest["
     if (to < from) throw new Error("审查章节范围无效");
     return chapters.filter((path) => { const chapter = Number(path.match(/\d+/)?.[0]); return chapter >= from && chapter <= to; });
   }
-  return files.filter((path) => /\.(?:md|ya?ml|json|txt)$/i.test(path) && !path.startsWith("exports/") && !path.startsWith("workspace/reviews/"));
+  return files.filter((path) => /\.(?:md|ya?ml|json|txt)$/i.test(path) && !path.startsWith("exports/") && !path.startsWith("workspace/reviews/") && !path.startsWith("workspace/proposals/"));
 }
 
 export function chunkReviewSources(sources: ReviewSource[], maxChars = 24_000) {
@@ -256,7 +245,7 @@ function compactAuthority(source: ReviewSource) {
   return { ...source, content: `${source.content.slice(0, 5_000)}\n\n[中间内容已省略]\n\n${source.content.slice(-7_000)}` };
 }
 
-async function reviewProject(input: z.infer<typeof productionWorkflowInputSchema>, stateHash: string, parentAbortSignal?: AbortSignal) {
+async function reviewProject(input: z.infer<typeof productionWorkflowInputSchema>, execution: ExecutionEnvelope, parentAbortSignal?: AbortSignal) {
   const files = await repository.listFiles(input.novelId);
   const paths = selectReviewPaths(files.map((file) => file.path), input.scope);
   if (!paths.length) throw new Error("当前范围内没有可审查的作品文件");
@@ -264,11 +253,14 @@ async function reviewProject(input: z.infer<typeof productionWorkflowInputSchema
   const invalid = paths.find((path) => !existing.has(path));
   if (invalid) throw new Error(`审查文件不存在：${invalid}`);
   const authorityPaths = ["book/blueprint.md", "book/ledger.yaml", ...files.filter((file) => file.path.startsWith("volumes/")).map((file) => file.path)].filter((path) => existing.has(path));
-  const [authority, sources, skill] = await Promise.all([
-    Promise.all(authorityPaths.map(async (path) => compactAuthority(await repository.readProjectFile(input.novelId, path, 0, 50_000)))),
-    Promise.all(paths.map((path) => repository.readProjectFile(input.novelId, path, 0, 80_000))),
+  const [sourceFiles, skill] = await Promise.all([
+    Promise.all([...new Set([...authorityPaths, ...paths])].map((path) => repository.readProjectFile(input.novelId, path, 0, 80_000))),
     readSkill("project-review", input.skillVersions["project-review"]),
   ]);
+  const byPath = new Map(sourceFiles.map((file) => [file.path, file]));
+  const authority = authorityPaths.map((path) => compactAuthority(byPath.get(path)!));
+  const sources = paths.map((path) => byPath.get(path)!);
+  const basis = Object.fromEntries(sourceFiles.map((file) => [file.path, file.sha256]));
   const brief = input.brief ?? "审查所选作品文件，找出有明确文本证据的问题并给出可执行建议。";
   const authorityText = authority.map((item) => `## ${item.path}\n${item.content}`).join("\n\n");
   const batches = chunkReviewSources(sources);
@@ -277,15 +269,12 @@ async function reviewProject(input: z.infer<typeof productionWorkflowInputSchema
     const selected = await settings("critic", 4_000);
     const sourceText = batch.map((item) => `## ${item.path}\n${item.content}`).join("\n\n");
     const prompt = `${skill}\n\n作者的审查目标：\n${brief}\n\n权威约束：\n${authorityText}\n\n本批待审文件：\n${sourceText}\n\n根据作者目标自主选择检查角度。只报告有上述文件直接证据的问题；evidence.path 必须使用本轮提供的真实路径。`;
-    const parsed = await generateValidatedStructure({ schema: projectReviewResultSchema, label: `项目审查第 ${index + 1}/${batches.length} 批`, prompt, agent: novelCritic, context: requestContext(input.execution ?? legacyExecution(input), "critic", "reviewing"), selected, parentAbortSignal });
+    const parsed = await generateValidatedStructure({ schema: projectReviewResultSchema, label: `项目审查第 ${index + 1}/${batches.length} 批`, prompt, agent: novelCritic, context: requestContext(execution, "critic", "reviewing"), selected, parentAbortSignal });
     results.push(validateProjectReviewEvidence(parsed, [...authority, ...batch]));
   }
-  if (repository.stateHash(await repository.get(input.novelId)) !== stateHash) throw new Error("审查期间作品发生变化，请重新启动审查");
-  const reportPath = `workspace/reviews/review-${input.jobId}.md`;
   const report = renderProjectReviewReport(brief, paths, results);
-  const proposal = await repository.prepareProposal(input.novelId, { intent: "保存项目审查报告", summary: brief, changes: [{ operation: "create", path: reportPath, content: report }] });
-  await repository.applyProposal(proposal);
-  return reportPath;
+  parentAbortSignal?.throwIfAborted();
+  return (await repository.commitReviewReport(input.novelId, input.jobId, report, basis)).path;
 }
 
 function chineseChapterNumber(value: string) {
@@ -352,19 +341,23 @@ export function chapterOverlapRatio(previous: string, candidate: string) {
   return common / left.length;
 }
 
-async function chapterContext(novelId: string, chapter: number, volumePath: string, includeTension = true, brief?: string) {
+async function chapterContext(novelId: string, chapter: number, volumePath: string, brief?: string) {
   const state = await repository.get(novelId);
   const previousPath = chapter > 1 ? `chapters/chapter-${String(chapter - 1).padStart(3, "0")}.md` : undefined;
   const curvePath = volumeTensionPath(state.currentVolume);
-  const [blueprint, characters, ledger, volume, curveFile, previous, adaptations] = await Promise.all([
+  const [blueprint, characters, ledger, volume, curveFile, previous, adaptationItems] = await Promise.all([
     repository.readProjectFile(novelId, "book/blueprint.md", 0, 50_000),
     readCharacterAssets(novelId, Object.keys(state.files)),
     repository.readProjectFile(novelId, "book/ledger.yaml", 0, 50_000),
     repository.readProjectFile(novelId, volumePath, 0, 50_000),
-    includeTension ? repository.readProjectFile(novelId, curvePath, 0, 30_000) : undefined,
+    repository.readProjectFile(novelId, curvePath, 0, 30_000),
     previousPath ? repository.readProjectFile(novelId, previousPath, 0, 20_000) : undefined,
-    repository.activeAdaptations(novelId, chapter).then((items) => items.map((item) => item.adaptation)),
+    repository.activeAdaptations(novelId, chapter),
   ]);
+  const adaptations = adaptationItems.map((item) => item.adaptation);
+  const basis = { ...characters.basis, ...Object.fromEntries([
+    blueprint, ledger, volume, curveFile, ...(previous ? [previous] : []), ...adaptationItems.map((item) => item.file),
+  ].map((file) => [file.path, file.sha256])) };
   const currentPlan = extractChapterPlan(volume.content, chapter);
   const curve = curveFile ? volumeTensionCurveSchema.parse(parse(curveFile.content)) : undefined;
   const pointIndex = curve?.points.findIndex((point) => point.chapter === chapter) ?? -1;
@@ -375,13 +368,13 @@ async function chapterContext(novelId: string, chapter: number, volumePath: stri
     `## 当前章节卡（唯一执行目标）\n${currentPlan}`,
     tensionWindow ? `## 当前张力目标（方向约束，不在正文输出分数）\n${stringify(tensionWindow, { lineWidth: 0 })}` : "",
     `## 作品蓝图（全局约束）\n${blueprint.content}`,
-    characters ? `## 角色档案（长期设计，不代表已经发生）\n${characters}` : "",
+    characters.text ? `## 角色档案（长期设计，不代表已经发生）\n${characters.text}` : "",
     `## 连续性账本（稳定事实）\n${ledger.content}`,
     previous ? `## 上一章稳定正文（只用于承接）\n${previous.content}\n\n上一章内容已经发生，严禁复制、改写或重新表演。第 ${chapter} 章必须从其结尾状态继续，并产生新的目标推进、阻力、转折和净变化。` : "",
     renderAdaptations(adaptations, "writing"),
     adaptations.length ? `## 仿写验收约束\n${renderAdaptations(adaptations, "review")}` : "",
   ].filter(Boolean).join("\n\n");
-  return { source, previousChapter: previous?.content };
+  return { source, previousChapter: previous?.content, basis };
 }
 
 async function writeChapter(execution: ExecutionEnvelope, chapter: number, source: string, feedback = "", parentAbortSignal?: AbortSignal) {
@@ -438,41 +431,41 @@ const runStep = createStep({
   inputSchema: productionWorkflowInputSchema, outputSchema, suspendSchema, resumeSchema, retries: 0,
   execute: async ({ inputData, resumeData, suspend, abortSignal }) => {
     try {
-    const execution = inputData.execution ?? legacyExecution(inputData);
     const state = await repository.get(inputData.novelId);
+    const execution = inputData.execution;
+    if (!execution || state.productionAuthorization?.jobId !== inputData.jobId) throw new Error("此任务缺少生产授权，请取消旧任务并重新启动");
     await assertAdaptationVersions(execution);
     if (execution.runId !== inputData.jobId || execution.novelId !== inputData.novelId || execution.novelStateHash !== inputData.baseStateHash) throw new Error("执行信封与任务输入不一致");
     if (state.activeJobId !== inputData.jobId) throw new Error("活动任务标识已经变化");
     if (resumeData?.action === "cancel") {
-      if (inputData.interactionMode === "autonomous_opening") await repository.setApprovalMode(inputData.novelId, "milestone");
-      await repository.setActiveJob(inputData.novelId, undefined);
+      await repository.finishProductionJob(inputData.novelId, inputData.jobId, "canceled");
       return { status: "canceled" as const, novelId: inputData.novelId, jobId: inputData.jobId, completedThrough: state.nextChapter - 1 };
     }
     if (repository.stateHash(state) !== inputData.baseStateHash && !resumeData) throw new Error("任务输入已经过期，请重新启动");
     if (inputData.interactionMode === "autonomous_opening" && inputData.goal !== "write_chapters") throw new Error("全自动开书模式只允许生产前三章");
     if (inputData.goal === "review_project") {
-      const reportPath = await reviewProject(inputData, inputData.baseStateHash, abortSignal);
-      await repository.setActiveJob(inputData.novelId, undefined);
+      const reportPath = await reviewProject(inputData, execution, abortSignal);
+      await repository.finishProductionJob(inputData.novelId, inputData.jobId, "completed");
       return { status: "completed" as const, novelId: inputData.novelId, jobId: inputData.jobId, completedThrough: state.nextChapter - 1, reportPath };
     }
     if (inputData.goal === "export") {
-      const exported = await repository.exportNovel(inputData.novelId); await repository.setActiveJob(inputData.novelId, undefined);
+      abortSignal?.throwIfAborted();
+      const exported = await repository.exportNovel(inputData.novelId, inputData.jobId);
+      await repository.finishProductionJob(inputData.novelId, inputData.jobId, "completed");
       return { status: "completed" as const, novelId: inputData.novelId, jobId: inputData.jobId, completedThrough: state.nextChapter - 1, exportPath: exported.path };
     }
     if (inputData.goal === "revise_files") throw new Error("修订任务必须先由 Agent 提交文件补丁");
     if (!state.files["book/blueprint.md"] || !state.files["book/ledger.yaml"]) throw new Error("请先确认作品蓝图");
-    const legacyTask = !inputData.tensionCurveRequired && !state.files["book/tension-curve.yaml"];
-    if (!legacyTask && !state.files["book/tension-curve.yaml"]) throw new Error("请先确认作品蓝图与全书张力曲线");
+    if (!state.files["book/tension-curve.yaml"]) throw new Error("请先确认作品蓝图与全书张力曲线");
     const from = inputData.scope.fromChapter ?? state.nextChapter;
     const to = inputData.scope.toChapter ?? (inputData.interactionMode === "autonomous_opening" ? 3 : from + 2);
     if (from !== state.nextChapter || to < from || to > from + 4) throw new Error(`章节范围必须从第 ${state.nextChapter} 章开始，单次最多 5 章`);
     if (inputData.interactionMode === "autonomous_opening" && (from > 3 || to !== 3)) throw new Error("全自动开书任务必须从当前未完成章节继续，并以第 3 章结束");
-    const planning = legacyTask ? undefined : await ensureVolumePlan(execution, from, to, abortSignal);
-    const volumePath = legacyTask ? await ensureLegacyVolumePlan(execution, from, to, abortSignal) : planning!.volumePath;
-    if (!legacyTask && inputData.interactionMode === "standard" && !resumeData) return suspend({ jobId: inputData.jobId, checkpoint: "curve_confirmation", chapter: from, summary: `第 ${from}-${to} 章卷计划与目标张力曲线已经生成，请确认后继续。`, issues: [] });
+    const { volumePath } = await ensureVolumePlan(execution, from, to, abortSignal);
+    if (inputData.interactionMode === "standard" && !resumeData) return suspend({ jobId: inputData.jobId, checkpoint: "curve_confirmation", chapter: from, summary: `第 ${from}-${to} 章卷计划与目标张力曲线已经生成，请确认后继续。`, issues: [] });
     let cursor = (await repository.get(inputData.novelId)).nextChapter;
     for (; cursor <= to; cursor += 1) {
-      const context = await chapterContext(inputData.novelId, cursor, volumePath, !legacyTask, inputData.brief);
+      const context = await chapterContext(inputData.novelId, cursor, volumePath, inputData.brief);
       let text = await writeChapter(execution, cursor, context.source, resumeData?.feedback ?? "", abortSignal);
       let review = enforceOverlapGuard(await critiqueChapter(execution, cursor, context.source, text, abortSignal), cursor, context.previousChapter, text);
       let completedRewrites = 0;
@@ -482,13 +475,13 @@ const runStep = createStep({
         review = enforceOverlapGuard(await critiqueChapter(execution, cursor, context.source, text, abortSignal), cursor, context.previousChapter, text);
       }
       if (chapterQualityAction(review.verdict, completedRewrites) === "fail") throw new Error(`第 ${cursor} 章经过 ${MAX_CHAPTER_QUALITY_REWRITES} 次自动重写后仍未通过独立验收：${review.summary}`);
-      await repository.commitChapter(inputData.novelId, cursor, text, review.continuityDelta, review.newCharacterProfiles, review.actualTension);
+      abortSignal?.throwIfAborted();
+      await repository.commitChapter(inputData.novelId, { jobId: inputData.jobId, chapter: cursor, text, review, basis: context.basis });
     }
-    if (inputData.interactionMode === "autonomous_opening") await repository.setApprovalMode(inputData.novelId, "milestone");
-    await repository.setActiveJob(inputData.novelId, undefined);
+    await repository.finishProductionJob(inputData.novelId, inputData.jobId, "completed");
     return { status: "completed" as const, novelId: inputData.novelId, jobId: inputData.jobId, completedThrough: to };
     } catch (error) {
-      if (inputData.interactionMode === "autonomous_opening") await repository.setApprovalMode(inputData.novelId, "milestone").catch(() => undefined);
+      await repository.finishProductionJob(inputData.novelId, inputData.jobId, "failed").catch(() => undefined);
       throw error;
     }
   },

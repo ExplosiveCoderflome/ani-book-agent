@@ -43,8 +43,9 @@ export const chapterPatternSchema = z.object({
   name: z.string().trim().min(1).max(40),
   pattern: z.string().trim().min(2).max(240).refine((value) => value.startsWith("^"), "章节正则必须从 ^ 开始，只匹配行首。").superRefine((value, ctx) => {
     try {
-      const regex = new RegExp(value, "iu");
-      if (regex.test("")) ctx.addIssue({ code: "custom", message: "章节正则不能匹配空行。" });
+      // Only compile here. Even testing an empty string can execute untrusted
+      // lookarounds; all matching belongs in the bounded worker adapter.
+      new RegExp(value, "iu");
     } catch {
       ctx.addIssue({ code: "custom", message: "章节正则语法无效。" });
     }
@@ -73,22 +74,27 @@ export const chapterRangeSchema = z.object({
 }).refine((value) => value.toChapter >= value.fromChapter, { path: ["toChapter"], message: "结束章节不能早于起始章节。" });
 export type ChapterRange = z.infer<typeof chapterRangeSchema>;
 
-export function normalizeChapterPatternSuggestion(
+export type ChapterPatternMatcher = (patterns: string[], lines: string[]) => Promise<readonly number[]>;
+
+export async function normalizeChapterPatternSuggestion(
   value: { name: string; pattern: string; explanation: string },
   sample: string,
-): ChapterPatternSuggestion | undefined {
+  matchPatterns: ChapterPatternMatcher,
+): Promise<ChapterPatternSuggestion | undefined> {
   let pattern = value.pattern.trim().replace(/^```(?:regex|regexp|javascript|js)?\s*/i, "").replace(/\s*```$/, "").trim();
   const delimited = pattern.match(/^\/([\s\S]+)\/[a-z]*$/i);
   if (delimited) pattern = delimited[1]!;
   const candidates = [pattern, ...(pattern.includes("\\\\") ? [pattern.replaceAll("\\\\", "\\")] : [])];
   const lines = sample.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const validCandidates: ChapterPatternSuggestion[] = [];
   for (const candidate of [...new Set(candidates)]) {
     const parsed = chapterPatternSuggestionSchema.safeParse({ ...value, pattern: candidate });
-    if (!parsed.success) continue;
-    const regex = new RegExp(parsed.data.pattern, "iu");
-    if (lines.some((line) => regex.test(line.slice(0, 160)))) return parsed.data;
+    if (parsed.success) validCandidates.push(parsed.data);
   }
-  return undefined;
+  if (!validCandidates.length) return undefined;
+  const matches = await matchPatterns(validCandidates.map((candidate) => candidate.pattern), lines);
+  const matched = new Set(matches);
+  return validCandidates.find((_candidate, index) => matched.has(index));
 }
 
 export const chapterManifestItemSchema = z.object({

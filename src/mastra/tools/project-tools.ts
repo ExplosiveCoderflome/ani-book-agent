@@ -1,7 +1,7 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import { AppError } from "../../application/errors";
-import type { NovelProjectStore, ReferenceLibraryStore, SkillCatalogPort } from "../../application/ports";
+import type { NovelAgentStore, ReferenceLibraryStore, SkillCatalogPort } from "../../application/ports";
 import { novelStateSchema, patchChangeSchema, patchProposalSchema, productionJobRequestSchema, productionJobSchema, type ProductionJob, type ProductionJobRequest } from "../../domain";
 
 const errorSchema = z.object({ code: z.string(), message: z.string(), recoverable: z.boolean(), nextAction: z.enum(["retry", "reread", "author_approval", "replan"]).optional() });
@@ -23,7 +23,7 @@ export function selectProjectReadPaths(requested: Array<{ path: string; offset: 
 }
 
 export function createProjectTools(deps: {
-  novels: NovelProjectStore;
+  novels: NovelAgentStore;
   references: ReferenceLibraryStore;
   skills: SkillCatalogPort;
   readSkill(id: string, versionId?: string): Promise<string>;
@@ -87,7 +87,7 @@ export function createProjectTools(deps: {
       const id = novelId(context);
       const proposal = await deps.novels.prepareProposal(id, input);
       if (proposal.approval === "auto") {
-        const applied = await deps.novels.applyProposal(proposal, false);
+        const applied = await deps.novels.applyProposal(proposal);
         if (!applied.duplicate && proposal.changes.some((change) => change.path === "book/blueprint.md")) {
           try {
             const job = await deps.startProductionJob(id, { goal: "write_chapters", scope: { fromChapter: applied.state.nextChapter, toChapter: 3 } });

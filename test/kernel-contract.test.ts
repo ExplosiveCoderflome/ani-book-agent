@@ -107,17 +107,16 @@ test("production prose calls cannot drift into the interactive tool loop", async
     readFile(new URL("../src/mastra/agents/novel-agent.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/mastra/composition.ts", import.meta.url), "utf8"),
   ]);
-  assert.equal((source.match(/toolChoice: "none"/g) ?? []).length, 4);
-  assert.equal((source.match(/providerOptions: productionProviderOptions/g) ?? []).length, 4);
+  assert.equal((source.match(/toolChoice: "none"/g) ?? []).length, 3);
+  assert.equal((source.match(/providerOptions: productionProviderOptions/g) ?? []).length, 3);
   assert.match(source, /generateValidatedStructure/);
   assert.match(source, /custom: \{ reasoningEffort: "none"/);
   assert.match(source, /MAX_CHAPTER_QUALITY_REWRITES/);
-  assert.match(source, /!legacyTask && inputData\.interactionMode === "standard" && !resumeData/);
-  assert.match(source, /review\.newCharacterProfiles/);
+  assert.match(source, /inputData\.interactionMode === "standard" && !resumeData/);
   assert.match(source, /generatedVolumePlanSchema/);
   assert.doesNotMatch(source, /planning\?\.created && !resumeData/);
   assert.match(source, /await repository\.commitChapter/);
-  assert.match(source, /review\.actualTension/);
+  assert.match(source, /text, review, basis: context\.basis/);
   const writer = agents.slice(agents.indexOf("const novelWriter"), agents.indexOf("const novelCritic"));
   assert.match(writer, /id: "novel-writer"/);
   assert.doesNotMatch(writer, /tools:|workspace:|new Memory/);

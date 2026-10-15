@@ -1,7 +1,7 @@
 import type {
   AdaptationPlan, ApprovalMode, ChapterManifest, ChapterParserConfig, ChapterPatternSuggestion, ChapterRange, CriticResult, DeconstructionFocus,
   DeconstructionMode, FileContent, MarketRadarSnapshot, MarketRadarSummary, NovelFileView, NovelLedger, NovelState, NovelSummary,
-  PatchProposal, PreferenceSignalInput, ProductionJobRequest, ReferenceAdaptation, ReferenceAnalysis, ReferenceAnalysisPreset,
+  PatchProposal, PreferenceSignalInput, ProductionInteractionMode, ProductionJobRequest, ReferenceAdaptation, ReferenceAnalysis, ReferenceAnalysisPreset,
   ReferenceCharacterProfile, ReferenceSection, ReferenceState, ReferenceStructureRadar, SkillBindings, SkillSandboxCapabilities,
   SkillVersion, TokenEstimate,
 } from "../domain";
@@ -34,14 +34,19 @@ export interface NovelProjectStore {
   readProjectFile(novelId: string, relativePath: string, offset?: number, maxChars?: number): Promise<FileContent>;
   search(novelId: string, query: string, limit?: number): Promise<Array<{ path: string; excerpt: string }>>;
   prepareProposal(novelId: string, input: { intent: string; summary: string; changes: PatchProposal["changes"] }): Promise<PatchProposal>;
-  applyProposal(raw: PatchProposal, authorApproved?: boolean, updateState?: (state: NovelState) => void): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }>;
+  applyProposal(raw: PatchProposal): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }>;
+  approveProposal(raw: PatchProposal): Promise<{ proposal: PatchProposal; state: NovelState; duplicate: boolean }>;
+  rejectProposal(raw: PatchProposal): Promise<PatchProposal>;
   saveAuthorFile(novelId: string, relativePath: string, content: string, expectedSha256: string): Promise<FileContent>;
   readLedger(novelId: string): Promise<NovelLedger>;
-  commitChapter(novelId: string, chapter: number, text: string, delta: Parameters<typeof import("../domain").mergeLedger>[2], profiles?: CriticResult["newCharacterProfiles"], actualTension?: CriticResult["actualTension"]): Promise<unknown>;
-  setActiveJob(novelId: string, jobId?: string): Promise<NovelState>;
-  clearActiveJob(novelId: string, jobId: string): Promise<NovelState>;
-  setApprovalMode(novelId: string, approvalMode: ApprovalMode): Promise<NovelState>;
-  exportNovel(novelId: string): Promise<{ path: string }>;
+  commitProductionPlan(novelId: string, jobId: string, changes: PatchProposal["changes"], basis: Record<string, string>): Promise<NovelState>;
+  confirmProductionPlan(novelId: string, jobId: string): Promise<NovelState>;
+  commitChapter(novelId: string, input: ChapterCommitInput): Promise<{ state: NovelState; path: string; sha256: string }>;
+  commitReviewReport(novelId: string, jobId: string, report: string, basis: Record<string, string>): Promise<{ path: string }>;
+  claimProductionJob(novelId: string, jobId: string, request: ProductionJobRequest, interactionMode: ProductionInteractionMode, options?: ProductionClaimOptions): Promise<NovelState>;
+  finishProductionJob(novelId: string, jobId: string, outcome: "completed" | "failed" | "canceled"): Promise<NovelState>;
+  cancelAutonomousOpening(novelId: string): Promise<NovelState>;
+  exportNovel(novelId: string, jobId: string): Promise<{ path: string }>;
   stateHash(state: NovelState): string;
   adaptationAuthorityFiles(state: NovelState): Record<string, string>;
   adaptationSetHash(versions: Record<string, string>): string;
@@ -52,9 +57,23 @@ export interface NovelProjectStore {
   activeAdaptations(novelId: string, chapter: number): Promise<Array<{ adaptation: ReferenceAdaptation; file: FileContent }>>;
 }
 
+export type ChapterCommitInput = { jobId: string; chapter: number; text: string; review: CriticResult; basis: Record<string, string> };
+export type ProductionClaimOptions = { expectedStateHash?: string; previousJob?: { id: string; status: "failed" | "completed" | "canceled" } };
+
+// Adapters receive only the commands their role is allowed to issue. Author
+// decisions never enter the Agent tool or production Workflow capability.
+export type NovelAgentStore = Pick<NovelProjectStore, "get" | "listFiles" | "readProjectFile" | "search" | "prepareProposal" | "applyProposal">;
+export type NovelWorkflowStore = Pick<NovelProjectStore,
+  "get" | "listFiles" | "readProjectFile" | "stateHash" | "adaptations" | "activeAdaptations"
+  | "commitProductionPlan" | "commitChapter" | "commitReviewReport" | "exportNovel" | "finishProductionJob"
+>;
+
 export interface ReferenceLibraryStore {
   libraryState(): Promise<{ activeJobId?: string; activeReferenceId?: string }>;
-  setActive(jobId?: string, referenceId?: string): Promise<unknown>;
+  claimJob(referenceId: string, jobId: string, analysis: ReferenceAnalysis): Promise<ReferenceState>;
+  assertActiveJob(referenceId: string, jobId: string): Promise<void>;
+  clearActiveJob(referenceId: string, jobId: string): Promise<boolean>;
+  finishJob(referenceId: string, jobId: string, analysisId: string, result: ReferenceJobCompletion): Promise<boolean>;
   import(input: { fileName: string; title?: string; bytes: Buffer }): Promise<unknown>;
   list(): Promise<ReferenceState[]>;
   get(id: string): Promise<ReferenceState>;
@@ -67,9 +86,9 @@ export interface ReferenceLibraryStore {
   confirmManifest(id: string, expectedHash: string): Promise<unknown>;
   delete(id: string): Promise<void>;
   clearAnalyses(id: string): Promise<ReferenceState>;
-  updateAnalysis(id: string, analysis: ReferenceAnalysis): Promise<ReferenceState>;
+  updateAnalysis(id: string, analysis: ReferenceAnalysis, jobId?: string): Promise<ReferenceState>;
   propagateStale(id: string, sourceHash: string, manifestHash: string, promptVersion: string): Promise<ReferenceState>;
-  writeAnalysisFile(id: string, analysisId: string, relative: string, content: string): Promise<string>;
+  writeAnalysisFile(id: string, analysisId: string, relative: string, content: string, jobId?: string): Promise<string>;
   readAnalysisFile(id: string, analysisId: string, relative: string, maxChars?: number): Promise<string>;
   listAnalysisFiles(id: string, analysisId: string, directory: "batches" | "segments" | "chapters" | "focus"): Promise<string[]>;
   section(id: string, analysisId: string, key: string): Promise<ReferenceSection>;
@@ -78,6 +97,8 @@ export interface ReferenceLibraryStore {
   radar(id: string, analysisId: string): Promise<ReferenceStructureRadar>;
   analysisHash(id: string, analysisId: string): Promise<string>;
 }
+
+export type ReferenceJobCompletion = { status: "completed" | "failed" | "canceled" } & Partial<Pick<ReferenceAnalysis, "inputTokens" | "outputTokens" | "usageEstimated" | "reportPath" | "radarPath">>;
 
 export interface ModelSettingsPort {
   status(): Promise<any>;

@@ -1,5 +1,5 @@
 import { parse } from "yaml";
-import { normalizeChapterPatternSuggestion, referenceAnalysisPresetSections, referenceAnalysisSchema, referenceJobRequestSchema, referenceJobSchema, type ChapterRange, type DeconstructionFocus, type DeconstructionMode, type ReferenceAnalysisPreset, type ReferenceJob } from "../domain";
+import { referenceAnalysisPresetSections, referenceAnalysisSchema, referenceJobRequestSchema, referenceJobSchema, type ChapterRange, type DeconstructionFocus, type DeconstructionMode, type ReferenceAnalysisPreset, type ReferenceJob } from "../domain";
 import { AppError } from "./errors";
 import type { ChapterPatternAdvisorPort, CharacterProfileRunner, ErrorSanitizer, ModelSettingsPort, ReferenceAnalysisRunner, ReferenceEstimatorPort, ReferenceLibraryStore } from "./ports";
 
@@ -32,7 +32,7 @@ async function referenceDetail(id: string) { const [state, manifest, parser] = a
 async function estimateReference(id: string, mode: DeconstructionMode, focuses: DeconstructionFocus[], chapterRange?: ChapterRange, preset: ReferenceAnalysisPreset = "standard") { return estimateDeconstruction(await referenceRepository.manifest(id), mode, focuses, chapterRange, preset); }
 async function rebuildReferenceManifest(id: string) { const running = await activeJob(); if (running?.referenceId === id) throw new AppError("REFERENCE_ACTIVE", "这本参考书正在拆解，请先取消任务再重新识别章节。", 409, true); return referenceRepository.rebuildManifest(id); }
 async function saveReferenceParser(id: string, input: unknown) { const running = await activeJob(); if (running?.referenceId === id) throw new AppError("REFERENCE_ACTIVE", "这本参考书正在拆解，请先取消任务再修改章节规则。", 409, true); await referenceRepository.saveParser(id, input); return referenceRepository.rebuildManifest(id); }
-async function suggestReferencePattern(id: string, sample: unknown) { await referenceRepository.get(id); const generated = await suggestChapterPattern(sample); const suggestion = normalizeChapterPatternSuggestion(generated, String(sample)); if (!suggestion) throw new AppError("REFERENCE_PATTERN_NO_MATCH", "模型生成的正则格式无法应用。请保留真实章节标题并重试，系统不会保存这条无效规则。", 422, true); return suggestion; }
+async function suggestReferencePattern(id: string, sample: unknown) { await referenceRepository.get(id); return suggestChapterPattern(sample); }
 async function confirmReferenceManifest(id: string, manifestHash: string) { return referenceRepository.confirmManifest(id, manifestHash); }
 async function deleteReference(id: string) { await activeJob(); await referenceRepository.delete(id); return { deleted: true }; }
 async function referenceSource(id: string, start: number, end: number) { return referenceRepository.sourceSlice(id, start, end); }
@@ -58,23 +58,24 @@ async function referenceChapter(id: string, analysisId: string, chapterId: strin
 
 async function activeJob() {
   const library = await referenceRepository.libraryState(); if (!library.activeJobId || !library.activeReferenceId) return undefined;
-  const job = await referenceJobView(library.activeReferenceId, library.activeJobId).catch(() => undefined);
-  if (!job || ["completed", "failed", "canceled"].includes(job.status)) { await referenceRepository.setActive(); return undefined; }
+  const job = await referenceJobView(library.activeReferenceId, library.activeJobId);
+  if (["completed", "failed", "canceled"].includes(job.status)) { await referenceRepository.clearActiveJob(library.activeReferenceId, library.activeJobId); return undefined; }
   return job;
 }
 
 async function startReferenceJob(referenceId: string, raw: unknown) {
-  const input = referenceJobRequestSchema.parse(raw); if (starting.size || await activeJob()) throw new AppError("REFERENCE_JOB_ACTIVE", "当前已有一本参考书正在拆解。", 409, true);
+  const input = referenceJobRequestSchema.parse(raw); if (starting.size) throw new AppError("REFERENCE_JOB_ACTIVE", "当前已有一本参考书正在拆解。", 409, true);
   starting.add(referenceId);
   try {
+    if (await activeJob()) throw new AppError("REFERENCE_JOB_ACTIVE", "当前已有一本参考书正在拆解。", 409, true);
     const [state, manifest] = await Promise.all([referenceRepository.get(referenceId), referenceRepository.manifest(referenceId)]); if (!state.manifestConfirmed) throw new AppError("REFERENCE_MANIFEST_UNCONFIRMED", "请先确认章节切分。", 409, true); if (input.manifestHash !== state.manifestHash) throw new AppError("REFERENCE_MANIFEST_STALE", "章节切分已经变化，请重新确认。", 409, true);
     await referenceRepository.propagateStale(referenceId, state.source.sha256, state.manifestHash, DECONSTRUCTION_PROMPT_VERSION);
     const scopedChapters = referenceChaptersInRange(manifest, input.chapterRange); const scopedChars = scopedChapters.reduce((sum, chapter) => sum + chapter.end - chapter.start, 0);
     const estimate = estimateDeconstruction(manifest, "standard", [], input.chapterRange, input.preset); if (input.tokenBudget < estimate.inputMin + estimate.outputMin) throw new AppError("REFERENCE_BUDGET_TOO_LOW", `预算至少需要 ${estimate.inputMin + estimate.outputMin} Token。`, 409, true);
     await modelSettings.runtimeSelection("analysis"); const run = await referenceDeconstructionWorkflow.createRun({ resourceId: referenceId }); const analysisId = deps.newId(); const timestamp = new Date().toISOString();
     const analysis = referenceAnalysisSchema.parse({ id: analysisId, mode: "standard", focuses: [], preset: input.preset, sectionKeys: referenceAnalysisPresetSections[input.preset], chapterRange: input.chapterRange, status: "running", sourceHash: state.source.sha256, manifestHash: state.manifestHash, promptVersion: DECONSTRUCTION_PROMPT_VERSION, tokenBudget: input.tokenBudget, inputTokens: 0, outputTokens: 0, usageEstimated: false, createdAt: timestamp, updatedAt: timestamp });
-    await referenceRepository.updateAnalysis(referenceId, analysis); await referenceRepository.setActive(run.runId, referenceId);
-    void run.start({ inputData: { referenceId, jobId: run.runId, analysisId, sourceHash: state.source.sha256, manifestHash: state.manifestHash, mode: "standard", preset: input.preset, focuses: [], chapterRange: input.chapterRange, tokenBudget: input.tokenBudget, promptVersion: DECONSTRUCTION_PROMPT_VERSION } }).catch(async (error) => { await referenceRepository.updateAnalysis(referenceId, { ...analysis, status: "failed", updatedAt: new Date().toISOString() }).catch(() => undefined); await referenceRepository.setActive().catch(() => undefined); console.warn("拆书任务失败", { runId: run.runId, message: sanitizeProviderError(error) }); });
+    await referenceRepository.claimJob(referenceId, run.runId, analysis);
+    void run.start({ inputData: { referenceId, jobId: run.runId, analysisId, sourceHash: state.source.sha256, manifestHash: state.manifestHash, mode: "standard", preset: input.preset, focuses: [], chapterRange: input.chapterRange, tokenBudget: input.tokenBudget, promptVersion: DECONSTRUCTION_PROMPT_VERSION } }).catch(async (error) => { await referenceRepository.finishJob(referenceId, run.runId, analysisId, { status: "failed" }).catch(() => undefined); console.warn("拆书任务失败", { runId: run.runId, message: sanitizeProviderError(error) }); });
     const batchesTotal = Math.max(1, Math.ceil(scopedChars / 18_000));
     const segmentsTotal = Math.max(1, Math.ceil(scopedChapters.length / 25));
     const macrosTotal = Math.max(1, Math.ceil(segmentsTotal / 4));
@@ -119,7 +120,7 @@ async function referenceJobView(referenceId: string, jobId: string) {
   const activeStage = phaseIndex === 1 ? (batches.length ? "逐章全量拆解" : "准备批次") : phaseIndex === 2 ? "聚合故事阶段" : phaseIndex === 3 ? "汇总全书结构" : analysis.mode === "deep" && phaseIndex === 4 ? "深度专项复扫" : "生成并复核全书报告";
   const stage = status === "paused" ? "等待追加预算" : status === "completed" ? "已完成" : activeStage;
   const detail = status === "paused" ? `已使用 ${analysis.inputTokens + analysis.outputTokens} Token，追加预算后会从当前阶段继续。` : phaseIndex === 1 ? `${batches.length ? `已完成 ${batches.length} 个原文批次` : "正在准备第一个原文批次"}${lastCoveredChapter ? `，最近覆盖到《${lastCoveredChapter.title}》` : ""}。` : phaseIndex === 2 ? `正在把逐章结果归纳为连续故事阶段，已完成 ${segments.length}/${segmentsTotal} 段。` : phaseIndex === 3 ? `正在合并阶段结果，建立全书层面的升级、因果和人物弧线。` : analysis.mode === "deep" && phaseIndex === 4 ? `正在复扫原文专项，已完成 ${focusFiles.length}/${focusesTotal} 个专项批次。` : "正在生成全书报告，并按原文偏移复核关键证据。";
-  if ((status === "failed" || status === "canceled") && analysis.status === "running") { await referenceRepository.updateAnalysis(referenceId, { ...analysis, status, updatedAt: new Date().toISOString() }); await referenceRepository.setActive(); }
+  if ((status === "failed" || status === "canceled") && analysis.status === "running") await referenceRepository.finishJob(referenceId, jobId, analysis.id, { status });
   const timestamp = new Date().toISOString(); const result = (run.result ?? {}) as Record<string, unknown>;
   const liveInputTokens = analysis.inputTokens > 0 ? analysis.inputTokens + liveFocusUsage.inputTokens : liveBatchUsage.inputTokens + liveFocusUsage.inputTokens;
   const liveOutputTokens = analysis.outputTokens > 0 ? analysis.outputTokens + liveFocusUsage.outputTokens : liveBatchUsage.outputTokens + liveFocusUsage.outputTokens;
@@ -128,9 +129,10 @@ async function referenceJobView(referenceId: string, jobId: string) {
 
 async function referenceJobAction(referenceId: string, jobId: string, input: { action: "continue" | "add_budget" | "cancel"; additionalTokens?: number }) {
   const current = await referenceJobView(referenceId, jobId); const run = await referenceDeconstructionWorkflow.createRun({ runId: jobId, resourceId: referenceId }); const state = await referenceRepository.get(referenceId); const analysis = state.analyses.find((item) => item.id === current.analysisId)!;
-  if (input.action === "cancel") { await run.cancel(); await referenceRepository.updateAnalysis(referenceId, { ...analysis, status: "canceled", updatedAt: new Date().toISOString() }); await referenceRepository.setActive(); return { ...current, status: "canceled" as const }; }
+  if (input.action === "cancel") { await referenceRepository.finishJob(referenceId, jobId, analysis.id, { status: "canceled" }); await run.cancel(); return { ...current, status: "canceled" as const }; }
   if (current.status !== "paused") throw new AppError("REFERENCE_JOB_NOT_PAUSED", "当前拆书任务没有暂停。", 409, true);
-  if (input.action === "add_budget") { const additional = input.additionalTokens ?? 0; if (!Number.isInteger(additional) || additional <= 0 || analysis.tokenBudget + additional > 50_000_000) throw new AppError("REFERENCE_BUDGET_INVALID", "追加预算必须为正整数，且总预算不超过 50,000,000。", 400, false); await referenceRepository.updateAnalysis(referenceId, { ...analysis, tokenBudget: analysis.tokenBudget + additional, status: "running", updatedAt: new Date().toISOString() }); }
+  if (input.action === "add_budget") { const additional = input.additionalTokens ?? 0; if (!Number.isInteger(additional) || additional <= 0 || analysis.tokenBudget + additional > 50_000_000) throw new AppError("REFERENCE_BUDGET_INVALID", "追加预算必须为正整数，且总预算不超过 50,000,000。", 400, false); await referenceRepository.updateAnalysis(referenceId, { ...analysis, tokenBudget: analysis.tokenBudget + additional, status: "running", updatedAt: new Date().toISOString() }, jobId); }
+  await referenceRepository.assertActiveJob(referenceId, jobId);
   const stateRun = await referenceDeconstructionWorkflow.getWorkflowRunById(jobId, { fields: ["steps"] }); const suspended = Object.entries(stateRun?.steps ?? {}).map(([name, raw]) => [name, Array.isArray(raw) ? raw.at(-1) : raw] as const).find(([, step]) => step?.suspendPayload); if (!suspended) throw new AppError("REFERENCE_JOB_NOT_PAUSED", "没有找到可恢复的拆书步骤。", 409, true);
   void run.resume({ step: suspended[0], resumeData: { action: "continue" } }).catch((error) => console.warn("恢复拆书任务失败", { jobId, message: sanitizeProviderError(error) })); return { ...current, status: "running" as const, tokenBudget: input.action === "add_budget" ? analysis.tokenBudget + (input.additionalTokens ?? 0) : analysis.tokenBudget, updatedAt: new Date().toISOString() };
 }
