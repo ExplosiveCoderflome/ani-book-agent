@@ -14,15 +14,28 @@ React 作者工作区 / Mastra Studio
 
 依赖只向内流动：UI、Mastra 和基础设施可以依赖 Application/Domain，Domain 不依赖 Mastra。
 
-## 三个 Agent
+## 创作决策与事实闭环
 
-- `novel-agent`：对话、探索、蓝图、规划、正文和修订判断；拥有六个通用工具。
-- `novel-critic`：无记忆、无工具，负责章节验收、连续性增量抽取和通用项目审查。
-- `deconstruction-agent`：无记忆、无工具，只在全局拆书 Workflow 内完成逐章提取、聚合、专项分析和证据复核。
+- 作者意图、显式偏好与当前作品状态驱动主 Agent 选择方法和工具；创作判断不依赖关键词路由或固定问卷。
+- Skill 是可发现、可版本化的方法资产，为探索、蓝图、角色、卷规划、写作和审查提供要求与输出合同。
+- 市场趋势经作者选择成为开书输入；参考书分析经机制适配和作者批准，在限定章节内形成规划、写作与验收约束，不直接成为本书事实。
+- 生产 Workflow 逐章组装蓝图、角色、账本、当前章节卡、相邻张力目标、上一章和批准约束，调用 Writer 与独立 Critic，未通过时最多重写两次。
+- 通过验收的正文、事实增量、新角色、实际张力与进度经统一边界提交；正文、账本与角色更新成为下一章的权威输入，实际张力供作者审阅与诊断。角色设计和计划中的事件不等于正文已发生事实。
+- 作者审阅正文、报告与目标/实际张力后，可以提出反馈、编辑或请求修订提案；实际张力不会自动改写作者目标。
+
+创作协作全景与章节闭环图见 [README](../README.md#创作协作全景)。
+
+## 五个 Agent
+
+- `novel-agent`：对话、探索、方案和修订判断；使用六个通用项目工具及 Workspace Skill 检索能力。
+- `novel-writer`：负责生产链中的卷规划、正文和有限重写；无工具、无聊天记忆，权威上下文由 Workflow 提供。
+- `novel-critic`：负责独立验收、连续性增量抽取、实际张力和项目审查；不提供项目写入工具，结果由 Workflow 交给提交边界校验。
+- `deconstruction-agent`：负责参考书提取、聚合、证据复核、角色深研及章节识别规则建议。
+- `market-radar-agent`：根据已保存的公开榜单元数据提炼题材信号和阅读感觉。
 
 主 Agent 的确定性工具包括 `read_project`、`search_project`、`read_skill`、`read_reference`、`propose_patch`、`start_job`。`read_reference` 只能读取已完成报告、阶段、章节分析和短证据，不能修改参考书或把参考书事实写入连续性账本。工具只读取、校验或发起运行，不调用模型，也不能绕过 Domain 写权威文件。
 
-创作方法按需从仓库内五个只读 Skill 加载：`discovery`、`blueprint`、`volume-planning`、`chapter-writing`、`critique`。
+官方创作方法为七个版本化 Skill：`discovery`、`blueprint`、`character-planning`、`volume-planning`、`chapter-writing`、`critique`、`project-review`。作品可以绑定已发布的方法版本；任务记录已解析的版本，但 Workspace 仍按当前绑定读取资源，不保证所有资源在运行中完全冻结。
 
 ## 数据与权限
 
@@ -59,7 +72,7 @@ Skill 绑定的首次初始化使用固定的系统入口，幂等创建受保�
 
 `novel-production` 处理写章、通用项目审查和导出。写章批次从当前 `nextChapter` 开始，最多五章；默认蓝图批准后生成三章。
 
-`reference-deconstruction` 是同一 Mastra Runtime 内的全局拆书 Workflow。它按“完整章节批次 → 阶段 → 宏观结构 → 全书 → 证据复核”执行，批次上下文不超过约 18,000 字符，`foreach` 并发为 2，全局只允许一个活动拆书 Job。标准模式全量遍历一次原文；深度模式在标准报告后按所选专项复扫。不存在第二套 Agent 循环、向量库或独立运行时。
+`reference-deconstruction` 是同一 Mastra Runtime 内的全局拆书 Workflow。它按“完整章节批次 → 阶段 → 宏观结构 → 全书 → 证据复核”执行，批次上下文不超过约 18,000 字符，`foreach` 并发为 2，全局只允许一个活动拆书 Job。当前业务入口使用标准模式，快速/标准/完整预设主要决定结果小节，分析范围由所选章节确定；Workflow 内保留的深度专项复扫尚未通过当前入口开放。不存在第二套 Agent 循环、向量库或独立运行时。
 
 参考书的权威数据位于 `reference-library/`：`library-state.yaml` 保存全局活动任务锁，每本书的 `reference-state.yaml`、规范化原文、章节清单和版本化分析均为本地 Markdown/YAML。Mastra storage 只保存运行快照、暂停、Trace 和评估。
 

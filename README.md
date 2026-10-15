@@ -244,25 +244,79 @@ novels/<novel-id>/
 
 ## 架构与开发
 
-Mastra 是唯一 Agent/Workflow 运行时。AI 负责创作判断，Domain 决定权限与合法状态变化，Repository 负责在最新文件上校验并提交。
+架构围绕作者、创作方法和不断积累的作品事实组织。主 Agent 根据意图选择 Skill 和工具，Workflow 将创作判断组织成可恢复的生产任务，Domain 保证每次提交仍符合作者授权与作品状态。
+
+### 创作协作全景
 
 ```mermaid
-flowchart LR
-    UI[React 作者工作区] --> APP[Application / HTTP API]
-    APP --> M[Mastra Runtime]
-    M --> A[Creative Agents]
-    A --> T[受限项目工具]
-    T --> APP
-    M --> W[Recoverable Workflows]
-    APP --> R[NovelRepository：同书锁与最新文件]
-    W --> R
-    R --> D[Domain 命令决策]
-    D --> C[事务提交与中断恢复]
-    C --> F[Markdown / YAML 权威文件]
-    M -. 执行快照、对话、Trace、评估 .-> S[LibSQL / DuckDB]
+flowchart TB
+    AUTHOR["作者：意图、选择、审阅与反馈"]
+    MARKET["市场趋势：题材信号与阅读感觉"] -->|作者选择方向| AUTHOR
+    AUTHOR -->|显式选择与反馈| PREF["作者偏好记录"]
+    REF["参考书拆解：结构、人物、机制与证据"] -->|作者选择 1–3 条推荐洞察| ADAPT["机制迁移提案"]
+    ADAPT --> APPROVAL["作者批准：限定未来章节"]
+    AUTHOR --> APPROVAL
+
+    subgraph MASTRA["Mastra：唯一 Agent 与 Workflow 运行时"]
+        AGENT["主创作 Agent：理解目标、自主选择方法与工具"]
+        WORKFLOW["单书串行生产 Workflow：写章、项目审查、导出"]
+        AGENT -->|start_job| WORKFLOW
+    end
+
+    AUTHOR -->|目标与当前要求| AGENT
+    AGENT -->|候选方案、解释与提案| AUTHOR
+    PREF -.->|偏好上下文| AGENT
+    AGENT -.->|按需发现与读取| SKILL["版本化 Skill：探索、蓝图、角色、规划、写作、审查"]
+    SKILL -.->|方法与输出合同| WORKFLOW
+    APPROVAL -->|已批准的规划、写作与验收约束| WORKFLOW
+    AGENT -->|propose_patch| PATCH["补丁提案：按规则自动应用或等待作者审批"]
+    AUTHOR -->|审批或编辑| COMMIT["统一提交边界：授权、保护、版本与顺序校验"]
+    PATCH -->|满足审批条件| COMMIT
+    WORKFLOW -->|规划、章节、审查与导出命令| COMMIT
+    COMMIT --> BOOK["权威作品资产：蓝图、角色、计划、正文、账本与张力"]
+    BOOK -->|读取事实与规划| AGENT
+    BOOK -->|蓝图、角色、账本与章节规划| WORKFLOW
+    BOOK -->|目标作品的蓝图与账本| ADAPT
+    BOOK -->|正文、报告、目标与实际张力| AUTHOR
 ```
 
-上图表示小说写入流程。代码依赖向内：`Web / Mastra / Infrastructure → Application → Domain`，Domain 不导入 Mastra。Agent 和 Workflow 获得不同的受限操作，作者审批权限不进入生产 Workflow。
+作者的目标、方法资产和作品事实共同影响创作判断。Skill 提供按需选择的方法，版本化 Prompt 与输出合同约束具体模型调用。市场信号经过作者选择进入开书，拆书洞察经过适配与批准进入限定章节；正文审阅和张力对比又会形成新的反馈、编辑或修订提案。实际张力不会自动改写作者的目标曲线。
+
+### 章节生产与事实积累
+
+```mermaid
+flowchart TB
+    PLAN["Writer 规划：当前卷章节卡与目标张力"] --> SAVE["受控保存规划"]
+    SAVE --> CONSENT["作者确认当前版本 / 已明确授权的全自动前三章"]
+
+    subgraph LOOP["同一 Mastra 生产 Workflow：每章依次执行"]
+        CONTEXT["组装上下文：蓝图、角色、账本、当前章节卡、相邻张力、上一章与迁移约束"]
+        WRITER["Writer：推进本章目标，形成新事件与变化"]
+        CRITIC["Critic：独立验收，抽取事实增量、新角色与实际张力"]
+        CONTEXT --> WRITER --> CRITIC
+        CONTEXT -->|独立核对依据| CRITIC
+        CRITIC -->|repair / replan：最多重写两次| WRITER
+        CRITIC -->|仍未通过| STOP["停止并保留此前稳定章节"]
+    end
+
+    CONSENT --> CONTEXT
+    CRITIC -->|accepted 与结构化结果| COMMIT["领域校验后事务提交"]
+    COMMIT --> ASSETS["正文、连续性账本、新角色、实际张力与 nextChapter 一起更新"]
+    ASSETS -->|本批次仍有章节：正文、账本与角色回流| CONTEXT
+    ASSETS -->|批次完成：作者审阅后续写| PLAN
+```
+
+角色档案描述长期设计，账本记录已经发生的事实；章节卡规定本章任务，目标张力约束读者体验。正文、账本与角色更新回流下一章；实际张力用于作者审阅和诊断，当前不会自动注入章节上下文或修改目标曲线。
+
+规划确认发生在标准批次开写前。之后通过独立验收的章节按授权范围提交；全自动开书使用作者预先明确授予的前三章权限。模型生成的候选正文和 Critic 抽取结果都必须经过确定性校验。
+
+### 执行与权威边界
+
+最终写入统一经过：`受限业务命令 → Repository 同书锁与最新文件 → Domain 决策 → 事务提交 / 中断恢复`。作者审批权限保留在作者操作入口，Agent 与 Workflow 只获得各自允许的操作。
+
+Mastra 保存运行快照、对话、Trace 和评估，并承载 Skill 版本与资源；小说事实和生产进度以作品 Markdown/YAML 为准。上下文组装是 Workflow 内部职责，不额外引入一套 Agent 调度或事实存储。
+
+代码依赖向内：`Web / Mastra / Infrastructure → Application → Domain`，Domain 不导入 Mastra。实现边界详见[架构说明](docs/architecture.md)。
 
 <details>
 <summary><strong>Agent、Workflow 与源码目录</strong></summary>
